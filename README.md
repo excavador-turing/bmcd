@@ -188,10 +188,24 @@ the log.
 The ban is per peer address and lives in `ban_patrol.rs`. The real numbers:
 `authentication_attempts` defaults to **5**, `BAN_DURATION` is **60 s** and
 `BAN_LEVELS` is **10**. Consecutive failures are counted per peer; on the 5th the
-peer is banned for 1 minute, and every failure after that doubles the ban —
+peer is banned for 1 minute, and each further failure doubles the ban —
 2, 4, 8, … minutes — with the multiplier capped at `1 << 10`, so **1024 minutes,
-about 17 hours**. One success clears the peer's counter outright. The
-bookkeeping is in memory only: restarting the daemon forgives everyone.
+about 17 hours**. Requests made *while* a ban stands are refused without
+counting against it, so what walks the ladder is the next failure after each
+ban lapses, not the retries during it. One success clears the peer's counter
+outright. The bookkeeping is in memory only: restarting the daemon forgives
+everyone.
+
+**A ban is answered as a ban, not as a wrong password.** Every other
+authentication failure is the 401 (or, on `POST /api/bmc/authenticate`, the
+403) it has always been; `ExceededAllowedAttempts` is **429 Too Many
+Requests** with `Retry-After` in seconds and the time left in the body, and no
+`WWW-Authenticate`, since a challenge there only tells a browser to prompt for
+the password again. `ban_patrol` runs on every authenticated request, not only
+on the login endpoint, so a 429 can come back from anything under `/api/bmc`
+or from `/metrics` — a client that treats 401 and 429 alike will read a
+lockout as a credential problem, which is precisely the bug this replaced.
+Loopback never sees it: that exemption is taken before the ban is consulted.
 
 ### One endpoint answers without authentication
 

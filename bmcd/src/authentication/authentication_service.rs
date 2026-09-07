@@ -109,7 +109,10 @@ where
             };
 
             if let Err(e) = authorized {
-                unauthorized_response(request.request(), e, realm)
+                match e.retry_after() {
+                    Some(seconds) => too_many_requests_response(request.request(), seconds, e),
+                    None => unauthorized_response(request.request(), e, realm),
+                }
             } else {
                 service
                     .call(request)
@@ -133,7 +136,10 @@ async fn authentication_request<B>(
 
     let response = match context.authenticate_request(peer, &buffer).await {
         Ok(session) => authenticated_response(request.request(), session.id.clone(), session),
-        Err(error) => forbidden_response(request.request(), error),
+        Err(error) => match error.retry_after() {
+            Some(seconds) => too_many_requests_response(request.request(), seconds, error),
+            None => forbidden_response(request.request(), error),
+        },
     };
 
     response
@@ -193,6 +199,34 @@ fn forbidden_response<B, E: ToString>(
     ))
 }
 
+/// The answer a banned caller gets, from the login endpoint and from every
+/// other path alike.
+///
+/// A ban is not a statement about the credential offered -- `patrole_ban` runs
+/// before anything is read -- and reporting it as one is what made this worth
+/// fixing: the web interface showed "Invalid username or password" to someone
+/// whose password was correct, so they went on trying, and the first attempt
+/// after each ban lapses doubles the next one.
+///
+/// So it gets its own status, and `Retry-After` in delta-seconds so a client
+/// can wait rather than guess. Deliberately no `WWW-Authenticate`: a challenge
+/// here is an instruction to a browser to prompt for the credential again,
+/// which is the loop this is trying to break. A 429 is not an authentication
+/// challenge and does not carry one.
+fn too_many_requests_response<B, E: ToString>(
+    request: &HttpRequest,
+    retry_after: u64,
+    response_text: E,
+) -> Result<ServiceResponse<EitherBody<B>>, Error> {
+    Ok(ServiceResponse::new(
+        request.clone(),
+        HttpResponse::TooManyRequests()
+            .insert_header((header::RETRY_AFTER, retry_after.to_string()))
+            .body(response_text.to_string())
+            .map_into_right_body(),
+    ))
+}
+
 fn authenticated_response<B>(
     request: &HttpRequest,
     token: String,
@@ -231,6 +265,8 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::test::TestRequest;
     use base64::{engine::general_purpose, Engine as _};
+    use humantime::format_duration;
+    use std::time::Duration;
     use tokio::time::Instant;
 
     /// A token the store knows, and an account whose shadow hash matches
@@ -239,9 +275,29 @@ mod tests {
     const TOKEN: &str = "9RmQ0OGpXwYbLJ1t";
     const PASSWORD: &str = "hunter2";
 
+    /// The address these tests are refused from, and one they are not. The ban
+    /// is keyed on the peer, so a second address is how a test can show a
+    /// credential is good while the first address is locked out -- which is
+    /// how the board's owner established it, with a 200 from elsewhere during
+    /// a lockout the web interface was calling a wrong password.
+    const PEER: &str = "192.168.1.10:41234";
+    const OTHER_PEER: &str = "192.168.1.11:41234";
+
+    /// How many failures [`build_test_context`] allows before it bans. The
+    /// board's default is five; the number is not what these tests are about,
+    /// only what the answer is once it is reached.
+    const ATTEMPTS: usize = 10;
+
     /// The middleware in front of a route that answers 200 to anything that
     /// reaches it, so the status alone says whether the request got through.
-    async fn call(request: ServiceRequest) -> ServiceResponse<EitherBody<BoxBody>> {
+    ///
+    /// One instance owns one ban patrol. `call` below builds a fresh one per
+    /// request on purpose, so that no test can leave a ban behind for the
+    /// next; a test *about* a ban therefore has to hold this itself and drive
+    /// several requests through the one instance.
+    fn service(
+    ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
+    {
         let context = build_test_context(
             [(TOKEN.to_string(), Instant::now())],
             [(
@@ -260,9 +316,13 @@ mod tests {
             "/api/bmc/authenticate",
             "test realm",
         )
-        .call(request)
-        .await
-        .expect("the middleware always answers")
+    }
+
+    async fn call(request: ServiceRequest) -> ServiceResponse<EitherBody<BoxBody>> {
+        service()
+            .call(request)
+            .await
+            .expect("the middleware always answers")
     }
 
     fn basic(user: &str, password: &str) -> String {
@@ -273,9 +333,30 @@ mod tests {
     /// A request from somewhere other than the board itself, so the
     /// authentication middleware actually runs.
     fn rest_call() -> TestRequest {
+        rest_call_from(PEER)
+    }
+
+    fn rest_call_from(peer: &str) -> TestRequest {
         TestRequest::get()
             .uri("/api/bmc?opt=get&type=power")
-            .peer_addr("192.168.1.10:41234".parse().expect("a peer address"))
+            .peer_addr(peer.parse().expect("a peer address"))
+    }
+
+    /// One wrong password, offered the way a browser offers it.
+    fn wrong_password(peer: &str) -> ServiceRequest {
+        rest_call_from(peer)
+            .insert_header((header::AUTHORIZATION, basic("root", "not the password")))
+            .to_srv_request()
+    }
+
+    /// A login request: the path the web interface actually uses, and the one
+    /// whose answer it turns into "Invalid username or password".
+    fn login(peer: &str, password: &str) -> ServiceRequest {
+        TestRequest::post()
+            .uri("/api/bmc/authenticate")
+            .peer_addr(peer.parse().expect("a peer address"))
+            .set_payload(format!(r#"{{"username":"root","password":"{password}"}}"#))
+            .to_srv_request()
     }
 
     /// The four headers a browser puts on the wire for `new WebSocket(...)`.
@@ -420,6 +501,171 @@ mod tests {
         )
         .await;
         assert_eq!(contradicted.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A ban answers as a ban. Up to the threshold every wrong password is
+    /// still a 401 with the `Basic` challenge, exactly as before; the attempt
+    /// that trips the ban, and everything after it, is a 429 that says how
+    /// long is left, in a header a client can act on and in a body a person
+    /// can read.
+    ///
+    /// The 401s in the loop are the half of this that must not move. Were the
+    /// dispatch ever to fire on something other than a ban, they would turn
+    /// into 429s here.
+    #[actix_web::test]
+    async fn a_ban_is_answered_as_a_ban() {
+        let service = service();
+
+        for attempt in 1..ATTEMPTS {
+            let refused = service
+                .call(wrong_password(PEER))
+                .await
+                .expect("the middleware always answers");
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {attempt} of {ATTEMPTS}"
+            );
+            assert!(challenge(&refused).starts_with("Basic "));
+            assert!(
+                refused.headers().get(header::RETRY_AFTER).is_none(),
+                "attempt {attempt} is not a ban and must not tell anyone to wait"
+            );
+        }
+
+        let banned = service
+            .call(wrong_password(PEER))
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(banned.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Never zero, never negative, and no longer than the first ban level.
+        let seconds = retry_after(&banned);
+        assert!((1..=60).contains(&seconds), "Retry-After: {seconds}");
+
+        // No challenge. A 429 carrying one is an instruction to a browser to
+        // ask for the password again, which is the loop this fixes.
+        assert!(banned.headers().get(header::WWW_AUTHENTICATE).is_none());
+
+        // And the body says the same thing the header does.
+        let body = body(banned).await;
+        assert!(
+            body.contains("Exceeded allowed authentication attempts"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains(&format_duration(Duration::from_secs(seconds)).to_string()),
+            "body {body:?} does not agree with Retry-After: {seconds}"
+        );
+    }
+
+    /// The ban is unchanged in strength: a correct password does not lift it.
+    /// The proof that the password really is correct is that the same one is
+    /// accepted from another address while this one is locked out -- which is
+    /// the observation this change came from.
+    #[actix_web::test]
+    async fn a_ban_still_refuses_a_correct_password() {
+        let service = service();
+
+        for _ in 0..ATTEMPTS {
+            let _ = service.call(wrong_password(PEER)).await;
+        }
+
+        let banned = service
+            .call(
+                rest_call_from(PEER)
+                    .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                    .to_srv_request(),
+            )
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(banned.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let elsewhere = service
+            .call(
+                rest_call_from(OTHER_PEER)
+                    .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                    .to_srv_request(),
+            )
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(elsewhere.status(), StatusCode::OK);
+    }
+
+    /// The login endpoint is where the web interface reads its message from,
+    /// so it is where the wrong answer did its damage. A wrong password there
+    /// is still the 403 it always was; a ban is a 429.
+    #[actix_web::test]
+    async fn the_login_endpoint_reports_a_ban_too() {
+        let service = service();
+
+        for attempt in 1..ATTEMPTS {
+            let refused = service
+                .call(login(PEER, "not the password"))
+                .await
+                .expect("the middleware always answers");
+            assert_eq!(
+                refused.status(),
+                StatusCode::FORBIDDEN,
+                "attempt {attempt} of {ATTEMPTS}"
+            );
+        }
+
+        let banned = service
+            .call(login(PEER, "not the password"))
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(banned.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!((1..=60).contains(&retry_after(&banned)));
+
+        // And the ban does not become an oracle: the right password gets the
+        // same answer, so nothing here tells a guesser it guessed right.
+        let correct = service
+            .call(login(PEER, PASSWORD))
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(correct.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// The loopback exemption, under the one condition this change could have
+    /// broken it: with a ban already standing. The firmware's boot-time health
+    /// gate probes `https://127.0.0.1/` while a new image is on trial, and a
+    /// 429 there would roll the firmware back just as surely as a 401 would.
+    /// Nothing on the board shares an address with the peer being banned, but
+    /// nothing in the code said so until this test did.
+    #[actix_web::test]
+    async fn loopback_is_exempt_even_while_another_peer_is_banned() {
+        let service = service();
+
+        for _ in 0..ATTEMPTS {
+            let _ = service.call(wrong_password(PEER)).await;
+        }
+
+        for peer in ["127.0.0.1:41234", "[::1]:41234", "[::ffff:127.0.0.1]:41234"] {
+            let response = service
+                .call(rest_call_from(peer).to_srv_request())
+                .await
+                .expect("the middleware always answers");
+            assert_eq!(response.status(), StatusCode::OK, "from {peer}");
+        }
+    }
+
+    fn retry_after<B>(response: &ServiceResponse<B>) -> u64 {
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("a 429 always says when to come back")
+            .to_str()
+            .expect("the delay is text")
+            .parse()
+            .expect("the delay is a whole number of seconds")
+    }
+
+    async fn body<B: MessageBody>(response: ServiceResponse<B>) -> String {
+        let Ok(bytes) = actix_web::body::to_bytes(response.into_body()).await else {
+            panic!("the body reads");
+        };
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
     }
 
     fn challenge<B>(response: &ServiceResponse<B>) -> &str {
