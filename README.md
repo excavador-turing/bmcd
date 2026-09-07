@@ -2,7 +2,7 @@
 
 > **This is a fork of [turing-machines/bmcd](https://github.com/turing-machines/bmcd).**
 > `master` is upstream's `master`, commit for commit. **`hive` is the branch that
-> gets built**: nine functional commits on top of the `v2.3.7` tag, plus the CI
+> gets built**: ten functional commits on top of the `v2.3.7` tag, plus the CI
 > and documentation ones. Everything below the fold
 > is upstream's own README, unchanged.
 >
@@ -50,6 +50,7 @@ but the *fixes* have not been back on hardware.
 
 | not yet proven | what the change does |
 |---|---|
+| **A browser can open the serial console** | `/api/bmc/serial/ws` sits inside the authenticated `/api/bmc` scope, and the browser `WebSocket` constructor cannot set `Authorization` -- so the console worked from `curl` and answered a page with 401. A handshake that sends no `Authorization` header may now carry its bearer token as a websocket subprotocol, `Sec-WebSocket-Protocol: bmcd.serial.v1, bmcd.bearer.<token>`, which is what the Kubernetes API server does for `exec` and `attach`. The handshake response names the plain protocol back, never the credential, because a browser closes a connection the server did not answer with one of the names it offered. Not a query parameter: this daemon traces request paths, so a `?token=` would write the credential into the log. The fallback is read only off a complete handshake and only when `Authorization` is absent, so it is not a second way to authenticate a REST call; `Bearer`, `Basic` and the loopback exemption are untouched |
 | **The SoC temperature is reachable over the API** | The firmware only just gained a working SoC thermal sensor -- it was never described in any device tree, and the node had to be added -- and nothing in the daemon exposed it, so the web UI could not show a temperature at all. `opt=get&type=thermal` now returns two lists: every `thermal_zone*` as a `name` (the zone's `type`, `bmc-thermal` here) and a `temperature_c`, and every `cooling_device*` as a `name`, `cur_state` and `max_state`. Read straight from `/sys/class/thermal`, no shelling out. Millidegrees are converted to degrees at one decimal -- the board reads `52539`, which is `52.5` -- because raw millidegrees are unreadable and a whole degree throws away detail the sensor has. A board with no thermal zone at all, which is every image before this one and every v2.4 board, is a 200 with two empty lists: a caller has to be able to tell "this board cannot measure temperature" from "this board is at 0 degrees". `type=cooling` is untouched |
 | **The switch's own link state is reachable over the API** | Nothing in the daemon reported anything about the on-board Ethernet switch, although the kernel registers a netdev per port and knows all of it. `opt=get&type=network` now returns, for each of `node1`-`node4`, `ge0` and `ge1`: whether it is a node port or an uplink, whether the kernel has it at all, carrier, `operstate`, speed, duplex and the four byte/error counters. Read straight from `/sys/class/net`, no shelling out. The failure it exists for is a kernel where the switch driver does not probe -- the BMC stays perfectly reachable over its own interface while all four compute modules are cut off -- so every port is always listed and an absent one is `"present": false` rather than a missing entry or a 500 |
 | **`type=about` reports the board's serial number** | The 24c02 EEPROM at i2c 0x50 holds the factory serial next to the product name and the hardware revision, and the daemon already parses that header -- `board_model` and `board_revision` come out of it. `get_about` now also sends `board_serial` from the `FactorySerial` field of the same read, with the fixed-width field's NUL padding stripped and an unprogrammed EEPROM reported as `null` rather than as a string of padding. `board_model` and `board_revision` are left byte-for-byte as they were, padding included, because something may be matching on them |
@@ -137,6 +138,44 @@ Both schemes work. `Authorization: Basic` validates against the shadow hash on
 every request. `POST /api/bmc/authenticate` exchanges credentials for a bearer
 token, whose expiry (`token_expires`, default **10800 s** = 3 h) is counted from
 its *last successful use*, not from issue.
+
+**A websocket handshake has a third place to put the token.** The browser
+`WebSocket` constructor takes a URL and a list of subprotocols and nothing else
+-- a page cannot put a header on it -- so `/api/bmc/serial/ws` was reachable
+from `curl` and unreachable from a browser. A handshake that sends no
+`Authorization` header may name its bearer token as a subprotocol instead:
+
+```text
+Sec-WebSocket-Protocol: bmcd.serial.v1, bmcd.bearer.<token>
+```
+
+```js
+new WebSocket(`wss://${host}/api/bmc/serial/ws?node=0`,
+              ["bmcd.serial.v1", `bmcd.bearer.${token}`]);
+```
+
+`<token>` is the session token verbatim -- the `id` from
+`POST /api/bmc/authenticate`, which is also its `X-Auth-Token` header. It is 64
+characters of `[A-Za-z0-9]`, so it needs no encoding to be a legal subprotocol
+name. It is treated as `Authorization: Bearer <token>` and nothing else: same
+store, same expiry, same ban patrol.
+
+The daemon answers with the first offered name that is **not** a credential:
+
+```text
+Sec-WebSocket-Protocol: bmcd.serial.v1
+```
+
+It never echoes the credential, and a browser fails a connection the server
+answered with no subprotocol at all -- so **always offer a plain name, and put
+it first**. `bmcd.serial.v1` is the name to use for the console; the daemon
+does not care which it is. The fallback is read only off a complete websocket
+handshake -- `GET`, `Connection: upgrade`, `Upgrade: websocket`,
+`Sec-WebSocket-Version: 13` and a `Sec-WebSocket-Key` -- and only when
+`Authorization` is absent, so it cannot become a second way to authenticate an
+ordinary REST call. A token in the query string is **not** accepted, and that is
+the point: request paths are traced, and a `?token=` would put the credential in
+the log.
 
 The ban is per peer address and lives in `ban_patrol.rs`. The real numbers:
 `authentication_attempts` defaults to **5**, `BAN_DURATION` is **60 s** and

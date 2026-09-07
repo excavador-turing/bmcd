@@ -17,3 +17,4 @@ pub mod authentication_service;
 pub mod ban_patrol;
 pub mod linux_authenticator;
 pub mod passwd_validator;
+pub mod websocket_subprotocol;

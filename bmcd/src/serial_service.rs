@@ -17,6 +17,7 @@ use crate::api::{
     get_node_param,
     into_legacy_response::{LegacyResponse, LegacyResult},
 };
+use crate::authentication::websocket_subprotocol::echo_selected_protocol;
 use crate::serial_service::serial_websocket::run_websocket;
 use actix_web::{
     post, route,
@@ -101,7 +102,14 @@ async fn handle_ws(
     serials: web::Data<SerialConnections>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let node = get_node_param(&query)?;
-    let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+    let (mut res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+    // A browser fails the connection unless the server names one of the
+    // subprotocols the client offered, and a browser is the only client that
+    // has to put its credential in that header in the first place. Done for
+    // every handshake, not just the ones that authenticated that way: a client
+    // may offer a subprotocol whether it sent an `Authorization` header, a
+    // subprotocol token, or -- coming from loopback -- nothing at all.
+    echo_selected_protocol(req.head(), &mut res);
     match serials[node].open_channel() {
         Ok((stream, sink)) => {
             run_websocket(session, msg_stream, stream, sink).await;

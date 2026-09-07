@@ -15,6 +15,7 @@ use super::{
     authentication_context::AuthenticationContext,
     authentication_errors::{AuthenticationError, SchemedAuthError},
     passwd_validator::UnixValidator,
+    websocket_subprotocol::{bearer_token, is_websocket_handshake},
 };
 use actix_web::{
     body::{EitherBody, MessageBody},
@@ -25,7 +26,7 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 use futures::StreamExt;
 use serde::Serialize;
-use std::{rc::Rc, sync::Arc};
+use std::{borrow::Cow, rc::Rc, sync::Arc};
 use tokio::sync::Mutex;
 
 /// This authentication service is designed to prepare for implementing "Redfish
@@ -102,14 +103,12 @@ where
                 return authentication_request(&mut request, &peer, &mut context).await;
             }
 
-            let auth = match parse_authorization_header(&request) {
-                Ok(p) => p,
-                Err(e) => {
-                    return unauthorized_response(request.request(), e.into_basic_error(), realm)
-                }
+            let authorized = match credential_line(&request) {
+                Ok(auth) => context.authorize_request(&peer, &auth).await,
+                Err(e) => Err(e.into_basic_error()),
             };
 
-            if let Err(e) = context.authorize_request(&peer, auth).await {
+            if let Err(e) = authorized {
                 unauthorized_response(request.request(), e, realm)
             } else {
                 service
@@ -138,6 +137,36 @@ async fn authentication_request<B>(
     };
 
     response
+}
+
+/// The credential this request offers, written as an HTTP authorization line
+/// for [`AuthenticationContext::authorize_request`] to take apart.
+///
+/// `Authorization` is where it lives for every client that can set a header.
+/// A browser opening a websocket cannot: the `WebSocket` constructor takes a
+/// URL and a list of subprotocols and nothing else, which left the serial
+/// console reachable from `curl` and unreachable from a page. Such a request
+/// may name its bearer token as a subprotocol instead, and this turns that
+/// back into the `Bearer <token>` line the rest of the stack already
+/// understands -- so the token store, the expiry and the ban patrol all treat
+/// it exactly as they treat a header. See
+/// [`super::websocket_subprotocol`] for the format.
+///
+/// The fallback is deliberately narrow. It applies only when `Authorization`
+/// is absent -- a header that is there but unreadable is still that header's
+/// error -- and only to a request that is a complete websocket handshake, so
+/// it cannot become a second way to authenticate an ordinary REST call.
+fn credential_line(request: &ServiceRequest) -> Result<Cow<'_, str>, AuthenticationError> {
+    match parse_authorization_header(request) {
+        Ok(line) => Ok(Cow::Borrowed(line)),
+        Err(AuthenticationError::Empty) if is_websocket_handshake(request.head()) => {
+            match bearer_token(request.head()) {
+                Some(token) => Ok(Cow::Owned(format!("Bearer {}", token))),
+                None => Err(AuthenticationError::Empty),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_authorization_header(request: &ServiceRequest) -> Result<&str, AuthenticationError> {
@@ -191,4 +220,214 @@ fn unauthorized_response<B>(
         request.clone(),
         response,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authentication::authentication_context::tests::build_test_context;
+    use actix_web::body::BoxBody;
+    use actix_web::dev::fn_service;
+    use actix_web::http::StatusCode;
+    use actix_web::test::TestRequest;
+    use base64::{engine::general_purpose, Engine as _};
+    use tokio::time::Instant;
+
+    /// A token the store knows, and an account whose shadow hash matches
+    /// `PASSWORD`. Both are built fresh for every call, so no test can leave a
+    /// ban or an aged token behind for the next one.
+    const TOKEN: &str = "9RmQ0OGpXwYbLJ1t";
+    const PASSWORD: &str = "hunter2";
+
+    /// The middleware in front of a route that answers 200 to anything that
+    /// reaches it, so the status alone says whether the request got through.
+    async fn call(request: ServiceRequest) -> ServiceResponse<EitherBody<BoxBody>> {
+        let context = build_test_context(
+            [(TOKEN.to_string(), Instant::now())],
+            [(
+                "root".to_string(),
+                pwhash::sha512_crypt::hash(PASSWORD).expect("a shadow hash"),
+            )],
+        );
+
+        let route = Rc::new(fn_service(|request: ServiceRequest| async move {
+            Ok::<_, Error>(request.into_response(HttpResponse::Ok().body("reached the route")))
+        }));
+
+        AuthenticationService::new(
+            route,
+            Arc::new(Mutex::new(context)),
+            "/api/bmc/authenticate",
+            "test realm",
+        )
+        .call(request)
+        .await
+        .expect("the middleware always answers")
+    }
+
+    fn basic(user: &str, password: &str) -> String {
+        let credentials = general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        format!("Basic {credentials}")
+    }
+
+    /// A request from somewhere other than the board itself, so the
+    /// authentication middleware actually runs.
+    fn rest_call() -> TestRequest {
+        TestRequest::get()
+            .uri("/api/bmc?opt=get&type=power")
+            .peer_addr("192.168.1.10:41234".parse().expect("a peer address"))
+    }
+
+    /// The four headers a browser puts on the wire for `new WebSocket(...)`.
+    fn handshake() -> TestRequest {
+        TestRequest::get()
+            .uri("/api/bmc/serial/ws?node=0")
+            .peer_addr("192.168.1.10:41234".parse().expect("a peer address"))
+            .insert_header((header::CONNECTION, "Upgrade"))
+            .insert_header((header::UPGRADE, "websocket"))
+            .insert_header((header::SEC_WEBSOCKET_VERSION, "13"))
+            .insert_header((header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ=="))
+    }
+
+    fn subprotocols() -> String {
+        format!("bmcd.serial.v1, bmcd.bearer.{TOKEN}")
+    }
+
+    /// Both header schemes, exactly as before. `tpi` and `curl` reach the
+    /// daemon this way and nothing about that has moved.
+    #[actix_web::test]
+    async fn an_authorization_header_still_authenticates() {
+        let bearer = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(bearer.status(), StatusCode::OK);
+
+        let basic = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(basic.status(), StatusCode::OK);
+    }
+
+    /// And still refuses what it always refused, with the same challenge.
+    #[actix_web::test]
+    async fn a_wrong_authorization_header_is_still_rejected() {
+        let bearer = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, "Bearer not-a-token"))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(bearer.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&bearer).starts_with("Bearer "));
+
+        let basic = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, basic("root", "not the password")))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(basic.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&basic).starts_with("Basic "));
+
+        let nothing = call(rest_call().to_srv_request()).await;
+        assert_eq!(nothing.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The loopback exemption. The firmware's boot-time health gate probes
+    /// `https://127.0.0.1/` while a new image is on trial, so a 401 here would
+    /// not be an inconvenience -- it would roll the firmware back.
+    #[actix_web::test]
+    async fn a_request_from_loopback_needs_no_credentials() {
+        for peer in ["127.0.0.1:41234", "[::1]:41234", "[::ffff:127.0.0.1]:41234"] {
+            let response = call(
+                TestRequest::get()
+                    .uri("/api/bmc?opt=get&type=power")
+                    .peer_addr(peer.parse().expect("a peer address"))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "from {peer}");
+        }
+    }
+
+    /// The new path: a browser's handshake, with the token where the
+    /// `WebSocket` constructor can put it.
+    #[actix_web::test]
+    async fn a_subprotocol_token_authenticates_an_upgrade() {
+        let response = call(
+            handshake()
+                .insert_header((header::SEC_WEBSOCKET_PROTOCOL, subprotocols()))
+                .to_srv_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A token the store does not know is refused as a bearer token, because
+    /// that is all it ever was.
+    #[actix_web::test]
+    async fn a_subprotocol_token_the_store_does_not_know_is_rejected() {
+        let response = call(
+            handshake()
+                .insert_header((
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    "bmcd.serial.v1, bmcd.bearer.not-a-token",
+                ))
+                .to_srv_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&response).starts_with("Bearer "));
+    }
+
+    /// The reason the fallback is gated on the whole handshake and not on a
+    /// header or two: the identical `Sec-WebSocket-Protocol` on an ordinary
+    /// REST call buys nothing at all.
+    #[actix_web::test]
+    async fn a_rest_call_carrying_the_same_header_is_not_authenticated() {
+        let response = call(
+            rest_call()
+                .insert_header((header::SEC_WEBSOCKET_PROTOCOL, subprotocols()))
+                .to_srv_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The fallback fills in for an absent `Authorization` header and does
+    /// nothing else. A handshake with no credential anywhere is still a 401,
+    /// and a handshake whose header is wrong is not rescued by a good token in
+    /// its subprotocols -- the header that is there is the one that counts.
+    #[actix_web::test]
+    async fn the_fallback_only_fills_in_for_an_absent_header() {
+        let bare = call(handshake().to_srv_request()).await;
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+
+        let contradicted = call(
+            handshake()
+                .insert_header((header::AUTHORIZATION, "Bearer not-a-token"))
+                .insert_header((header::SEC_WEBSOCKET_PROTOCOL, subprotocols()))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(contradicted.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn challenge<B>(response: &ServiceResponse<B>) -> &str {
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("a 401 always carries a challenge")
+            .to_str()
+            .expect("the challenge is text")
+    }
 }
