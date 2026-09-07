@@ -819,10 +819,11 @@ mod test {
     }
 
     /// The exact bytes `opt=get&type=thermal` puts on the wire, for the board
-    /// as it reads today: the SoC sensor at 52539 millidegrees and the fan the
-    /// kernel drives from it on step 4 of 6. `thermal_info`'s own tests assert
-    /// that that sysfs reads back as this `Thermal`, so between them the chain
-    /// from the files to the response body is covered.
+    /// as it reads today: the SoC sensor at 52539 millidegrees, and the fan
+    /// the kernel drives from it on step 4 of 6 with the duty behind each of
+    /// those steps out of the board's device tree. `thermal_info`'s own tests
+    /// assert that sysfs and that device tree read back as this `Thermal`, so
+    /// between them the chain from the files to the response body is covered.
     ///
     /// The keys come out sorted rather than in the order the structs declare
     /// them. That is not this endpoint's doing: `LegacyResponse` carries its
@@ -844,6 +845,8 @@ mod test {
                 cur_state: Some(4),
                 max_state: Some(6),
                 present: true,
+                levels: Some(vec![0, 16, 32, 64, 102, 170, 254]),
+                max_level: Some(254),
             }],
         };
 
@@ -857,7 +860,8 @@ mod test {
             std::str::from_utf8(&body).expect("utf8"),
             concat!(
                 r#"{"response":[{"result":{"#,
-                r#""cooling":[{"cur_state":4,"max_state":6,"name":"pwm-fan","present":true}],"#,
+                r#""cooling":[{"cur_state":4,"levels":[0,16,32,64,102,170,254],"#,
+                r#""max_level":254,"max_state":6,"name":"pwm-fan","present":true}],"#,
                 r#""sensors":[{"name":"bmc-thermal","present":true,"temperature_c":52.5}]"#,
                 r#"}}]}"#,
             )
