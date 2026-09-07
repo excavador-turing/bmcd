@@ -163,8 +163,8 @@ impl UpgradeWorker {
         if expected_crc != dev_checksum {
             bail!(
                 "crc error. expected {}, calculated {}",
-                expected_crc.to_string(),
-                dev_checksum.to_string()
+                expected_crc,
+                dev_checksum
             );
         }
 
@@ -334,7 +334,7 @@ mod test {
 
     fn random_array<const SIZE: usize>() -> Vec<u8> {
         let mut array = vec![0; SIZE];
-        rand::thread_rng().fill_bytes(&mut array);
+        rand::rng().fill_bytes(&mut array);
         array
     }
 
