@@ -2,9 +2,11 @@
 
 > **This is a fork of [turing-machines/bmcd](https://github.com/turing-machines/bmcd).**
 > `master` is upstream's `master`, commit for commit. **`hive` is the branch that
-> gets built**: eleven functional commits on top of the `v2.3.7` tag, plus the CI
-> and documentation ones. Everything below the fold
-> is upstream's own README, unchanged.
+> gets built**: nineteen functional commits on top of the `v2.3.7` tag, plus the
+> CI, build-tooling and documentation ones. That count has gone stale twice
+> already, so read `git log --oneline v2.3.7..hive` for the list and this
+> sentence for the size. Everything below the fold is upstream's own README,
+> unchanged.
 >
 > The daemon does not ship on its own. Our [BMC firmware
 > fork](https://github.com/excavador/tp2-bmc-firmware) pins it *by commit* and
@@ -43,10 +45,11 @@ cold-boot path.
 `27ec80f`, and the bump to `df1e8ec` sits on an open firmware pull request.
 Read these as a diff with an argument behind it, not as behaviour.
 
-The last four of them do come from measurements taken on the board -- `ge1`
-sitting at `lowerlayerdown`, the serial in the EEPROM, three power-on times
-resetting to the BMC's own uptime, `tpi info` disagreeing with the about page --
-but the *fixes* have not been back on hardware.
+Four of them do come from measurements taken on the board -- the switch link
+state (`ge1` sitting at `lowerlayerdown`), the board serial in the EEPROM, three
+power-on times resetting to the BMC's own uptime, and `tpi info` disagreeing
+with the about page -- but the *fixes* have not been back on hardware. They were
+the last four when that was written; there are ten more behind them now.
 
 | not yet proven | what the change does |
 |---|---|
@@ -55,12 +58,13 @@ but the *fixes* have not been back on hardware.
 | **The switch's own link state is reachable over the API** | Nothing in the daemon reported anything about the on-board Ethernet switch, although the kernel registers a netdev per port and knows all of it. `opt=get&type=network` now returns, for each of `node1`-`node4`, `ge0` and `ge1`: whether it is a node port or an uplink, whether the kernel has it at all, carrier, `operstate`, speed, duplex and the four byte/error counters. Read straight from `/sys/class/net`, no shelling out. The failure it exists for is a kernel where the switch driver does not probe -- the BMC stays perfectly reachable over its own interface while all four compute modules are cut off -- so every port is always listed and an absent one is `"present": false` rather than a missing entry or a 500 |
 | **The A/B firmware slots are reachable over the API** | The board takes firmware upgrades A/B -- the new image goes into the rootfs UBI volume that is not running, `nextboot` sends U-Boot at it once, and a promotion script keeps it or puts the old one back -- and nothing in the API said which volume the board booted, how big either is, whether an upgrade is waiting for the next boot, or what the promotion script decided last time. `opt=get&type=firmware_slots` now answers all four, from `/sys/class/ubi`, `fw_printenv -n nextboot` and the tail of `/mnt/overlay/postupdate.log`. The running slot is the volume with a `ubiblock` device attached, not the one called `rootfs`. Its version comes from `/etc/os-release`; **the rollback volume is not mounted, so it has a name and a size and no version** rather than a guessed one. A board with no UBI, or without `fw_printenv`, answers 200 with `"present": false` and nulls -- and `update_staged` is `null` rather than `false`, because "nothing is staged" and "the environment could not be read" are different answers. Not `type=firmware`: that name has belonged to the transfer machinery since long before this fork |
 | **The BMC's own condition is reachable over the API** | Everything the daemon reported was about the four compute modules or the board's peripherals; nothing was about the board running the daemon, which has 116 MB of RAM, five spare NAND eraseblocks and two clocks. `opt=get&type=health` now returns uptime and load from `/proc`, memory in bytes rather than meminfo's kibibytes, UBI's own eraseblock accounting from `/sys/class/ubi/ubi0` -- the same 2040 total, 5 available, 0 bad and 40 reserved that `ubinfo` prints, without the fork or the dependency on mtd-utils being in the image -- and every RTC the kernel registered. Clock synchronisation is the one thing that is not a file read: `chronyc tracking` is parsed for the stratum, the source and the offset, reported as system clock minus true time so a board that is behind is negative. `measured_by` says so. A board with no chrony answers `null` rather than `false`, because "not synchronised" and "we cannot tell" are different answers, and which of the two RTCs has a battery behind it is not claimed at all -- the kernel does not expose it |
-| **There is a Prometheus scrape endpoint** | `/metrics` used to return the web UI's `index.html` through the catch-all, which is worse than a 404: a scraper sees HTTP 200 and a document it cannot parse. It now returns the text exposition format -- SoC temperature and fan state, per-port link, speed and byte/error counters, per-node power state and power-on time, the health values above, and the firmware slots as an info metric. Hand-written, no metrics crate: the format is two comment lines and a sample per value, and this daemon is cross-compiled into a firmware image that is at 78% of its flash slot. **It is authenticated**, behind the same `LinuxAuthenticator` that wraps `/api/bmc`, which accepts HTTP Basic -- so a scrape config authenticates with `basic_auth` and nothing else. Adding a second unauthenticated surface next to `/info` would have been the same finding twice |
+| **There is a Prometheus scrape endpoint** | `/metrics` used to return the web UI's `index.html` through the catch-all, which is worse than a 404: a scraper sees HTTP 200 and a document it cannot parse. It now returns the text exposition format -- SoC temperature and fan state, per-port link, speed and byte/error counters, per-node power state and power-on time, the health values above, and the firmware slots as an info metric. Hand-written, no metrics crate: the format is two comment lines and a sample per value, and this daemon is cross-compiled into a firmware image that is at 78% of its flash slot. **It is authenticated**, behind the same `LinuxAuthenticator` that wraps `/api/bmc`, which accepts HTTP Basic -- so a scrape config authenticates with `basic_auth` and nothing else. Adding a second unauthenticated surface next to what `/info` was at the time would have been the same finding twice; `/info` itself has since been removed outright (`e4e5eee`) |
 | **`type=about` reports the board's serial number** | The 24c02 EEPROM at i2c 0x50 holds the factory serial next to the product name and the hardware revision, and the daemon already parses that header -- `board_model` and `board_revision` come out of it. `get_about` now also sends `board_serial` from the `FactorySerial` field of the same read, with the fixed-width field's NUL padding stripped and an unprogrammed EEPROM reported as `null` rather than as a string of padding. `board_model` and `board_revision` are left byte-for-byte as they were, padding included, because something may be matching on them |
 | **`power_on_time` stops resetting for nodes 2, 3 and 4 on every daemon start** | `update_power_on_times` compared the new state of a node, which `bit_iterator` yields as 0 or 1, against `activated_nodes & (1 << idx)`, which is 0 or `1 << idx`. Those agree only for node 1. For every other node "already on, staying on" looked like a transition, so `initialize_power` -- which calls `activate_slot` on every start -- rewrote their power-on stamp to the moment the daemon came up. Measured after a BMC reboot with four modules running: node 1 at 52418 s, matching its own `/proc/uptime`, and nodes 2, 3 and 4 at 172 s, the BMC's own uptime. The comparison is now shifted down. Upstream bug, from 2023; boards carrying a wrong stamp recover it at the next real power cycle of that node |
 | **The About page stops saying `Build version: vundefined`** | The web UI reads the daemon version from a key named `build_version`; `get_about` only ever sent `bmcd_version`. It now sends the same value under both names — `bmcd_version` stays, it is the documented key of the legacy API. The value is bmcd's own crate version (`2.3.7`), not the firmware release. The UI's *other* version bug, the doubled `v` in `vv2.2.0-…`, is on the UI side and is untouched here |
 | **The About page reports the Buildroot release instead of the firmware name** | `get_about` filled its `buildroot` field from `PRETTY_NAME` in `/etc/os-release`, which our firmware stamps with the Turing Pi release — so a board built on Buildroot 2025.02.17 called its "Buildroot release" `Turing Pi v2.2.0`. It now prefers a `BUILDROOT_VERSION` key and falls back to `PRETTY_NAME`. The key is written by the firmware's `post_build.sh` from Buildroot's own `BR2_VERSION`, and that too is still on the open firmware PR, so an image built today has only the fallback to offer. `get_system_information` was left alone at the time and is fixed by the row below |
-| **`tpi info` reports the Buildroot release too** | The fix above only reached `get_about`. `get_system_information` -- `opt=get&type=other`, and the unauthenticated `GET /info` -- kept deriving its `buildroot` field from `PRETTY_NAME`, so on the same board `type=about` answered `2025.02.17` while `type=other` answered `Turing Pi v2.2.0`, and `tpi info` reads the latter. Both now call one `buildroot_release` helper rather than spelling the rule out a third time. `type=other` also loses the surrounding quotes it used to pass through from the raw os-release line |
+| **`tpi info` reports the Buildroot release too** | The fix above only reached `get_about`. `get_system_information` -- `opt=get&type=other`, and the then-unauthenticated `GET /info`, since removed -- kept deriving its `buildroot` field from `PRETTY_NAME`, so on the same board `type=about` answered `2025.02.17` while `type=other` answered `Turing Pi v2.2.0`, and `tpi info` reads the latter. Both now call one `buildroot_release` helper rather than spelling the rule out a third time. `type=other` also loses the surrounding quotes it used to pass through from the raw os-release line |
+| **HTTP/2 is no longer offered, so its parser is not reachable before authentication** | The HTTPS listener advertised `h2` over ALPN, which puts HTTP/2 frame parsing in front of the authentication middleware -- an unauthenticated caller was inside the h2 codec just by connecting, and the h2 this tree resolves to is 0.3.27 with RUSTSEC-2026-0258 and no fixed 0.3.x to move to. The acceptor now offers `http/1.1` and nothing else, and an h2-only client gets no ALPN agreement rather than one the daemon does not want to honour. This could not be done by configuring the acceptor and calling `bind_openssl`: that method overwrites the ALPN callback with its own `h2`-preferring one, silently, so the listener is now assembled directly from an `HttpService`, `.h1()` rather than `.finish()`, which is what `bind_openssl` does internally minus the overwrite. Measured before and after against a running daemon, `openssl s_client -alpn h2,http/1.1` goes from `h2` to `http/1.1`, and an unauthenticated request goes from `HTTP/2 401` to `HTTP/1.1 401`. A websocket handshake from an h2-capable client used to negotiate `h2` and be answered 400 by the h2 dispatcher, since actix-web 4 cannot upgrade over HTTP/2; it now reaches the handler |
 | **A firmware upload is staged on disk rather than in the RAM disk** | `os_update` copied the whole uploaded image into `/tmp/os_upgrade` before handing it to `osupdate`. `select_staging_dir` now takes the first of `/mnt/sdcard`, `/mnt/overlay`, `/tmp` that is a mount point *of its own*, is mounted read-write, and has room for the image. The mount-point test is what rejects an SD card that is not inserted — `/mnt/sdcard` exists as an empty directory either way, and a write into it would land on the root filesystem. Node flashing does not go through here; `flash_node` streams straight to the node block device |
 
 Be careful with the last one, because the evidence is thinner than the story.
@@ -129,8 +133,11 @@ compare the whole parameter value -- a `type` that merely *starts* with
 `firmware` was being swallowed by the transfer machinery. The
 transfer itself is not query-string RPC: `POST /api/bmc/upload/{handle}` streams
 the bytes and `GET /api/bmc/upload/{handle}/cancel` aborts it. Alongside those
-sit `GET /api/bmc/backup` (a tar of `/mnt/overlay/upper`), `GET /api/bmc/info`,
+sit `GET /api/bmc/backup` (a tar of `/mnt/overlay/upper`),
 `POST /api/bmc/serial/status`, and the serial websocket at `/api/bmc/serial/ws`.
+There is no `GET /api/bmc/info`: it answers 401 unauthenticated, which makes it
+look like a route, and once authenticated it falls through to the SPA and
+returns `index.html`.
 
 ### Authentication is `/etc/shadow`, watched
 
@@ -207,15 +214,27 @@ or from `/metrics` — a client that treats 401 and 429 alike will read a
 lockout as a credential problem, which is precisely the bug this replaced.
 Loopback never sees it: that exemption is taken before the ban is consulted.
 
-### One endpoint answers without authentication
+### One thing answers without authentication
 
-Two, really. Requests whose peer address is loopback skip the authentication
-middleware entirely — that is how anything on the board talks to the daemon. And
-when `redirect_http` is true the daemon also runs a plain-HTTP server on port 80
-whose only job is to redirect to HTTPS; that server is built with `info_config`
-but **without** the authentication wrapper, so `http://<board>/info` returns the
-API version, build time, IPv4 address, `br0` MAC, firmware version and
-`PRETTY_NAME` to anyone who asks.
+The loopback exemption, and nothing else. Requests whose peer address is
+loopback skip the authentication middleware entirely — that is how anything on
+the board talks to the daemon.
+
+There used to be a second, and this section used to say so. When `redirect_http`
+is true the daemon runs a plain-HTTP server on port 80 whose only job is to
+redirect to HTTPS, and `/info` was registered on it **without** the
+authentication wrapper the HTTPS server gets — so `http://<board>/info` returned
+the API version, build time, IPv4 address, `br0` MAC, firmware version and
+`PRETTY_NAME` to anyone who could reach port 80, in the clear, and passively
+readable by anything on the segment. `e4e5eee` removed it (SQU-125).
+
+It was a removal rather than a move because there was nowhere to move it to:
+`info_handler` was registered only through `info_config`, and `info_config` only
+on that redirect server, so no authenticated equivalent existed. The same data
+is available authenticated at `/api/bmc?opt=get&type=info`. Port 80 now does
+nothing but redirect. **This deletes a public interface of upstream's daemon** —
+anything outside this estate polling `http://<board>/info`, a discovery script
+or a monitoring probe, stops getting an answer.
 
 ### The scrape endpoint authenticates like everything else
 
@@ -290,6 +309,21 @@ rustfmt nor clippy. `--workspace` is, for the same virtual-manifest reason as
 above. This builds for the host, not for `armv7`; it is a correctness check, and
 the real cross build is the firmware's.
 
+Add `--features stubbed` to the clippy and test lines to cover the other half.
+That feature replaces the GPIO and sysfs HAL with an in-memory simulation, and
+is the only way to build or run this daemon with no Turing Pi board under it.
+It had not compiled since before `v2.3.7` — nothing built it — so `Cargo CI`
+now runs clippy and the tests with it on as well as off. Not `--all-features`:
+the other feature is `vendored`, which statically links OpenSSL for
+cross-builds and would have the job compile OpenSSL from source for nothing.
+
+A `stubbed` build will also *run* on a workstation, which is how an
+ALPN-shaped or middleware-shaped change gets checked against a real socket
+rather than argued about. It wants a config file pointing at a certificate and
+key of its own, a `www` directory, a writable `/var/lib/bmcd`, and
+`/dev/input/event0` — the front-panel power button; without it the daemon
+starts and only warns.
+
 **Clippy is at zero warnings on `hive`, and should stay there.** The three
 warnings inherited from the `v2.3.7` tag — `rand::thread_rng` deprecated twice
 in test helpers, and `needless_lifetimes` on `WriteMonitor` — were fixed on
@@ -322,6 +356,10 @@ path), `tracing-subscriber` (ANSI escapes from user input poisoning the log —
 bmcd logs failed usernames), plus `tokio`, `crossbeam-channel` and two crates
 that had been yanked.
 
+`actix-http` and `actix-service` became direct dependencies when the HTTPS
+listener stopped going through `HttpServer::bind_openssl`. Both were already in
+the tree beneath `actix-web`; the lockfile gained two lines and no crate.
+
 Resolution is pinned to **Rust 1.85**. A plain `cargo update` pulls actix-web
 4.15, `serde_with` 3.22, `time` 0.3.55 and the `icu_*` family, all of which now
 require rustc 1.88 and none of which compile here, so they are held one minor
@@ -329,12 +367,13 @@ behind on purpose. Raising the toolchain is a decision about the Buildroot
 toolchain, not about this repo — and it has to happen together with
 `Cargo.lock`, `cargo_ci.yml` and `bmcd.hash`.
 
-Three advisories were **declined**, each because closing it needs a major bump
-or a toolchain move:
+Three advisories are still open in the lockfile. One of them has since been
+closed off in the daemon rather than in the dependency; the other two are
+**declined**, each because closing it needs a major bump or a toolchain move:
 
 | advisory | reachable here? | why it is still open |
 |---|---|---|
-| `h2` 0.3.27 — RUSTSEC-2026-0258, unbounded empty DATA frames | **Yes, and pre-authentication.** `bind_openssl` advertises `h2` over ALPN, so a peer reaches HTTP/2 framing before the auth middleware runs | No fix exists at any version. The patch is in `h2 >= 0.4.16`, and every `actix-http` up to the newest (3.13.5) still pins `h2` 0.3.27. Only an actix-web 5 migration, or an upstream backport, closes it |
+| `h2` 0.3.27 — RUSTSEC-2026-0258, unbounded empty DATA frames | **No longer.** It was, and pre-authentication: `bind_openssl` advertised `h2` over ALPN, so a peer reached HTTP/2 framing before the auth middleware ran. The listener now offers `http/1.1` and nothing else, and is built from an `HttpService` with `.h1()`, so the HTTP/2 dispatcher is never constructed — see the row on it above | Still no fix at any version. The patch is in `h2 >= 0.4.16`, and every `actix-http` up to the newest (3.13.5) still pins `h2` 0.3.27, so only an actix-web 5 migration or an upstream backport takes the advisory off the list. The crate is compiled into the binary and unreachable; dropping actix-web's default `http2` feature would take it out of the graph entirely and is its own decision |
 | `time` 0.3.45 — RUSTSEC-2026-0009, stack exhaustion | No. The flaw is in the RFC 2822 parse path; nothing in the graph uses it. actix parses HTTP dates with `httpdate`, `tracing-appender` only formats its own filename suffixes, and bmcd never touches cookies | Patched 0.3.47 requires rustc 1.88 |
 | `remove_dir_all` 0.5.3 — RUSTSEC-2023-0018, TOCTOU | No. It arrives via the `tempdir` **dev-dependency** and is not in the shipped binary | Fixing it means replacing `tempdir` with `tempfile`, a test-code change left for its own decision |
 
