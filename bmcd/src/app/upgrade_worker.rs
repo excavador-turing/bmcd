@@ -18,8 +18,10 @@ use crate::utils::WriteMonitor;
 use anyhow::bail;
 use crc::{Crc, CRC_64_REDIS};
 use humansize::{format_size, DECIMAL};
+use nix::sys::statvfs::{statvfs, FsFlags};
 use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -35,7 +37,21 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const TMP_UPGRADE_DIR: &str = "/tmp/os_upgrade";
+/// Directories an uploaded firmware image can be staged in, most preferred
+/// first:
+///
+/// * `/mnt/sdcard` holds tens of gigabytes when a card is inserted and costs no
+///   NAND wear.
+/// * `/mnt/overlay` is the UBIFS overlay of about 150MB. It is always mounted,
+///   and is what is left when there is no SD card.
+/// * `/tmp` is a tmpfs, which is RAM. The BMC has 116MB of it in total and the
+///   tmpfs is capped at 58MB, so staging a 38MiB image here got the daemon
+///   killed halfway through the copy. It stays last in the list because it is
+///   the only writable place left when nothing else is mounted.
+const UPGRADE_STAGING_DIRS: [&str; 3] = ["/mnt/sdcard", "/mnt/overlay", "/tmp"];
+/// Directory created under the chosen staging location, removed again when
+/// `osupdate` returns.
+const UPGRADE_DIR_NAME: &str = "os_upgrade";
 const BLOCK_WRITE_SIZE: usize = BLOCK_READ_SIZE; // 512Kib
 const BLOCK_READ_SIZE: usize = 524288; // 512Kib
 
@@ -157,13 +173,17 @@ impl UpgradeWorker {
 
     pub async fn os_update(mut self) -> anyhow::Result<()> {
         let file_name = self.data_transfer.file_name()?.to_owned();
+        // Read the size before the reader is taken: on a URL transfer it is the
+        // content-length of a response that `reader()` consumes.
+        let image_size = self.data_transfer.size()?;
         let source = self.data_transfer.reader().await?;
         tracing::info!("start firmware upgrade {}", file_name.to_string_lossy());
 
-        let mut os_update_img = PathBuf::from(TMP_UPGRADE_DIR);
+        let staging_dir = select_staging_dir(image_size);
+        let mut os_update_img = staging_dir.clone();
         os_update_img.push(&file_name);
 
-        tokio::fs::create_dir_all(TMP_UPGRADE_DIR).await?;
+        tokio::fs::create_dir_all(&staging_dir).await?;
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -184,7 +204,7 @@ impl UpgradeWorker {
         })
         .await?;
 
-        tokio::fs::remove_dir_all(TMP_UPGRADE_DIR).await?;
+        tokio::fs::remove_dir_all(&staging_dir).await?;
 
         let success = result?;
         if !success.success() {
@@ -192,6 +212,80 @@ impl UpgradeWorker {
         }
 
         Ok(())
+    }
+}
+
+/// Selects the directory to stage a firmware image in. Returns the first entry
+/// of [`UPGRADE_STAGING_DIRS`] that is a mount point of its own, is mounted
+/// read-write, and has room for `image_size` bytes. When none of them
+/// qualifies it falls back to `/tmp`, which is where every image was staged
+/// before this function existed.
+fn select_staging_dir(image_size: u64) -> PathBuf {
+    for candidate in UPGRADE_STAGING_DIRS {
+        let path = Path::new(candidate);
+
+        if !is_mount_point(path) {
+            tracing::debug!("staging: {} is not a mount point", candidate);
+            continue;
+        }
+
+        let stat = match statvfs(path) {
+            Ok(stat) => stat,
+            Err(e) => {
+                tracing::debug!("staging: cannot stat {}: {}", candidate, e);
+                continue;
+            }
+        };
+
+        if stat.flags().contains(FsFlags::ST_RDONLY) {
+            tracing::debug!("staging: {} is mounted read-only", candidate);
+            continue;
+        }
+
+        let free = stat.blocks_free() as u64 * stat.fragment_size() as u64;
+        if free < image_size {
+            tracing::debug!(
+                "staging: {} has {} free, the image needs {}",
+                candidate,
+                format_size(free, DECIMAL),
+                format_size(image_size, DECIMAL)
+            );
+            continue;
+        }
+
+        tracing::info!(
+            "staging firmware image in {}/{}: first of {:?} that is a writable mount with room for it ({} free, image is {})",
+            candidate,
+            UPGRADE_DIR_NAME,
+            UPGRADE_STAGING_DIRS,
+            format_size(free, DECIMAL),
+            format_size(image_size, DECIMAL)
+        );
+        return path.join(UPGRADE_DIR_NAME);
+    }
+
+    tracing::info!(
+        "staging firmware image in /tmp/{}: none of {:?} is a writable mount with room for {}, falling back to the RAM disk",
+        UPGRADE_DIR_NAME,
+        UPGRADE_STAGING_DIRS,
+        format_size(image_size, DECIMAL)
+    );
+    PathBuf::from("/tmp").join(UPGRADE_DIR_NAME)
+}
+
+/// True when `path` is the root of a mount, i.e. its device id differs from the
+/// one of the directory it sits in. Both `/mnt/sdcard` and `/mnt/overlay` exist
+/// as empty directories when nothing is mounted on them, and writing an image
+/// there would land on the small root filesystem instead.
+fn is_mount_point(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        // `/` has no parent and is always a mount point.
+        return true;
+    };
+
+    match (path.metadata(), parent.metadata()) {
+        (Ok(dir), Ok(parent)) => dir.dev() != parent.dev(),
+        _ => false,
     }
 }
 
@@ -235,12 +329,33 @@ mod test {
 
     use super::*;
     use rand::RngCore;
+    use tempdir::TempDir;
     use tokio::io::BufWriter;
 
     fn random_array<const SIZE: usize>() -> Vec<u8> {
         let mut array = vec![0; SIZE];
         rand::thread_rng().fill_bytes(&mut array);
         array
+    }
+
+    #[test]
+    fn mount_point_detection() {
+        assert!(is_mount_point(Path::new("/")));
+        // a directory inside a mount shares the device id of its parent.
+        let dir = TempDir::new("staging_test").unwrap();
+        assert!(!is_mount_point(dir.path()));
+        // a directory that is not there cannot be written to either.
+        assert!(!is_mount_point(&dir.path().join("absent")));
+    }
+
+    #[test]
+    fn staging_dir_falls_back_to_tmp() {
+        // no filesystem has room for this, so every candidate is skipped and
+        // the historic location is returned.
+        assert_eq!(
+            select_staging_dir(u64::MAX),
+            PathBuf::from("/tmp/os_upgrade")
+        );
     }
 
     #[tokio::test]
