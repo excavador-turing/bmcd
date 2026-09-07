@@ -105,6 +105,29 @@ fn powered_nodes(node_states: u8) -> Vec<usize> {
         .collect()
 }
 
+/// Whether a node is changing power state, and to what.
+///
+/// # Arguments
+///
+/// * `activated_nodes`     bit-field of the nodes that are on now.
+/// * `idx`                 index of the node, 0-based.
+/// * `new_state`           the value the node is being set to, 0 or 1, as
+///     [`bit_iterator`] yields it.
+///
+/// # Returns
+///
+/// `Some(true)` when the node is being powered on, `Some(false)` when it is
+/// being powered off, and `None` when it is being left where it is.
+///
+/// The bit has to be shifted down before it can be compared with what
+/// `bit_iterator` yields. `bit_iterator` returns the state as 0 or 1;
+/// `activated_nodes & (1 << idx)` is 0 or `1 << idx`. Comparing the two
+/// directly is only ever right for node 1.
+fn power_transition(activated_nodes: u8, idx: usize, new_state: u8) -> Option<bool> {
+    let current_state = (activated_nodes >> idx) & 1;
+    (new_state != current_state).then_some(new_state == 1)
+}
+
 pub struct BmcApplication {
     pub(super) pin_controller: PinController,
     pub(super) power_controller: PowerController,
@@ -311,16 +334,10 @@ impl BmcApplication {
             .unwrap_or_default();
 
         for (idx, new_state) in bit_iterator(node_states, mask) {
-            let current_state = activated_nodes & (1 << idx);
-            let current_time = get_timestamp_unix();
-            let node_info = &mut node_infos[idx];
-
-            if new_state != current_state {
-                if new_state == 1 {
-                    node_info.power_on_time = current_time;
-                } else {
-                    node_info.power_on_time = None;
-                }
+            match power_transition(activated_nodes, idx, new_state) {
+                Some(true) => node_infos[idx].power_on_time = get_timestamp_unix(),
+                Some(false) => node_infos[idx].power_on_time = None,
+                None => (),
             }
         }
 
@@ -499,7 +516,11 @@ impl BmcApplication {
         let mut node_infos = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
         node_infos.iter_mut().for_each(|info| {
             if let Some(time) = &mut info.power_on_time {
-                *time = current_time - *time;
+                // saturating: the stored value is a wall-clock stamp, and the
+                // BMC has no RTC, so a clock that steps backwards once NTP
+                // lands would otherwise underflow this into an enormous
+                // uptime.
+                *time = current_time.saturating_sub(*time);
             }
         });
 
@@ -563,6 +584,38 @@ mod tests {
             startup_power_state(0b0000, 0b0000),
             StartupPowerState::Persisted(0b0000)
         );
+    }
+
+    #[test]
+    fn a_node_that_stays_on_keeps_its_power_on_time() {
+        // The regression. All four nodes on, all four asked to stay on, which
+        // is what `initialize_power` does on every start of the daemon. Every
+        // node has to come back None -- nothing changed, so no timestamp may
+        // be rewritten.
+        for idx in 0..4 {
+            assert_eq!(
+                power_transition(0b1111, idx, 1),
+                None,
+                "node {} was reported as a transition while staying on",
+                idx + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_that_stays_off_keeps_its_absent_power_on_time() {
+        for idx in 0..4 {
+            assert_eq!(power_transition(0b0000, idx, 0), None);
+        }
+    }
+
+    #[test]
+    fn powering_a_node_on_and_off_is_a_transition() {
+        for idx in 0..4 {
+            let others = 0b1111 & !(1 << idx);
+            assert_eq!(power_transition(others, idx, 1), Some(true));
+            assert_eq!(power_transition(0b1111, idx, 0), Some(false));
+        }
     }
 
     #[test]
