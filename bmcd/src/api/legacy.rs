@@ -20,6 +20,7 @@ use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
 use crate::app::firmware_info::get_firmware_slots;
+use crate::app::health_info::get_health;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
@@ -186,6 +187,7 @@ async fn api_entry(
         ("usb_boot", true) => usb_boot(bmc, query).await.into(),
         ("clear_usb_boot", true) => clear_usb_boot(bmc).into(),
         ("firmware_slots", false) => get_firmware_slot_info().await.into(),
+        ("health", false) => get_health_info().await.into(),
         ("network", false) => get_network_info().await.into(),
         ("network", true) => reset_network(bmc).await.into(),
         ("nodeinfo", true) => set_node_info().into(),
@@ -289,6 +291,13 @@ async fn get_info() -> impl Into<LegacyResponse> {
 /// keep getting that answer.
 async fn get_firmware_slot_info() -> impl Into<LegacyResponse> {
     json!(get_firmware_slots(firmware_version().await).await)
+}
+
+/// The condition of the BMC itself: uptime, load, memory, what is left of
+/// the NAND, and whether the board knows what time it is. Always a 200 -- a
+/// board that can answer none of it says so field by field.
+async fn get_health_info() -> impl Into<LegacyResponse> {
+    json!(get_health().await)
 }
 
 /// Link state of the on-board Ethernet switch. Read-only, and read straight
@@ -928,6 +937,142 @@ mod test {
             concat!(
                 r#"{"response":[{"result":{"last_promotion":null,"nextboot":null,"#,
                 r#""present":false,"rollback":null,"running":null,"update_staged":null}}]}"#,
+            )
+        );
+    }
+
+    use crate::app::health_info::{Clock, Health, Load, Memory, Nand, Rtc};
+
+    /// The exact bytes `opt=get&type=health` puts on the wire. The uptime,
+    /// the memory total and the four NAND counts are the board's own numbers;
+    /// the rest is shaped like it. `health_info`'s tests cover the reads that
+    /// produce this value.
+    ///
+    /// Worth seeing before writing a client: a microsecond offset comes out
+    /// as `-3.077e-6`. serde_json prints the shortest round-trip form of an
+    /// `f64`, which for small magnitudes is scientific notation -- valid
+    /// JSON, and not what a hand-written parser always expects.
+    #[actix_web::test]
+    async fn health_answers_with_the_boards_condition() {
+        let health = Health {
+            uptime_seconds: Some(172.43),
+            load: Load {
+                present: true,
+                one_minute: Some(0.08),
+                five_minutes: Some(0.03),
+                fifteen_minutes: Some(0.01),
+            },
+            memory: Memory {
+                present: true,
+                total_bytes: Some(121634816),
+                free_bytes: Some(20971520),
+                available_bytes: Some(62914560),
+            },
+            nand: Nand {
+                present: true,
+                total_eraseblocks: Some(2040),
+                available_eraseblocks: Some(5),
+                bad_eraseblocks: Some(0),
+                reserved_eraseblocks: Some(40),
+                eraseblock_size_bytes: Some(126976),
+                available_bytes: Some(634880),
+            },
+            clock: Clock {
+                rtc: vec![
+                    Rtc {
+                        device: "rtc0".to_string(),
+                        name: Some("sun6i-rtc".to_string()),
+                    },
+                    Rtc {
+                        device: "rtc1".to_string(),
+                        name: Some("pcf8563".to_string()),
+                    },
+                ],
+                synchronised: Some(true),
+                source: Some("192.168.77.1".to_string()),
+                stratum: Some(3),
+                offset_seconds: Some(-0.000003077),
+                measured_by: Some("chronyc tracking".to_string()),
+            },
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(health)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            concat!(
+                r#"{"response":[{"result":{"#,
+                r#""clock":{"measured_by":"chronyc tracking","offset_seconds":-3.077e-6,"#,
+                r#""rtc":[{"device":"rtc0","name":"sun6i-rtc"},{"device":"rtc1","name":"pcf8563"}],"#,
+                r#""source":"192.168.77.1","stratum":3,"synchronised":true},"#,
+                r#""load":{"fifteen_minutes":0.01,"five_minutes":0.03,"one_minute":0.08,"present":true},"#,
+                r#""memory":{"available_bytes":62914560,"free_bytes":20971520,"present":true,"total_bytes":121634816},"#,
+                r#""nand":{"available_bytes":634880,"available_eraseblocks":5,"bad_eraseblocks":0,"#,
+                r#""eraseblock_size_bytes":126976,"present":true,"reserved_eraseblocks":40,"total_eraseblocks":2040},"#,
+                r#""uptime_seconds":172.43"#,
+                r#"}}]}"#,
+            )
+        );
+    }
+
+    /// A board that can answer none of it: no `/proc` readings, no UBI, no
+    /// RTC, no chrony. 200 and a field-by-field "not there", never a 500 and
+    /// never a zero that would read as a measurement.
+    #[actix_web::test]
+    async fn health_answers_200_when_nothing_can_be_read() {
+        let health = Health {
+            uptime_seconds: None,
+            load: Load {
+                present: false,
+                one_minute: None,
+                five_minutes: None,
+                fifteen_minutes: None,
+            },
+            memory: Memory {
+                present: false,
+                total_bytes: None,
+                free_bytes: None,
+                available_bytes: None,
+            },
+            nand: Nand {
+                present: false,
+                total_eraseblocks: None,
+                available_eraseblocks: None,
+                bad_eraseblocks: None,
+                reserved_eraseblocks: None,
+                eraseblock_size_bytes: None,
+                available_bytes: None,
+            },
+            clock: Clock {
+                rtc: Vec::new(),
+                synchronised: None,
+                source: None,
+                stratum: None,
+                offset_seconds: None,
+                measured_by: None,
+            },
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(health)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            concat!(
+                r#"{"response":[{"result":{"clock":{"measured_by":null,"offset_seconds":null,"rtc":[],"#,
+                r#""source":null,"stratum":null,"synchronised":null},"#,
+                r#""load":{"fifteen_minutes":null,"five_minutes":null,"one_minute":null,"present":false},"#,
+                r#""memory":{"available_bytes":null,"free_bytes":null,"present":false,"total_bytes":null},"#,
+                r#""nand":{"available_bytes":null,"available_eraseblocks":null,"bad_eraseblocks":null,"#,
+                r#""eraseblock_size_bytes":null,"present":false,"reserved_eraseblocks":null,"total_eraseblocks":null},"#,
+                r#""uptime_seconds":null}}]}"#,
             )
         );
     }
