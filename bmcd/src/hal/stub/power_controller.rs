@@ -33,6 +33,10 @@ impl PowerController {
         Ok(())
     }
 
+    pub fn get_power_node(&self) -> anyhow::Result<u8> {
+        Ok(0)
+    }
+
     /// Reset a given node by setting the reset pin logically high for 1 second
     pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
         warn!("reset node {:?}", node);

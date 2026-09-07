@@ -102,6 +102,27 @@ impl PowerController {
         Ok(())
     }
 
+    /// Read back the state of the node enable lines.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(bit-field)` where bit(n) = 1 means node n is enabled. On a
+    ///     latching board the kernel keeps these latches across a reboot of
+    ///     the BMC, so the value reflects the nodes that are actually powered,
+    ///     not what this daemon last requested.
+    /// * `Err(gpio error)` when a line could not be read.
+    pub fn get_power_node(&self) -> anyhow::Result<u8> {
+        let mut node_states = 0u8;
+        for (idx, line) in self.enable.iter().enumerate() {
+            let state = line
+                .get_values(0u8)
+                .with_context(|| format!("error reading enable line of node {}", idx + 1))?;
+            node_states |= (state & 1) << idx;
+        }
+
+        Ok(node_states)
+    }
+
     /// Reset a given node by setting the reset pin logically high for 1 second
     pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
         debug!("reset node {:?}", node);
