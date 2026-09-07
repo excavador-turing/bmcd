@@ -19,6 +19,7 @@ use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
+use crate::app::switch_info::get_switch_ports;
 use crate::app::transfer_action::InitializeTransfer;
 use crate::app::transfer_action::UpgradeCommand;
 use crate::hal::{NodeId, UsbMode, UsbRoute};
@@ -166,6 +167,7 @@ async fn api_entry(
     match (ty.as_ref(), is_set) {
         ("usb_boot", true) => usb_boot(bmc, query).await.into(),
         ("clear_usb_boot", true) => clear_usb_boot(bmc).into(),
+        ("network", false) => get_network_info().await.into(),
         ("network", true) => reset_network(bmc).await.into(),
         ("nodeinfo", true) => set_node_info().into(),
         ("nodeinfo", false) => get_node_info(bmc).into(),
@@ -262,6 +264,19 @@ async fn get_info() -> impl Into<LegacyResponse> {
             "storage": storage,
         }
     )
+}
+
+/// Link state of the on-board Ethernet switch. Read-only, and read straight
+/// from `/sys/class/net`: the switch driver registers a netdev per port, so
+/// the kernel already has all of this and the daemon simply never passed it
+/// on.
+///
+/// Every port is always listed, absent ones included. A kernel where the
+/// switch driver does not probe leaves the BMC perfectly reachable over its
+/// own interface while all four compute modules are cut off, and the only
+/// visible difference is that these six netdevs are not there.
+async fn get_network_info() -> impl Into<LegacyResponse> {
+    json!({ "ports": get_switch_ports().await })
 }
 
 async fn reboot(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
