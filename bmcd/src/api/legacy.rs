@@ -236,12 +236,13 @@ async fn get_about() -> impl Into<LegacyResponse> {
     }
 
     let hostname = read_hostname().await.unwrap_or_default();
-    let (board_model, board_revision) = read_board_model().await.unwrap_or_default();
+    let (board_model, board_revision, board_serial) = read_board_info().await.unwrap_or_default();
 
     json!(
         {
             "board_model": board_model,
             "board_revision": board_revision,
+            "board_serial": board_serial,
             "hostname": hostname,
             "api": API_VERSION,
             "version": version,
@@ -362,11 +363,27 @@ async fn read_hostname() -> io::Result<String> {
     Ok(hostname)
 }
 
-async fn read_board_model() -> io::Result<(String, String)> {
+/// Model, hardware revision and factory serial, all three out of the board's
+/// 24c02 EEPROM at i2c 0x50. `board_info` already reads and lays out that
+/// EEPROM for the first two; the serial is the next field along in the same
+/// 50-byte header, so this is one more `value_of` and not a second reader.
+async fn read_board_info() -> io::Result<(String, String, Option<String>)> {
     let info = ::board_info::BoardInfo::load()?;
     let board_model = info.value_of(&BoardInfoAttribute::ProductName);
     let board_revision = info.value_of(&BoardInfoAttribute::HwVersion);
-    Ok((board_model, board_revision))
+    let board_serial = trim_eeprom_field(info.value_of(&BoardInfoAttribute::FactorySerial));
+    Ok((board_model, board_revision, board_serial))
+}
+
+/// Strips the padding off a fixed-width EEPROM text field. The factory writes
+/// 16 bytes whatever the serial is, padded with NUL, and an erased EEPROM
+/// reads back as 0xff, which `from_utf8_lossy` turns into replacement
+/// characters. A field with nothing left after that is `None`: a board whose
+/// EEPROM was never programmed should say it has no serial, not report a
+/// string of padding as one.
+fn trim_eeprom_field(value: String) -> Option<String> {
+    let trimmed = value.trim_matches(|c: char| c == '\0' || c == '\u{fffd}' || c.is_whitespace());
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// function is here for backwards compliance. Data is mostly a duplication of [`get_about`]
@@ -722,6 +739,21 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+
+    #[test]
+    fn eeprom_fields_lose_their_padding() {
+        assert_eq!(
+            trim_eeprom_field("XZCT250200139\0\0\0".to_string()),
+            Some("XZCT250200139".to_string())
+        );
+        assert_eq!(
+            trim_eeprom_field("TuringPi2\0\0\0\0\0\0\0".to_string()),
+            Some("TuringPi2".to_string())
+        );
+        // never programmed: all NUL, or an erased EEPROM read as 0xff
+        assert_eq!(trim_eeprom_field("\0".repeat(16)), None);
+        assert_eq!(trim_eeprom_field("\u{fffd}".repeat(16)), None);
+    }
 
     #[actix_web::test]
     async fn test_node_info() {
