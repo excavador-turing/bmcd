@@ -112,7 +112,16 @@ async fn handle_ws(
     echo_selected_protocol(req.head(), &mut res);
     match serials[node].open_channel() {
         Ok((stream, sink)) => {
-            run_websocket(session, msg_stream, stream, sink).await;
+            // Spawn, do not await. `actix_ws::handle` does not use a connection
+            // upgrade: it returns a 101 whose *body* is a stream, and actix-web
+            // writes the response head only once this handler's future resolves.
+            // Awaiting the whole session here therefore withheld the handshake
+            // until the session had already ended -- a client saw nothing for
+            // the 30s CLIENT_TIMEOUT, then a 101 followed immediately by a
+            // close, or nothing at all if UART output filled the session
+            // channel that nothing was draining yet. The route has never been
+            // usable by any client.
+            actix_web::rt::spawn(run_websocket(session, msg_stream, stream, sink));
             Ok(res)
         }
         Err(e) => Ok(HttpResponse::InternalServerError().body(e.to_string())),
