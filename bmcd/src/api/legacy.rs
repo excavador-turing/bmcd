@@ -219,16 +219,8 @@ async fn get_about() -> impl Into<LegacyResponse> {
     let mut version = "unknown".to_string();
 
     if let Ok(os_release) = read_os_release().await {
-        // `PRETTY_NAME` carries the Turing Pi firmware release, not the
-        // Buildroot one, so a board built on Buildroot 2025.02.17 reported
-        // "Turing Pi v2.2.0" as its buildroot release. post_build.sh writes the
-        // actual release to `BUILDROOT_VERSION`; images built before that key
-        // existed still only have `PRETTY_NAME` to offer.
-        if let Some(buildroot_release) = os_release
-            .get("BUILDROOT_VERSION")
-            .or_else(|| os_release.get("PRETTY_NAME"))
-        {
-            buildroot = buildroot_release.trim_matches('"').to_string();
+        if let Some(release) = buildroot_release(&os_release) {
+            buildroot = release;
         }
         if let Some(ver) = os_release.get("VERSION") {
             version = ver.to_string();
@@ -354,6 +346,21 @@ async fn read_os_release() -> std::io::Result<HashMap<String, String>> {
     Ok(results)
 }
 
+/// The Buildroot release the image was built from, out of a parsed
+/// /etc/os-release.
+///
+/// `PRETTY_NAME` carries the Turing Pi firmware release, not the Buildroot
+/// one, so a board built on Buildroot 2025.02.17 reported "Turing Pi v2.2.0"
+/// as its buildroot release. post_build.sh writes the actual release to
+/// `BUILDROOT_VERSION`; images built before that key existed still only have
+/// `PRETTY_NAME` to offer.
+fn buildroot_release(os_release: &HashMap<String, String>) -> Option<String> {
+    os_release
+        .get("BUILDROOT_VERSION")
+        .or_else(|| os_release.get("PRETTY_NAME"))
+        .map(|release| release.trim_matches('"').to_string())
+}
+
 async fn read_hostname() -> io::Result<String> {
     let hostname = tokio::fs::read_to_string("/proc/sys/kernel/hostname")
         .await?
@@ -403,10 +410,10 @@ async fn get_system_information() -> impl Into<LegacyResponse> {
 
     if let Ok(os_release) = read_os_release().await {
         let obj = info.as_object_mut().unwrap();
-        if let Some(buildroot_edition) = os_release.get("PRETTY_NAME") {
+        if let Some(release) = buildroot_release(&os_release) {
             obj.insert(
                 "buildroot".to_string(),
-                serde_json::value::to_value(buildroot_edition).unwrap(),
+                serde_json::value::to_value(release).unwrap(),
             );
         }
         if let Some(build_version) = os_release.get("VERSION") {
@@ -739,6 +746,37 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+
+    #[test]
+    fn buildroot_release_prefers_the_buildroot_key() {
+        let os_release = HashMap::from([
+            (
+                "PRETTY_NAME".to_string(),
+                "\"Turing Pi v2.2.0\"".to_string(),
+            ),
+            (
+                "BUILDROOT_VERSION".to_string(),
+                "\"2025.02.17\"".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            buildroot_release(&os_release),
+            Some("2025.02.17".to_string())
+        );
+    }
+
+    #[test]
+    fn buildroot_release_falls_back_to_the_pretty_name() {
+        let os_release = HashMap::from([(
+            "PRETTY_NAME".to_string(),
+            "\"Turing Pi v2.2.0\"".to_string(),
+        )]);
+        assert_eq!(
+            buildroot_release(&os_release),
+            Some("Turing Pi v2.2.0".to_string())
+        );
+        assert_eq!(buildroot_release(&HashMap::new()), None);
+    }
 
     #[test]
     fn eeprom_fields_lose_their_padding() {
