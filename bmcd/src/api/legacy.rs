@@ -91,10 +91,6 @@ pub fn config(cfg: &mut web::ServiceConfig) {
     .service(backup_handler);
 }
 
-pub fn info_config(cfg: &mut web::ServiceConfig) {
-    cfg.service(info_handler);
-}
-
 /// The value of one query parameter. A `GuardContext` hands out the raw query
 /// string and nothing else, so the guards below did their matching with
 /// `contains`, which reads a value as a prefix: `type=firmware_slots`
@@ -160,11 +156,6 @@ async fn backup_handler() -> impl Responder {
         }
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
-}
-
-#[get("/info")]
-async fn info_handler() -> impl Responder {
-    get_system_information().await.into()
 }
 
 async fn api_entry(

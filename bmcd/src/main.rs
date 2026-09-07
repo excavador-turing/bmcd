@@ -26,8 +26,7 @@ mod utils;
 use crate::config::Config;
 use crate::serial_service::{serial::SerialConnections, serial_config};
 use crate::{
-    api::legacy, api::legacy::info_config, api::metrics,
-    authentication::linux_authenticator::LinuxAuthenticator,
+    api::legacy, api::metrics, authentication::linux_authenticator::LinuxAuthenticator,
     streaming_data_service::StreamingDataService,
 };
 use actix_files::{Files, NamedFile};
@@ -120,9 +119,15 @@ async fn main() -> anyhow::Result<()> {
         // redirect requests to 'HTTPS'
         futures.push(
             HttpServer::new(move || {
+                // Nothing but the redirect. `/info` used to be served here,
+                // unauthenticated and in the clear: firmware version, build
+                // time, IPv4 and the br0 MAC to anyone who could reach port 80,
+                // and readable passively by anything on the segment. It was the
+                // only registration of that handler, so there was no
+                // authenticated equivalent to fall back to -- which is why this
+                // is a removal rather than a move.
                 App::new()
                     .app_data(Data::new(config.port))
-                    .configure(info_config)
                     .default_service(web::route().to(redirect))
             })
             .bind((config.host, HTTP_PORT))?
