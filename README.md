@@ -2,7 +2,8 @@
 
 > **This is a fork of [turing-machines/bmcd](https://github.com/turing-machines/bmcd).**
 > `master` is upstream's `master`, commit for commit. **`hive` is the branch that
-> gets built**: five commits on top of the `v2.3.7` tag. Everything below the fold
+> gets built**: nine functional commits on top of the `v2.3.7` tag, plus the CI
+> and documentation ones. Everything below the fold
 > is upstream's own README, unchanged.
 >
 > The daemon does not ship on its own. Our [BMC firmware
@@ -37,10 +38,15 @@ cold-boot path.
 
 ## Built, not yet on a board
 
-**Nothing in this section has run on hardware.** The three commits after
-`27ec80f` are in no flashed image: the firmware's `hive` branch still pins
+**Nothing in this section has run on hardware.** Every functional commit after
+`27ec80f` is in no flashed image: the firmware's `hive` branch still pins
 `27ec80f`, and the bump to `df1e8ec` sits on an open firmware pull request.
 Read these as a diff with an argument behind it, not as behaviour.
+
+The last four of them do come from measurements taken on the board -- `ge1`
+sitting at `lowerlayerdown`, the serial in the EEPROM, three power-on times
+resetting to the BMC's own uptime, `tpi info` disagreeing with the about page --
+but the *fixes* have not been back on hardware.
 
 | not yet proven | what the change does |
 |---|---|
