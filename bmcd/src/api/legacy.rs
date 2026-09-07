@@ -20,6 +20,7 @@ use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
 use crate::app::switch_info::get_switch_ports;
+use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
 use crate::app::transfer_action::UpgradeCommand;
 use crate::hal::{NodeId, UsbMode, UsbRoute};
@@ -190,6 +191,7 @@ async fn api_entry(
         ("info", false) => get_info().await.into(),
         ("cooling", false) => get_cooling_info().await.into(),
         ("cooling", true) => set_cooling_info(bmc, query).await.into(),
+        ("thermal", false) => get_thermal_info().await.into(),
         ("about", false) => get_about().await.into(),
         _ => (
             StatusCode::BAD_REQUEST,
@@ -270,6 +272,13 @@ async fn get_info() -> impl Into<LegacyResponse> {
 /// visible difference is that these six netdevs are not there.
 async fn get_network_info() -> impl Into<LegacyResponse> {
     json!({ "ports": get_switch_ports().await })
+}
+
+/// Every temperature the kernel can read and every cooling device it can
+/// drive. Always a 200: a board with neither answers with two empty lists,
+/// which is a fact about the board and not a failure of the request.
+async fn get_thermal_info() -> impl Into<LegacyResponse> {
+    json!(get_thermal_state().await)
 }
 
 async fn reboot(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
@@ -746,6 +755,7 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+    use crate::app::thermal_info::{Cooler, Thermal, ThermalSensor};
 
     #[test]
     fn buildroot_release_prefers_the_buildroot_key() {
@@ -806,5 +816,74 @@ mod test {
             }
         };
         let _: HashMap<NodeId, NodeInfo> = serde_json::from_value(json).unwrap();
+    }
+
+    /// The exact bytes `opt=get&type=thermal` puts on the wire, for the board
+    /// as it reads today: the SoC sensor at 52539 millidegrees and the fan the
+    /// kernel drives from it on step 4 of 6. `thermal_info`'s own tests assert
+    /// that that sysfs reads back as this `Thermal`, so between them the chain
+    /// from the files to the response body is covered.
+    ///
+    /// The keys come out sorted rather than in the order the structs declare
+    /// them. That is not this endpoint's doing: `LegacyResponse` carries its
+    /// body as a `serde_json::Value`, whose map is a `BTreeMap` unless
+    /// serde_json's `preserve_order` feature is on, and it is not -- so every
+    /// endpoint in this daemon has always answered with sorted keys. It is
+    /// asserted literally here so that anyone writing a client against this
+    /// shape is reading what the daemon actually sends.
+    #[actix_web::test]
+    async fn thermal_answers_with_sensors_and_cooling() {
+        let thermal = Thermal {
+            sensors: vec![ThermalSensor {
+                name: "bmc-thermal".to_string(),
+                temperature_c: Some(52.5),
+                present: true,
+            }],
+            cooling: vec![Cooler {
+                name: "pwm-fan".to_string(),
+                cur_state: Some(4),
+                max_state: Some(6),
+                present: true,
+            }],
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(thermal)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            concat!(
+                r#"{"response":[{"result":{"#,
+                r#""cooling":[{"cur_state":4,"max_state":6,"name":"pwm-fan","present":true}],"#,
+                r#""sensors":[{"name":"bmc-thermal","present":true,"temperature_c":52.5}]"#,
+                r#"}}]}"#,
+            )
+        );
+    }
+
+    /// A board that cannot measure anything -- any image older than the one
+    /// that describes the sensor in the device tree, or a v2.4 board with no
+    /// fan. Two empty lists and a 200. Never a 500, and never a temperature
+    /// that would read as a real zero degrees.
+    #[actix_web::test]
+    async fn thermal_answers_200_with_empty_lists_when_there_is_nothing_to_read() {
+        let thermal = Thermal {
+            sensors: Vec::new(),
+            cooling: Vec::new(),
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(thermal)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            r#"{"response":[{"result":{"cooling":[],"sensors":[]}}]}"#
+        );
     }
 }

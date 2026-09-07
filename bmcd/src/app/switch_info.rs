@@ -16,9 +16,9 @@
 //! The switch driver registers one netdev per port, so everything this module
 //! reports is what the kernel already knows; nothing here talks to the switch
 //! itself.
+use crate::app::sysfs::{read_attribute, read_attribute_string};
 use serde::Serialize;
 use std::path::Path;
-use std::str::FromStr;
 
 /// Where the kernel exposes network interfaces.
 const NET_CLASS: &str = "/sys/class/net";
@@ -142,20 +142,6 @@ async fn read_port(net_class: &Path, name: &str, kind: PortKind) -> SwitchPort {
         rx_errors: read_attribute(&statistics, "rx_errors").await,
         tx_errors: read_attribute(&statistics, "tx_errors").await,
     }
-}
-
-/// Reads one sysfs attribute as trimmed text. A missing file, an unreadable
-/// one, and an empty one are all `None`: sysfs answers a read with an error
-/// for attributes the driver cannot supply right now, and that is a normal
-/// state for a port, not a fault of ours.
-async fn read_attribute_string(dir: &Path, attribute: &str) -> Option<String> {
-    let value = tokio::fs::read_to_string(dir.join(attribute)).await.ok()?;
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
-async fn read_attribute<T: FromStr>(dir: &Path, attribute: &str) -> Option<T> {
-    read_attribute_string(dir, attribute).await?.parse().ok()
 }
 
 #[cfg(test)]

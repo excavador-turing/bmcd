@@ -16,6 +16,8 @@ pub mod bmc_info;
 pub mod cooling_device;
 pub mod event_application;
 pub mod switch_info;
+pub mod sysfs;
+pub mod thermal_info;
 pub mod transfer_action;
 pub mod upgrade_worker;
 pub mod usb_gadget;
