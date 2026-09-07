@@ -8,7 +8,14 @@ rust-version = "1.75.0"
 [dependencies]
 actix = "0.13.5"
 actix-files = "0.6.6"
+# actix-http and actix-service are already in the tree as transitive
+# dependencies of actix-web. They are named here because the HTTPS listener is
+# built by hand in `main.rs`: `HttpServer::bind_openssl()` discards the
+# acceptor's ALPN configuration, so the `HttpService` it would have assembled
+# is assembled directly instead.
+actix-http = { version = "3.11.2", features = ["openssl"] }
 actix-multipart = "0.7.2"
+actix-service = "2.0.3"
 actix-web = { version = "4.9.0", features = ["openssl"] }
 actix-ws = "0.3.0"
 anyhow = "1.0.95"

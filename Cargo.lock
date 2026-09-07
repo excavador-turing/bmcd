@@ -530,7 +530,9 @@ version = "2.3.7"
 dependencies = [
  "actix",
  "actix-files",
+ "actix-http",
  "actix-multipart",
+ "actix-service",
  "actix-web",
  "actix-ws",
  "anyhow",
