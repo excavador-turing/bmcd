@@ -19,6 +19,7 @@ use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
+use crate::app::firmware_info::get_firmware_slots;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
@@ -93,25 +94,41 @@ pub fn info_config(cfg: &mut web::ServiceConfig) {
     cfg.service(info_handler);
 }
 
-fn flash_status_guard(context: &GuardContext<'_>) -> bool {
+/// The value of one query parameter. A `GuardContext` hands out the raw query
+/// string and nothing else, so the guards below did their matching with
+/// `contains`, which reads a value as a prefix: `type=firmware_slots`
+/// contains `type=firmware`, and would be routed to the transfer machinery
+/// before `api_entry` ever saw it. This compares the whole value.
+fn query_param<'q>(query: &'q str, key: &str) -> Option<&'q str> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then_some(value)
+    })
+}
+
+/// Whether this request is the `flash`/`firmware` transfer machinery rather
+/// than an `api_entry` type, for the given `opt`.
+fn is_transfer_request(context: &GuardContext<'_>, opt: &str) -> bool {
     let Some(query) = context.head().uri.query() else {
         return false;
     };
-    query.contains("opt=get") && (query.contains("type=flash") || query.contains("type=firmware"))
+    query_param(query, "opt") == Some(opt)
+        && matches!(query_param(query, "type"), Some("flash" | "firmware"))
+}
+
+fn flash_status_guard(context: &GuardContext<'_>) -> bool {
+    is_transfer_request(context, "get")
 }
 
 fn flash_guard(context: &GuardContext<'_>) -> bool {
-    let Some(query) = context.head().uri.query() else {
-        return false;
-    };
-    query.contains("opt=set") && (query.contains("type=flash") || query.contains("type=firmware"))
+    is_transfer_request(context, "set")
 }
 
 fn set_node_info_guard(context: &GuardContext<'_>) -> bool {
     let Some(query) = context.head().uri.query() else {
         return false;
     };
-    query.contains("opt=set") && query.contains("type=node_info")
+    query_param(query, "opt") == Some("set") && query_param(query, "type") == Some("node_info")
 }
 
 #[get("/backup")]
@@ -168,6 +185,7 @@ async fn api_entry(
     match (ty.as_ref(), is_set) {
         ("usb_boot", true) => usb_boot(bmc, query).await.into(),
         ("clear_usb_boot", true) => clear_usb_boot(bmc).into(),
+        ("firmware_slots", false) => get_firmware_slot_info().await.into(),
         ("network", false) => get_network_info().await.into(),
         ("network", true) => reset_network(bmc).await.into(),
         ("nodeinfo", true) => set_node_info().into(),
@@ -259,6 +277,18 @@ async fn get_info() -> impl Into<LegacyResponse> {
             "storage": storage,
         }
     )
+}
+
+/// The A/B firmware slots: which UBI volume the board booted from, which one
+/// a rollback would land on, whether an update is staged for the next boot,
+/// and what the promotion script last said.
+///
+/// Not `type=firmware`. That name has been taken since before this fork by
+/// the transfer machinery -- `opt=get&type=firmware` is the status of a
+/// running firmware upload -- and a client polling an upgrade it started must
+/// keep getting that answer.
+async fn get_firmware_slot_info() -> impl Into<LegacyResponse> {
+    json!(get_firmware_slots(firmware_version().await).await)
 }
 
 /// Link state of the on-board Ethernet switch. Read-only, and read straight
@@ -353,6 +383,17 @@ async fn read_os_release() -> std::io::Result<HashMap<String, String>> {
         }
     }
     Ok(results)
+}
+
+/// The firmware version of the running image, out of /etc/os-release. Same
+/// key `get_about` sends as `version`, with the quotes os-release puts around
+/// a value stripped -- `get_about` passes them through, and something may be
+/// matching on that, so it is left as it is.
+async fn firmware_version() -> Option<String> {
+    let os_release = read_os_release().await.ok()?;
+    os_release
+        .get("VERSION")
+        .map(|version| version.trim_matches('"').to_string())
 }
 
 /// The Buildroot release the image was built from, out of a parsed
@@ -801,6 +842,94 @@ mod test {
         // never programmed: all NUL, or an erased EEPROM read as 0xff
         assert_eq!(trim_eeprom_field("\0".repeat(16)), None);
         assert_eq!(trim_eeprom_field("\u{fffd}".repeat(16)), None);
+    }
+
+    use crate::app::firmware_info::{FirmwareSlots, Promotion, Slot};
+
+    /// The exact bytes `opt=get&type=firmware_slots` puts on the wire for the
+    /// board as it reads today: `rootfs` running out of volume 1 with an
+    /// image of 37019648 bytes, `rootfs_prev` waiting in volume 3, nothing
+    /// staged. `firmware_info`'s own tests cover the read that produces this
+    /// value; this one pins the shape a client sees.
+    ///
+    /// The keys are sorted rather than declaration-ordered because
+    /// `LegacyResponse` carries its body as a `serde_json::Value` and
+    /// serde_json's `preserve_order` feature is off, so every endpoint in
+    /// this daemon answers with sorted keys.
+    #[actix_web::test]
+    async fn firmware_slots_answer_with_both_volumes() {
+        let slots = FirmwareSlots {
+            present: true,
+            running: Some(Slot {
+                volume: "rootfs".to_string(),
+                volume_id: 1,
+                size_bytes: Some(37019648),
+                version: Some("v2.2.0-unstable-hive.5".to_string()),
+            }),
+            rollback: Some(Slot {
+                volume: "rootfs_prev".to_string(),
+                volume_id: 3,
+                size_bytes: Some(37011456),
+                version: None,
+            }),
+            update_staged: Some(false),
+            nextboot: None,
+            last_promotion: Some(Promotion {
+                timestamp: "Mon Sep  7 19:30:22 UTC 2026".to_string(),
+                message: "switch ports present: node1 node2 node3 node4".to_string(),
+            }),
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(slots)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            concat!(
+                r#"{"response":[{"result":{"#,
+                r#""last_promotion":{"message":"switch ports present: node1 node2 node3 node4","#,
+                r#""timestamp":"Mon Sep  7 19:30:22 UTC 2026"},"#,
+                r#""nextboot":null,"present":true,"#,
+                r#""rollback":{"size_bytes":37011456,"version":null,"volume":"rootfs_prev","volume_id":3},"#,
+                r#""running":{"size_bytes":37019648,"version":"v2.2.0-unstable-hive.5","volume":"rootfs","volume_id":1},"#,
+                r#""update_staged":false"#,
+                r#"}}]}"#,
+            )
+        );
+    }
+
+    /// A board with no UBI, no `fw_printenv` and no promotion log -- an older
+    /// firmware, or a board that boots from something else entirely. 200 and
+    /// nulls, never a 500, and never an invented slot: `update_staged` is
+    /// null rather than false because "no update is staged" and "the U-Boot
+    /// environment could not be read" are different answers.
+    #[actix_web::test]
+    async fn firmware_slots_answer_200_when_there_is_no_ubi() {
+        let slots = FirmwareSlots {
+            present: false,
+            running: None,
+            rollback: None,
+            update_staged: None,
+            nextboot: None,
+            last_promotion: None,
+        };
+
+        let response = HttpResponse::from(LegacyResponse::from(json!(slots)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            concat!(
+                r#"{"response":[{"result":{"last_promotion":null,"nextboot":null,"#,
+                r#""present":false,"rollback":null,"running":null,"update_staged":null}}]}"#,
+            )
+        );
     }
 
     #[actix_web::test]
