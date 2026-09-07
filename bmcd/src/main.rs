@@ -26,7 +26,8 @@ mod utils;
 use crate::config::Config;
 use crate::serial_service::{serial::SerialConnections, serial_config};
 use crate::{
-    api::legacy, api::legacy::info_config, authentication::linux_authenticator::LinuxAuthenticator,
+    api::legacy, api::legacy::info_config, api::metrics,
+    authentication::linux_authenticator::LinuxAuthenticator,
     streaming_data_service::StreamingDataService,
 };
 use actix_files::{Files, NamedFile};
@@ -89,6 +90,18 @@ async fn main() -> anyhow::Result<()> {
                     .configure(serial_config)
                     // Legacy API
                     .configure(legacy::config),
+            )
+            // Prometheus scrape endpoint. Wrapped in the same authenticator
+            // as `/api/bmc`, deliberately: it reports the board's firmware
+            // versions, its NAND wear and its per-port traffic counters, and
+            // an unauthenticated second surface next to `/info` is a finding
+            // waiting to be filed. The authenticator accepts HTTP Basic,
+            // which is what a scrape config can send.
+            .service(
+                web::scope("/metrics")
+                    .wrap(authentication.clone())
+                    .app_data(bmc.clone())
+                    .configure(metrics::config),
             )
             // Serve a static tree of files of the web UI. Must be the last item.
             .service(Files::new("/", &config.www).index_file("index.html"))

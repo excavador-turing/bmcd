@@ -13,6 +13,7 @@
 // limitations under the License.
 pub mod into_legacy_response;
 pub mod legacy;
+pub mod metrics;
 use self::into_legacy_response::{LegacyResponse, LegacyResult};
 use crate::hal::NodeId;
 use actix_web::web;

@@ -398,7 +398,7 @@ async fn read_os_release() -> std::io::Result<HashMap<String, String>> {
 /// key `get_about` sends as `version`, with the quotes os-release puts around
 /// a value stripped -- `get_about` passes them through, and something may be
 /// matching on that, so it is left as it is.
-async fn firmware_version() -> Option<String> {
+pub(super) async fn firmware_version() -> Option<String> {
     let os_release = read_os_release().await.ok()?;
     os_release
         .get("VERSION")

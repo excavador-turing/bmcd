@@ -55,6 +55,7 @@ but the *fixes* have not been back on hardware.
 | **The switch's own link state is reachable over the API** | Nothing in the daemon reported anything about the on-board Ethernet switch, although the kernel registers a netdev per port and knows all of it. `opt=get&type=network` now returns, for each of `node1`-`node4`, `ge0` and `ge1`: whether it is a node port or an uplink, whether the kernel has it at all, carrier, `operstate`, speed, duplex and the four byte/error counters. Read straight from `/sys/class/net`, no shelling out. The failure it exists for is a kernel where the switch driver does not probe -- the BMC stays perfectly reachable over its own interface while all four compute modules are cut off -- so every port is always listed and an absent one is `"present": false` rather than a missing entry or a 500 |
 | **The A/B firmware slots are reachable over the API** | The board takes firmware upgrades A/B -- the new image goes into the rootfs UBI volume that is not running, `nextboot` sends U-Boot at it once, and a promotion script keeps it or puts the old one back -- and nothing in the API said which volume the board booted, how big either is, whether an upgrade is waiting for the next boot, or what the promotion script decided last time. `opt=get&type=firmware_slots` now answers all four, from `/sys/class/ubi`, `fw_printenv -n nextboot` and the tail of `/mnt/overlay/postupdate.log`. The running slot is the volume with a `ubiblock` device attached, not the one called `rootfs`. Its version comes from `/etc/os-release`; **the rollback volume is not mounted, so it has a name and a size and no version** rather than a guessed one. A board with no UBI, or without `fw_printenv`, answers 200 with `"present": false` and nulls -- and `update_staged` is `null` rather than `false`, because "nothing is staged" and "the environment could not be read" are different answers. Not `type=firmware`: that name has belonged to the transfer machinery since long before this fork |
 | **The BMC's own condition is reachable over the API** | Everything the daemon reported was about the four compute modules or the board's peripherals; nothing was about the board running the daemon, which has 116 MB of RAM, five spare NAND eraseblocks and two clocks. `opt=get&type=health` now returns uptime and load from `/proc`, memory in bytes rather than meminfo's kibibytes, UBI's own eraseblock accounting from `/sys/class/ubi/ubi0` -- the same 2040 total, 5 available, 0 bad and 40 reserved that `ubinfo` prints, without the fork or the dependency on mtd-utils being in the image -- and every RTC the kernel registered. Clock synchronisation is the one thing that is not a file read: `chronyc tracking` is parsed for the stratum, the source and the offset, reported as system clock minus true time so a board that is behind is negative. `measured_by` says so. A board with no chrony answers `null` rather than `false`, because "not synchronised" and "we cannot tell" are different answers, and which of the two RTCs has a battery behind it is not claimed at all -- the kernel does not expose it |
+| **There is a Prometheus scrape endpoint** | `/metrics` used to return the web UI's `index.html` through the catch-all, which is worse than a 404: a scraper sees HTTP 200 and a document it cannot parse. It now returns the text exposition format -- SoC temperature and fan state, per-port link, speed and byte/error counters, per-node power state and power-on time, the health values above, and the firmware slots as an info metric. Hand-written, no metrics crate: the format is two comment lines and a sample per value, and this daemon is cross-compiled into a firmware image that is at 78% of its flash slot. **It is authenticated**, behind the same `LinuxAuthenticator` that wraps `/api/bmc`, which accepts HTTP Basic -- so a scrape config authenticates with `basic_auth` and nothing else. Adding a second unauthenticated surface next to `/info` would have been the same finding twice |
 | **`type=about` reports the board's serial number** | The 24c02 EEPROM at i2c 0x50 holds the factory serial next to the product name and the hardware revision, and the daemon already parses that header -- `board_model` and `board_revision` come out of it. `get_about` now also sends `board_serial` from the `FactorySerial` field of the same read, with the fixed-width field's NUL padding stripped and an unprogrammed EEPROM reported as `null` rather than as a string of padding. `board_model` and `board_revision` are left byte-for-byte as they were, padding included, because something may be matching on them |
 | **`power_on_time` stops resetting for nodes 2, 3 and 4 on every daemon start** | `update_power_on_times` compared the new state of a node, which `bit_iterator` yields as 0 or 1, against `activated_nodes & (1 << idx)`, which is 0 or `1 << idx`. Those agree only for node 1. For every other node "already on, staying on" looked like a transition, so `initialize_power` -- which calls `activate_slot` on every start -- rewrote their power-on stamp to the moment the daemon came up. Measured after a BMC reboot with four modules running: node 1 at 52418 s, matching its own `/proc/uptime`, and nodes 2, 3 and 4 at 172 s, the BMC's own uptime. The comparison is now shifted down. Upstream bug, from 2023; boards carrying a wrong stamp recover it at the next real power cycle of that node |
 | **The About page stops saying `Build version: vundefined`** | The web UI reads the daemon version from a key named `build_version`; `get_about` only ever sent `bmcd_version`. It now sends the same value under both names — `bmcd_version` stays, it is the documented key of the legacy API. The value is bmcd's own crate version (`2.3.7`), not the firmware release. The UI's *other* version bug, the doubled `v` in `vv2.2.0-…`, is on the UI side and is untouched here |
@@ -201,6 +202,41 @@ whose only job is to redirect to HTTPS; that server is built with `info_config`
 but **without** the authentication wrapper, so `http://<board>/info` returns the
 API version, build time, IPv4 address, `br0` MAC, firmware version and
 `PRETTY_NAME` to anyone who asks.
+
+### The scrape endpoint authenticates like everything else
+
+`GET /metrics` answers in the Prometheus text exposition format, and it is
+inside the authentication middleware -- `main` wraps it with the same
+`LinuxAuthenticator` as `/api/bmc`. Basic is what a scraper can send, and the
+daemon validates it against the shadow hash on every request:
+
+```yaml
+scrape_configs:
+  - job_name: bmc
+    scheme: https
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['<board>:443']
+    basic_auth:
+      username: root
+      password_file: /etc/prometheus/bmc-password
+    tls_config:
+      # the daemon serves its own certificate; pin it with ca_file instead if
+      # you have one
+      insecure_skip_verify: true
+```
+
+Scrape the HTTPS port directly. Port 80 is the redirect server, and while a
+scraper that follows redirects will land on the right place, it lands there
+with an extra round trip per scrape. The loopback exemption applies here as it
+does everywhere else: something running on the board itself needs no
+credentials.
+
+Absence is a missing metric, not a zero. A board with no thermal zone has no
+`bmcd_temperature_celsius` at all -- not a `# TYPE` line with nothing under it,
+and never a fabricated 0 -- so alert on `absent()` where the difference
+matters. `bmcd_rtc_present` and `bmcd_build_info` are the two that are always
+there.
 
 ## Who depends on this fork
 
