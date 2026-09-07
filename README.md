@@ -171,7 +171,7 @@ docker run --rm -it -v "$PWD":/src -w /src rust:1.85-bookworm bash -c '
   apt-get install -y libusb-1.0-0-dev libssl-dev pkg-config libudev-dev &&
   rustup component add rustfmt clippy &&
   cargo fmt --all -- --check &&
-  cargo clippy --workspace --all-targets &&
+  cargo clippy --workspace --all-targets -- -D warnings &&
   cargo test --workspace
 '
 ```
@@ -181,22 +181,67 @@ rustfmt nor clippy. `--workspace` is, for the same virtual-manifest reason as
 above. This builds for the host, not for `armv7`; it is a correctness check, and
 the real cross build is the firmware's.
 
-**Expect exactly three clippy warnings on `hive`, and leave them alone.** They
-are upstream's, inherited from the `v2.3.7` tag we branched from:
+**Clippy is at zero warnings on `hive`, and should stay there.** The three
+warnings inherited from the `v2.3.7` tag — `rand::thread_rng` deprecated twice
+in test helpers, and `needless_lifetimes` on `WriteMonitor` — were fixed on
+2026-09-07, along with two more that a dependency refresh surfaced. `Cargo CI`
+runs clippy with `-- -D warnings`, so a new one fails the build.
 
-- `rand::thread_rng` is deprecated — twice, in the test helpers of
-  `bmcd/src/app/upgrade_worker.rs` and `bmcd/src/utils/io.rs`.
-- `needless_lifetimes` on `impl<'a, W> AsyncWrite for WriteMonitor<'a, W>` in
-  `bmcd/src/utils/io.rs`.
+Do **not** fix the lifetime warning the way upstream did. Upstream's `a15e8fc`,
+one commit past our tag on `master`, cherry-picks onto `hive` without conflict
+and then does not compile: it writes `impl<'_, W> AsyncWrite for
+WriteMonitor<'_, W>`, and `'_` is a reserved name that cannot appear in a
+generic parameter list, so rustc rejects it with `E0637`. Verified by trying
+it. The form here is clippy's own suggestion — elide the parameter, keep `'_`
+only in the type position. Adopting `master` is therefore still not a free
+rebase, and a rebase that takes `a15e8fc` will conflict with our fix, which is
+the outcome we want.
 
-Upstream fixed all three one commit past the tag, in `a15e8fc` on `master`,
-which we did not take: its `needless_lifetimes` fix writes `impl<'_, W>`, and
-`'_` is not something Rust accepts in a generics list. So adopting `master` is
-not a free rebase, and we have not run a build to see how far it gets.
+## Dependencies and security
 
-Note also that the inherited `Cargo CI` workflow has never run on this fork —
-Actions are off — and it would fail if it did: it runs clippy with
-`-- -D warnings`, which is what those three warnings are.
+Reviewed by hand on **2026-09-07** — there is no Renovate, no Dependabot and no
+other bot on this repo, by choice. The next review is somebody's decision, not a
+schedule's.
+
+`cargo audit` reported **15 advisories and 11 warnings** before that review and
+**3 and 3** after. What was applied was a `cargo update` inside the existing
+semver ranges — no `Cargo.toml` requirement moved, no feature changed, and the
+edition and `rust-version` are untouched. The upgrades that mattered for a
+daemon in this position were `openssl` (use-after-free, and this is the TLS
+stack the HTTPS listener runs on), `bytes` (integer overflow, on every request
+path), `tracing-subscriber` (ANSI escapes from user input poisoning the log —
+bmcd logs failed usernames), plus `tokio`, `crossbeam-channel` and two crates
+that had been yanked.
+
+Resolution is pinned to **Rust 1.85**. A plain `cargo update` pulls actix-web
+4.15, `serde_with` 3.22, `time` 0.3.55 and the `icu_*` family, all of which now
+require rustc 1.88 and none of which compile here, so they are held one minor
+behind on purpose. Raising the toolchain is a decision about the Buildroot
+toolchain, not about this repo — and it has to happen together with
+`Cargo.lock`, `cargo_ci.yml` and `bmcd.hash`.
+
+Three advisories were **declined**, each because closing it needs a major bump
+or a toolchain move:
+
+| advisory | reachable here? | why it is still open |
+|---|---|---|
+| `h2` 0.3.27 — RUSTSEC-2026-0258, unbounded empty DATA frames | **Yes, and pre-authentication.** `bind_openssl` advertises `h2` over ALPN, so a peer reaches HTTP/2 framing before the auth middleware runs | No fix exists at any version. The patch is in `h2 >= 0.4.16`, and every `actix-http` up to the newest (3.13.5) still pins `h2` 0.3.27. Only an actix-web 5 migration, or an upstream backport, closes it |
+| `time` 0.3.45 — RUSTSEC-2026-0009, stack exhaustion | No. The flaw is in the RFC 2822 parse path; nothing in the graph uses it. actix parses HTTP dates with `httpdate`, `tracing-appender` only formats its own filename suffixes, and bmcd never touches cookies | Patched 0.3.47 requires rustc 1.88 |
+| `remove_dir_all` 0.5.3 — RUSTSEC-2023-0018, TOCTOU | No. It arrives via the `tempdir` **dev-dependency** and is not in the shipped binary | Fixing it means replacing `tempdir` with `tempfile`, a test-code change left for its own decision |
+
+Three warnings remain, none of them reachable as written: `bincode` and
+`tempdir` are unmaintained (the first reads a local persistency file, the
+second is test-only), and `circular-buffer`'s panic-safety unsoundness needs an
+element type whose `Drop` or `Clone` can panic — the serial ring buffer is
+`u8`.
+
+Also worth knowing when reading `cargo audit` output here: it scans
+`Cargo.lock`, which records the union over all feature combinations, not what
+actually gets compiled. `rustls`, `rustls-webpki`, `ring`, `hyper-rustls` and
+`tokio-rustls` are all in the lock and none of them is in the enabled-feature
+graph — `reqwest` uses native-tls here. Five of the fifteen original advisories
+were in that set. Check with `cargo tree -e normal -i <crate>` before treating
+one as real.
 
 ---
 
