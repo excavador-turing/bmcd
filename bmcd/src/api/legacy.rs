@@ -236,6 +236,9 @@ async fn get_about() -> impl Into<LegacyResponse> {
             "api": API_VERSION,
             "version": version,
             "bmcd_version": bmcd_version,
+            // feeds the "Build version" field of the web UI about page, which
+            // renders "vundefined" without it.
+            "build_version": bmcd_version,
             "buildtime": build_time,
             "buildroot": buildroot,
         }
