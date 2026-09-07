@@ -13,6 +13,7 @@
 // limitations under the License.
 pub mod helpers;
 use std::fmt::Display;
+use thiserror::Error;
 
 macro_rules! conditional_import {
     ($attribute_condition:meta, $($statement:item)+) => {
@@ -115,4 +116,42 @@ impl UsbMode {
             _ => unreachable!(),
         }
     }
+}
+
+/// Which USB topology the board carries. `UsbMux` is the v2.4 multiplexer,
+/// `UsbHub` the v2.5+ hub. This lives here, next to `NodeId` and `UsbMode`,
+/// rather than in `pin_controller`, because both the real HAL and the stubbed
+/// one have to name it and there must not be two of it: the stubbed build was
+/// broken for months precisely because its copy of the pin controller drifted
+/// away from the real one.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UsbArchitecture {
+    UsbHub,
+    UsbMux,
+}
+
+impl Display for UsbArchitecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UsbArchitecture::UsbHub => f.write_str("Usb hub"),
+            UsbArchitecture::UsbMux => f.write_str("Single bus"),
+        }
+    }
+}
+
+/// Errors raised by the pin and power controllers. Shared with the stubbed
+/// HAL for the same reason as [`UsbArchitecture`].
+#[derive(Debug, Error)]
+pub enum PowerControllerError {
+    #[error("This command is only available on v2.5+ boards")]
+    Node1UsbNotApplicable,
+    #[error(
+        "Selecting one of the nodes as USB Host role \
+        is not supported by the current hardware"
+    )]
+    HostModeNotSupported,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Anyhow(#[from] anyhow::Error),
 }

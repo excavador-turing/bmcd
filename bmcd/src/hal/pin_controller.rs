@@ -18,12 +18,12 @@ use crate::gpio_output_lines;
 
 use super::gpio_definitions::*;
 use super::NodeId;
+use super::PowerControllerError;
+use super::UsbArchitecture;
 use super::UsbMode;
 use super::UsbRoute;
 use anyhow::Context;
 use gpiod::{Chip, Lines, Output};
-use std::fmt::Display;
-use thiserror::Error;
 use tracing::debug;
 
 const USB_PORT_POWER: &str = "/sys/bus/platform/devices/usb-port-power/state";
@@ -198,21 +198,6 @@ trait UsbConfiguration {
     fn configure_usb(&self, node: NodeId, mode: UsbMode) -> Result<(), PowerControllerError>;
 }
 
-#[derive(Debug, PartialEq)]
-pub enum UsbArchitecture {
-    UsbHub,
-    UsbMux,
-}
-
-impl Display for UsbArchitecture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UsbArchitecture::UsbHub => f.write_str("Usb hub"),
-            UsbArchitecture::UsbMux => f.write_str("Single bus"),
-        }
-    }
-}
-
 struct UsbMuxSwitch {
     usb_mux: Lines<Output>,
     usb_vbus: Lines<Output>,
@@ -333,19 +318,4 @@ impl UsbConfiguration for UsbHub {
         let value = if alternative_port { 0b11 } else { 0u8 };
         Ok(self.node1_source.set_values(value)?)
     }
-}
-
-#[derive(Debug, Error)]
-pub enum PowerControllerError {
-    #[error("This command is only available on v2.5+ boards")]
-    Node1UsbNotApplicable,
-    #[error(
-        "Selecting one of the nodes as USB Host role \
-        is not supported by the current hardware"
-    )]
-    HostModeNotSupported,
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Anyhow(#[from] anyhow::Error),
 }

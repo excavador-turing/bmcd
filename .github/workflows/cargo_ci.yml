@@ -79,6 +79,22 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # The `stubbed` feature swaps the GPIO/sysfs HAL for an in-memory
+      # simulation, and is the only way to run this daemon without a Turing Pi
+      # board under it. It had not compiled since before v2.3.7, because
+      # nothing built it -- the default build is the only thing CI ever asked
+      # for, so the stub drifted out of sync with the HAL it stands in for and
+      # nobody found out. These two steps are what stops that happening again.
+      #
+      # `--features stubbed` rather than `--all-features`: the other feature,
+      # `vendored`, statically links OpenSSL for cross-builds and would have
+      # this job compile OpenSSL from source for no benefit.
+      - name: cargo clippy (stubbed)
+        run: cargo clippy --workspace --all-targets --features stubbed --locked -- -D warnings
+
+      - name: cargo test (stubbed)
+        run: cargo test --workspace --features stubbed --locked
+
   cargo-deny:
     name: licences, bans, sources
     runs-on: ubuntu-latest
