@@ -1,35 +1,96 @@
 name: 'Cargo CI'
-on: push
+
+# Upstream ran this on every push with no branch filter and no concurrency
+# group. On a fork that means a duplicate run for every push to every branch,
+# and nothing cancels a superseded one. Pull requests are what gate merges
+# here, and `hive` is the branch that has to stay green.
+on:
+  push:
+    branches: [hive]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing in this workflow writes anything. The job this replaces handed
+# GITHUB_TOKEN to actions-rs/clippy-check purely so it could post check
+# annotations; running clippy directly needs no token at all.
+permissions:
+  contents: read
+
+# Actions are pinned by commit with the moving tag in a trailing comment, the
+# same convention the release workflow in the BMC-UI fork uses. The three
+# actions-rs/* actions this file used to call have been archived and
+# unmaintained since 2022, and actions/checkout@v3 runs on a Node runtime
+# GitHub has already removed once.
 
 jobs:
-  cargo-clippy:
+  cargo:
+    name: fmt, clippy, build, test
     runs-on: ubuntu-latest
+
     steps:
-      - run: |
-          sudo apt-get update &&\
-          sudo apt-get install libusb-1.0-0-dev -y
-      - uses: actions/checkout@v3
-      - run: rustup component add clippy
-      - uses: actions-rs/clippy-check@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # bmcd links libusb (rockusb/rusb), OpenSSL (actix-web's openssl
+      # feature) and libudev (via evdev/serialport). Upstream installed only
+      # libusb, in only one of the three jobs, and got away with it because
+      # the runner image happened to carry the rest.
+      - name: system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libusb-1.0-0-dev libssl-dev pkg-config libudev-dev
+
+      # Pinned, not "stable". Clippy gains lints every release, and with
+      # `-D warnings` below a new rustc would turn this red without anyone
+      # touching the repo. This is also the version Cargo.lock is resolved
+      # for: several dependencies are deliberately held one minor behind
+      # because their current releases require rustc 1.88. Bump this together
+      # with the Buildroot toolchain it is meant to match, and re-run
+      # `cargo update` when you do.
+      - name: rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          token: '${{ secrets.GITHUB_TOKEN }}'
-          args: '-- -D warnings'
-  cargo-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          default: true
-          profile: minimal
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
+          toolchain: '1.85.0'
+          components: rustfmt, clippy
+          # This action sets RUSTFLAGS='-D warnings' by default, which would
+          # apply to every cargo call in the job. The deny-warnings gate
+          # belongs on the clippy step, where it is visible.
+          rustflags: ''
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # `-D warnings` is the point of this step, and the tree is at zero
+      # clippy warnings as of this commit, so it does not need an exception.
+      # If a future toolchain bump introduces new lints, fix them or pin the
+      # toolchain -- do not soften this.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # --locked everywhere: CI must build the Cargo.lock that is committed,
+      # and fail loudly if the manifest and the lock have drifted, rather than
+      # quietly resolving something else and testing that instead.
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
   cargo-deny:
+    name: licences, bans, sources
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v3
-    - uses: EmbarkStudios/cargo-deny-action@v1
-      with:
-        command: check bans licenses sources
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # v1 of this action is unmaintained and ships a cargo-deny old enough to
+      # still accept the pre-2.x deny.toml schema. Moving to v2 is why
+      # deny.toml had to be migrated in this same series -- the old file is a
+      # hard parse error on any current cargo-deny, so this job could not have
+      # passed on v2 without that change.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses sources

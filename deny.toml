@@ -1,5 +1,13 @@
+# cargo-deny configuration.
+#
+# Migrated to the cargo-deny 2.x schema on 2026-09-07. The keys that used to
+# live here -- unlicensed, copyleft, allow-osi-fsf-free, default and deny --
+# were removed upstream in EmbarkStudios/cargo-deny#611 and are now hard
+# errors, so the old file no longer parsed at all. Under the current schema
+# the allow list below is exhaustive: any licence not named here is rejected,
+# which is what the removed keys used to say the long way round.
+
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -10,21 +18,19 @@ allow = [
     "OpenSSL",
     "MPL-2.0",
     "Unicode-DFS-2016",
+    # Unicode-3.0 is the successor to Unicode-DFS-2016 above, and is what the
+    # icu_* family and unicode-ident relicensed to. OSI approved, permissive.
+    "Unicode-3.0",
+    # Zlib arrived with foldhash, via hashbrown. OSI approved, FSF Free/Libre,
+    # permissive.
+    "Zlib",
     "CC0-1.0"
 ]
-deny = [
-    "Nokia",
-]
-copyleft = "deny"
-allow-osi-fsf-free = "neither"
-default = "deny"
 confidence-threshold = 0.8
 
 [[licenses.clarify]]
-name = "ring"
-version = "*"
+crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [
     { path = "LICENSE", hash = 0xbd0eed23 }
 ]
-
