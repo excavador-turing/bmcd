@@ -73,6 +73,38 @@ pub struct NodeInfo {
     pub uart_baud: Option<u32>,
 }
 
+/// Where the node power state applied on start of the daemon comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupPowerState {
+    /// Nodes were found powered: the daemon restarted underneath running
+    /// nodes and must not interfere with them.
+    Live(u8),
+    /// All nodes were found off: a cold boot, restore the last stored state.
+    Persisted(u8),
+}
+
+/// Decides which node power state to apply on start of the daemon.
+///
+/// # Arguments
+///
+/// * `live`        bit-field of the node enable lines as read back from the
+///     hardware.
+/// * `persisted`   bit-field of the node states last stored by the daemon.
+fn startup_power_state(live: u8, persisted: u8) -> StartupPowerState {
+    if live != 0 {
+        StartupPowerState::Live(live)
+    } else {
+        StartupPowerState::Persisted(persisted)
+    }
+}
+
+/// Lists the node numbers (1-based) set in the given bit-field, for logging.
+fn powered_nodes(node_states: u8) -> Vec<usize> {
+    bit_iterator(node_states, 0b1111)
+        .filter_map(|(idx, state)| (state == 1).then_some(idx + 1))
+        .collect()
+}
+
 pub struct BmcApplication {
     pub(super) pin_controller: PinController,
     pub(super) power_controller: PowerController,
@@ -145,9 +177,38 @@ impl BmcApplication {
 
     async fn initialize(&self) -> anyhow::Result<()> {
         self.initialize_usb_mode().await?;
-        let power_state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
-        self.activate_slot(power_state, 0b1111).await?;
+        self.initialize_power().await?;
         self.initialize_cooling().await
+    }
+
+    /// Applies the node power state on start of the daemon. A restart of the
+    /// daemon, or a reboot of the BMC, must not interfere with nodes that are
+    /// running: on a latching board the kernel preserves the node enable
+    /// latches, so when any of them reads on, that live state is the truth and
+    /// the persisted state is updated to match. Only when all of them read off
+    /// (a cold boot) the persisted state is restored.
+    async fn initialize_power(&self) -> anyhow::Result<()> {
+        let persisted = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
+        let live = self.power_controller.get_power_node().unwrap_or_else(|e| {
+            tracing::warn!("cannot read node power state, assuming cold boot: {:#}", e);
+            0
+        });
+
+        let node_states = match startup_power_state(live, persisted) {
+            StartupPowerState::Live(state) => {
+                info!("adopted live power state: nodes={:?}", powered_nodes(state));
+                state
+            }
+            StartupPowerState::Persisted(state) => {
+                info!(
+                    "cold boot: restoring persisted power state: nodes={:?}",
+                    powered_nodes(state)
+                );
+                state
+            }
+        };
+
+        self.activate_slot(node_states, 0b1111).await
     }
 
     #[instrument(skip(self), fields(alternative_port, config))]
@@ -469,5 +530,45 @@ impl BmcApplication {
 
     pub async fn get_cooling_devices() -> anyhow::Result<Vec<CoolingDevice>> {
         Ok(get_cooling_state().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_adopts_live_state_when_any_node_is_on() {
+        assert_eq!(
+            startup_power_state(0b0001, 0b1111),
+            StartupPowerState::Live(0b0001)
+        );
+        assert_eq!(
+            startup_power_state(0b1111, 0b0000),
+            StartupPowerState::Live(0b1111)
+        );
+        assert_eq!(
+            startup_power_state(0b0101, 0b0101),
+            StartupPowerState::Live(0b0101)
+        );
+    }
+
+    #[test]
+    fn startup_restores_persisted_state_on_cold_boot() {
+        assert_eq!(
+            startup_power_state(0b0000, 0b1111),
+            StartupPowerState::Persisted(0b1111)
+        );
+        assert_eq!(
+            startup_power_state(0b0000, 0b0000),
+            StartupPowerState::Persisted(0b0000)
+        );
+    }
+
+    #[test]
+    fn powered_nodes_lists_node_numbers() {
+        assert_eq!(powered_nodes(0b0000), Vec::<usize>::new());
+        assert_eq!(powered_nodes(0b1010), vec![2, 4]);
+        assert_eq!(powered_nodes(0b1111), vec![1, 2, 3, 4]);
     }
 }
