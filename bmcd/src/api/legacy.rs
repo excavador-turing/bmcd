@@ -217,8 +217,16 @@ async fn get_about() -> impl Into<LegacyResponse> {
     let mut version = "unknown".to_string();
 
     if let Ok(os_release) = read_os_release().await {
-        if let Some(buildroot_edition) = os_release.get("PRETTY_NAME") {
-            buildroot = buildroot_edition.trim_matches('"').to_string();
+        // `PRETTY_NAME` carries the Turing Pi firmware release, not the
+        // Buildroot one, so a board built on Buildroot 2025.02.17 reported
+        // "Turing Pi v2.2.0" as its buildroot release. post_build.sh writes the
+        // actual release to `BUILDROOT_VERSION`; images built before that key
+        // existed still only have `PRETTY_NAME` to offer.
+        if let Some(buildroot_release) = os_release
+            .get("BUILDROOT_VERSION")
+            .or_else(|| os_release.get("PRETTY_NAME"))
+        {
+            buildroot = buildroot_release.trim_matches('"').to_string();
         }
         if let Some(ver) = os_release.get("VERSION") {
             version = ver.to_string();
