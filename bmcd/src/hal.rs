@@ -86,6 +86,10 @@ impl Display for NodeId {
     }
 }
 
+// Upstream's declaration of the compute modules this board supports.
+// Nothing reads it today, but it is the only place that knowledge is
+// written down, so it is kept rather than deleted.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum NodeType {

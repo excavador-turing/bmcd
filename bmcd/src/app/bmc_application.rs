@@ -88,7 +88,7 @@ enum StartupPowerState {
 /// # Arguments
 ///
 /// * `live`        bit-field of the node enable lines as read back from the
-///     hardware.
+///   hardware.
 /// * `persisted`   bit-field of the node states last stored by the daemon.
 fn startup_power_state(live: u8, persisted: u8) -> StartupPowerState {
     if live != 0 {
@@ -112,7 +112,7 @@ fn powered_nodes(node_states: u8) -> Vec<usize> {
 /// * `activated_nodes`     bit-field of the nodes that are on now.
 /// * `idx`                 index of the node, 0-based.
 /// * `new_state`           the value the node is being set to, 0 or 1, as
-///     [`bit_iterator`] yields it.
+///   [`bit_iterator`] yields it.
 ///
 /// # Returns
 ///
@@ -274,7 +274,7 @@ impl BmcApplication {
         }
 
         // cleanup storage
-        let map: CoolingMap = HashMap::from_iter(set_devices.into_iter());
+        let map: CoolingMap = HashMap::from_iter(set_devices);
         info!("loaded cooling devices: {:?}", map);
         self.app_db.set(COOLING_DEVICES, map).await;
 

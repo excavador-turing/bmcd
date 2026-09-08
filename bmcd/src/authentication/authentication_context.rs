@@ -216,6 +216,10 @@ pub mod tests {
     use super::*;
     use std::ops::Sub;
 
+    // Fixtures for the authentication paths. No test constructs them at
+    // the moment; they are kept because writing them again is the harder
+    // half of testing this module.
+    #[allow(dead_code)]
     pub struct DummyValidator {}
     impl PasswordValidator for DummyValidator {
         fn validate(
@@ -226,6 +230,7 @@ pub mod tests {
         }
     }
 
+    #[allow(dead_code)]
     pub struct FalseValidator {}
     impl PasswordValidator for FalseValidator {
         fn validate(

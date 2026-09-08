@@ -81,14 +81,14 @@ impl PowerController {
     /// # Arguments
     ///
     /// * `node_states`     bit-field representing the nodes on the turing-pi board,
-    ///     where bit 1 is on and 0 equals off.
+    ///   where bit 1 is on and 0 equals off.
     /// * `node_mask`       bit-field to describe which nodes to control.
     ///
     /// # Returns
     ///
     /// * `Ok(())` when routine was executed successfully.
     /// * `Err(io error)` in the case there was a failure to write to the Linux
-    ///     subsystem that handles the node powering.
+    ///   subsystem that handles the node powering.
     pub async fn set_power_node(&self, node_states: u8, node_mask: u8) -> anyhow::Result<()> {
         let updates = bit_iterator(node_states, node_mask);
 
@@ -107,9 +107,9 @@ impl PowerController {
     /// # Returns
     ///
     /// * `Ok(bit-field)` where bit(n) = 1 means node n is enabled. On a
-    ///     latching board the kernel keeps these latches across a reboot of
-    ///     the BMC, so the value reflects the nodes that are actually powered,
-    ///     not what this daemon last requested.
+    ///   latching board the kernel keeps these latches across a reboot of
+    ///   the BMC, so the value reflects the nodes that are actually powered,
+    ///   not what this daemon last requested.
     /// * `Err(gpio error)` when a line could not be read.
     pub fn get_power_node(&self) -> anyhow::Result<u8> {
         let mut node_states = 0u8;
