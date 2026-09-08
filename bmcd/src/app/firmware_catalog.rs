@@ -26,7 +26,7 @@
 //! must not blank the others. Each carries its own error, and an error is
 //! never rendered as "nothing new" -- those are different claims and only the
 //! caller knows which one it is about to make.
-use crate::app::firmware_sources::{Source, SourceKind, Sources};
+use crate::app::firmware_sources::{Source, SourceKind};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::OnceLock;
