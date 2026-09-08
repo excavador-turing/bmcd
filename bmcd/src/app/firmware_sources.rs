@@ -91,6 +91,50 @@ pub struct Sources {
 /// 2026-09-08 the GitHub releases reach v2.1.0 while firmware.turingpi.com
 /// stops at v2.0.5. A source is a claim about what exists, and one publisher
 /// can make two different ones.
+/// Where this fork releases, and how the entry is labelled.
+pub const FORK_LOCATION: &str = "excavador-turing/BMC-Firmware";
+pub const FORK_LABEL: &str = "excavador-turing (this fork)";
+
+/// Locations that have MOVED, and where they moved to.
+///
+/// The fork left a personal account for its own organization on 2026-09-08.
+/// A board that had already written firmware-sources.json keeps whatever it
+/// stored, and nothing about a stale entry LOOKS broken: the archived
+/// repository still answers and still lists the releases it had. It simply
+/// never sees another one. A silent stop is exactly the failure a board
+/// owner would not notice, so the rewrite happens on read rather than
+/// waiting for a firmware nobody can discover to carry it.
+const RETIRED_LOCATIONS: &[(&str, &str)] = &[("excavador/tp2-bmc-firmware", FORK_LOCATION)];
+
+/// The label that shipped beside the retired location.
+const RETIRED_FORK_LABEL: &str = "excavador (this fork)";
+
+/// Rewrites retired locations in place; returns whether anything changed.
+///
+/// A label is only rewritten when its own source's location was rewritten
+/// AND the label is still the one that shipped -- a label the operator
+/// edited is theirs to keep.
+fn migrate(sources: &mut Sources) -> bool {
+    let mut changed = false;
+
+    for s in &mut sources.sources {
+        let Some((_, to)) = RETIRED_LOCATIONS
+            .iter()
+            .find(|(from, _)| s.location == *from)
+        else {
+            continue;
+        };
+
+        s.location = (*to).to_string();
+        if s.label == RETIRED_FORK_LABEL {
+            s.label = FORK_LABEL.to_string();
+        }
+        changed = true;
+    }
+
+    changed
+}
+
 impl Default for Sources {
     fn default() -> Self {
         Self {
@@ -98,8 +142,8 @@ impl Default for Sources {
                 Source {
                     id: "fork".to_string(),
                     kind: SourceKind::Github,
-                    label: "excavador (this fork)".to_string(),
-                    location: "excavador/tp2-bmc-firmware".to_string(),
+                    label: FORK_LABEL.to_string(),
+                    location: FORK_LOCATION.to_string(),
                     enabled: true,
                 },
                 Source {
@@ -135,13 +179,29 @@ impl Default for Sources {
 /// firmware screen must still render, and a board that cannot show its
 /// sources is worse than one showing the defaults.
 pub async fn load() -> Sources {
-    match tokio::fs::read_to_string(SOURCES_PATH).await {
+    let mut sources = match tokio::fs::read_to_string(SOURCES_PATH).await {
         Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
             tracing::warn!("{SOURCES_PATH} is not readable as sources ({e}); using defaults");
             Sources::default()
         }),
         Err(_) => Sources::default(),
+    };
+
+    // Persisted state outlives the firmware that wrote it, so a moved
+    // location is corrected on the way out rather than only in the default
+    // set -- a board that has ever opened this page has a file, and the
+    // default set is not what it reads.
+    if migrate(&mut sources) {
+        tracing::info!("firmware sources: a retired location was rewritten");
+        if let Err(e) = store(&sources).await {
+            // Read-only overlay, full disk: the rewrite still applies to
+            // THIS read, so the board keeps working; it just re-migrates
+            // next time.
+            tracing::warn!("could not persist the migrated sources ({e})");
+        }
     }
+
+    sources
 }
 
 /// Replaces the configured sources.
@@ -271,7 +331,7 @@ mod tests {
             sources: vec![src(
                 "x",
                 SourceKind::Github,
-                "https://github.com/excavador/tp2-bmc-firmware",
+                "https://github.com/excavador-turing/BMC-Firmware",
             )],
         };
         assert!(validate(&bad).is_err());
@@ -309,5 +369,83 @@ mod tests {
         let text = serde_json::to_string(&d).expect("serialises");
         let back: Sources = serde_json::from_str(&text).expect("parses");
         assert_eq!(back, d);
+    }
+
+    /// The whole point of the move: a board that already has a file keeps
+    /// pointing at the retired repository, which still answers and still
+    /// lists what it had. Nothing looks wrong; it just never sees another
+    /// release.
+    #[test]
+    fn a_retired_location_is_rewritten() {
+        let mut stored = Sources {
+            sources: vec![Source {
+                id: "fork".to_string(),
+                kind: SourceKind::Github,
+                label: "excavador (this fork)".to_string(),
+                location: "excavador/tp2-bmc-firmware".to_string(),
+                enabled: true,
+            }],
+        };
+
+        assert!(
+            migrate(&mut stored),
+            "the retired location must be recognised"
+        );
+        assert_eq!(stored.sources[0].location, FORK_LOCATION);
+        assert_eq!(stored.sources[0].label, FORK_LABEL);
+    }
+
+    /// A label the operator chose is theirs. Only one still at its shipped
+    /// default is rewritten alongside the location.
+    #[test]
+    fn an_edited_label_survives_the_migration() {
+        let mut stored = Sources {
+            sources: vec![Source {
+                id: "fork".to_string(),
+                kind: SourceKind::Github,
+                label: "my board".to_string(),
+                location: "excavador/tp2-bmc-firmware".to_string(),
+                enabled: true,
+            }],
+        };
+
+        assert!(migrate(&mut stored));
+        assert_eq!(stored.sources[0].location, FORK_LOCATION);
+        assert_eq!(stored.sources[0].label, "my board");
+    }
+
+    /// load() persists whenever migrate() reports a change, so a migration
+    /// that kept reporting one would rewrite the file on every read.
+    #[test]
+    fn the_default_set_needs_no_migration() {
+        let mut d = Sources::default();
+        assert!(
+            !migrate(&mut d),
+            "the shipped default must already be current"
+        );
+
+        let mut once = Sources {
+            sources: vec![src(
+                "fork",
+                SourceKind::Github,
+                "excavador/tp2-bmc-firmware",
+            )],
+        };
+        assert!(migrate(&mut once));
+        assert!(!migrate(&mut once), "migration must be idempotent");
+    }
+
+    /// A default still naming the retired repository would ship the very
+    /// state the migration exists to undo.
+    #[test]
+    fn the_default_no_longer_names_the_retired_location() {
+        let d = Sources::default();
+        for (retired, _) in RETIRED_LOCATIONS {
+            assert!(
+                !d.sources.iter().any(|s| s.location == *retired),
+                "default set still ships retired location {retired}"
+            );
+        }
+        assert!(d.sources.iter().any(|s| s.location == FORK_LOCATION));
     }
 }

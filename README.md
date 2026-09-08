@@ -9,13 +9,13 @@
 > unchanged.
 >
 > The daemon does not ship on its own. Our [BMC firmware
-> fork](https://github.com/excavador/tp2-bmc-firmware) pins it *by commit* and
+> fork](https://github.com/excavador-turing/BMC-Firmware) pins it *by commit* and
 > builds it into the image, so a change here is not real until that pin moves.
 
 ## Running now: `v2.6.0`
 
 Every functional change on this branch is on hardware. Firmware
-[`v2.5.0`](https://github.com/excavador/tp2-bmc-firmware/releases) pins bmcd
+[`v2.5.0`](https://github.com/excavador-turing/BMC-Firmware/releases) pins bmcd
 at `9474e75`, and everything below was measured on the board after that
 flash rather than inferred from a build.
 
@@ -263,7 +263,7 @@ there.
 ## Who depends on this fork
 
 Our firmware, and nothing else. `tp2bmc/package/bmcd/bmcd.mk` in
-[excavador/tp2-bmc-firmware](https://github.com/excavador/tp2-bmc-firmware) pins
+[excavador-turing/BMC-Firmware](https://github.com/excavador-turing/BMC-Firmware) pins
 `BMCD_VERSION` to a **commit on `hive`**, not a tag, and fetches the GitHub
 archive. Two consequences:
 
