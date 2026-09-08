@@ -20,6 +20,7 @@ use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
 use crate::app::firmware_info::get_firmware_slots;
+use crate::app::metrics_token;
 use crate::app::health_info::get_health;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
@@ -204,6 +205,8 @@ async fn api_entry(
         ("cooling", true) => set_cooling_info(bmc, query).await.into(),
         ("thermal", false) => get_thermal_info().await.into(),
         ("about", false) => get_about().await.into(),
+        ("metrics_token", false) => get_metrics_token().await,
+        ("metrics_token", true) => rotate_metrics_token().await,
         _ => (
             StatusCode::BAD_REQUEST,
             format!("Invalid `type` parameter {}", ty),
@@ -222,6 +225,62 @@ fn reload_self() -> impl Into<LegacyResponse> {
     });
 
     ()
+}
+
+/// Hands the metrics token to an administrator so a scrape can be configured.
+///
+/// Reachable only through `/api/bmc`, which means only a shadow account can
+/// read it -- and such an account can already power a node off and flash the
+/// firmware, so handing it this secret grants nothing it did not have. The
+/// point of the token is the reverse direction: what the token can do is
+/// read `/metrics` and nothing else.
+///
+/// Generates one on first read rather than at install time, so a board that
+/// is never scraped never carries a credential.
+async fn get_metrics_token() -> LegacyResponse {
+    if !metrics_token::storage_available() {
+        return LegacyResponse::Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no overlay mounted, so a metrics token cannot be stored".into(),
+        );
+    }
+    match metrics_token::ensure().await {
+        Ok(token) => LegacyResponse::ok(json!({
+            "username": metrics_token::TOKEN_USERNAME,
+            "token": token.token,
+            "created_at": token.created_at,
+            "path": metrics_token::TOKEN_PATH,
+        })),
+        Err(e) => LegacyResponse::Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read or create the metrics token: {e}").into(),
+        ),
+    }
+}
+
+/// Replaces the metrics token. The previous one stops working immediately --
+/// that is what rotation means, and it is why this is a separate credential:
+/// doing it cannot lock anyone out of the web interface, and rotating the
+/// root password cannot break a scrape.
+async fn rotate_metrics_token() -> LegacyResponse {
+    if !metrics_token::storage_available() {
+        return LegacyResponse::Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no overlay mounted, so a metrics token cannot be stored".into(),
+        );
+    }
+    match metrics_token::rotate().await {
+        Ok(token) => LegacyResponse::ok(json!({
+            "username": metrics_token::TOKEN_USERNAME,
+            "token": token.token,
+            "created_at": token.created_at,
+            "rotated": true,
+        })),
+        Err(e) => LegacyResponse::Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not rotate the metrics token: {e}").into(),
+        ),
+    }
 }
 
 async fn get_about() -> impl Into<LegacyResponse> {

@@ -127,9 +127,14 @@ async fn main() -> anyhow::Result<()> {
                 // an unauthenticated second surface next to `/info` is a finding
                 // waiting to be filed. The authenticator accepts HTTP Basic,
                 // which is what a scrape config can send.
+                // NOT wrapped in `authentication`. That authenticator checks
+                // /etc/shadow, and there is no per-route authorization behind
+                // it, so every credential it accepts can also power a node
+                // off and flash firmware -- which is not what belongs in a
+                // scrape config. This scope authenticates with its own token
+                // instead; see `app::metrics_token` and `api::metrics`.
                 .service(
                     web::scope("/metrics")
-                        .wrap(authentication.clone())
                         .app_data(bmc.clone())
                         .configure(metrics::config),
                 )
