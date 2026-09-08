@@ -337,7 +337,9 @@ async fn read_be_u32_property(path: &Path) -> Option<Vec<u32>> {
 
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|cell| u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]))
             .collect(),
     )

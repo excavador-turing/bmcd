@@ -1,0 +1,14 @@
+# The toolchain that builds what SHIPS.
+#
+# Buildroot's rust-bin package pins 1.98.1 and produces the binary on the
+# board; CI used to validate with 1.85.0, so thirteen minor versions of
+# clippy lints and codegen differences went unchecked. Worse, the vendored
+# cargo archive's sha256 depends on this version -- tp2bmc/package/bmcd/
+# bmcd.hash documents that trap -- so "which rustc" was already load-bearing
+# for the firmware build while being unpinned here.
+#
+# Bump this together with BMC-Firmware's buildroot/package/rust-bin, never
+# alone, and re-run `cargo update` when you do.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

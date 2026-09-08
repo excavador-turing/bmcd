@@ -53,7 +53,7 @@ jobs:
       - name: rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.98.1'
           components: rustfmt, clippy
           # This action sets RUSTFLAGS='-D warnings' by default, which would
           # apply to every cargo call in the job. The deny-warnings gate

@@ -216,26 +216,6 @@ pub mod tests {
     use super::*;
     use std::ops::Sub;
 
-    pub struct DummyValidator {}
-    impl PasswordValidator for DummyValidator {
-        fn validate(
-            _: &str,
-            _: &str,
-        ) -> Result<(), crate::authentication::authentication_errors::AuthenticationError> {
-            Ok(())
-        }
-    }
-
-    pub struct FalseValidator {}
-    impl PasswordValidator for FalseValidator {
-        fn validate(
-            _: &str,
-            _: &str,
-        ) -> Result<(), crate::authentication::authentication_errors::AuthenticationError> {
-            Err(AuthenticationError::IncorrectCredentials)
-        }
-    }
-
     pub fn build_test_context(
         token_data: impl IntoIterator<Item = (String, Instant)>,
         user_data: impl IntoIterator<Item = (String, String)>,

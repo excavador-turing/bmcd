@@ -78,7 +78,7 @@ impl DataTransfer {
     pub async fn url(url: Url, sha256: Option<bytes::Bytes>) -> anyhow::Result<Self> {
         let file_name = url
             .path_segments()
-            .and_then(|seg| seg.last())
+            .and_then(|mut seg| seg.next_back())
             .or_else(|| url.host_str())
             .unwrap_or("http_file")
             .into();
@@ -181,7 +181,7 @@ impl DataTransfer {
                     .take()
                     .expect("request taken")
                     .bytes_stream()
-                    .map(|res| res.map_err(|e| std::io::Error::new(ErrorKind::Other, e)));
+                    .map(|res| res.map_err(std::io::Error::other));
 
                 Ok(build_reader_object(file_name, sha256.clone(), bytes_stream))
             }

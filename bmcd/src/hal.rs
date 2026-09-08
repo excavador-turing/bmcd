@@ -86,14 +86,6 @@ impl Display for NodeId {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub enum NodeType {
-    RaspberryPi4,
-    JetsonTx2,
-    RK1,
-}
-
 #[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum UsbRoute {
     Bmc,
