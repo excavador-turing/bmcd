@@ -408,16 +408,7 @@ fn render_switch(out: &mut String, snapshot: &Snapshot) {
             .iter()
             .map(|port| {
                 Sample::new(
-                    labels(&[
-                        ("port", port.name.as_str()),
-                        (
-                            "kind",
-                            match port.kind {
-                                PortKind::Node => "node",
-                                PortKind::Uplink => "uplink",
-                            },
-                        ),
-                    ]),
+                    labels(&[("port", port.name.as_str()), ("kind", port_kind(port))]),
                     u8::from(port.present).into(),
                 )
             })
@@ -475,11 +466,32 @@ fn render_switch(out: &mut String, snapshot: &Snapshot) {
     );
 }
 
+/// Which side of the switch a port faces.
+///
+/// Carried on EVERY switch series, not only on `..._present`. It used to be
+/// on that one alone, which forced anything meaning "node ports only" to
+/// match the port NAME instead -- a naming convention rather than data. For
+/// an alert-shaped query that is the worst kind of dependency, because when
+/// the convention stops holding the query matches nothing, and matching
+/// nothing is indistinguishable from healthy. A dashboard panel was shipped
+/// broken exactly that way and caught only by inverting its join.
+fn port_kind(port: &SwitchPort) -> &'static str {
+    match port.kind {
+        PortKind::Node => "node",
+        PortKind::Uplink => "uplink",
+    }
+}
+
 fn port_samples(ports: &[SwitchPort], read: impl Fn(&SwitchPort) -> Option<f64>) -> Vec<Sample> {
     ports
         .iter()
         .filter_map(|port| {
-            read(port).map(|value| Sample::new(labels(&[("port", port.name.as_str())]), value))
+            read(port).map(|value| {
+                Sample::new(
+                    labels(&[("port", port.name.as_str()), ("kind", port_kind(port))]),
+                    value,
+                )
+            })
         })
         .collect()
 }
@@ -1033,6 +1045,35 @@ mod tests {
         assert_eq!(read_sensors(&dir.path().join("absent")).await, Vec::new());
     }
 
+    /// Every switch series must carry `kind`, not just `..._present`.
+    ///
+    /// This is an invariant rather than an example, so it is asserted over
+    /// whatever families exist rather than against a fixed list: a switch
+    /// metric added later gets the label or fails here.
+    ///
+    /// The reason it is worth a test of its own: while only `..._present`
+    /// carried `kind`, anything meaning "node ports only" had to match the
+    /// port NAME instead. That is a convention, not data, and when a query
+    /// built on it stops matching it returns nothing -- which for an
+    /// alert-shaped query is indistinguishable from healthy. A dashboard
+    /// panel shipped broken exactly that way.
+    #[test]
+    fn every_switch_series_carries_its_kind() {
+        let rendered = render(&a_healthy_board());
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("bmcd_switch_port_"))
+            .collect();
+
+        assert!(!samples.is_empty(), "no switch samples were rendered");
+        for line in samples {
+            assert!(
+                line.contains("kind=\"node\"") || line.contains("kind=\"uplink\""),
+                "switch series without a kind label: {line}"
+            );
+        }
+    }
+
     /// The whole document, asserted byte for byte. Nothing else checks the
     /// metric names, the units or the `# HELP`/`# TYPE` lines -- there is no
     /// client library here to do it -- so this test is the contract.
@@ -1068,56 +1109,56 @@ mod tests {
                 "\n",
                 "# HELP bmcd_switch_port_link Whether a switch port has carrier.\n",
                 "# TYPE bmcd_switch_port_link gauge\n",
-                "bmcd_switch_port_link{port=\"node1\"} 1\n",
-                "bmcd_switch_port_link{port=\"node2\"} 1\n",
-                "bmcd_switch_port_link{port=\"node3\"} 1\n",
-                "bmcd_switch_port_link{port=\"node4\"} 1\n",
-                "bmcd_switch_port_link{port=\"ge0\"} 1\n",
-                "bmcd_switch_port_link{port=\"ge1\"} 0\n",
+                "bmcd_switch_port_link{port=\"node1\",kind=\"node\"} 1\n",
+                "bmcd_switch_port_link{port=\"node2\",kind=\"node\"} 1\n",
+                "bmcd_switch_port_link{port=\"node3\",kind=\"node\"} 1\n",
+                "bmcd_switch_port_link{port=\"node4\",kind=\"node\"} 1\n",
+                "bmcd_switch_port_link{port=\"ge0\",kind=\"uplink\"} 1\n",
+                "bmcd_switch_port_link{port=\"ge1\",kind=\"uplink\"} 0\n",
                 "\n",
                 "# HELP bmcd_switch_port_speed_bits_per_second Negotiated line rate of a switch port.\n",
                 "# TYPE bmcd_switch_port_speed_bits_per_second gauge\n",
-                "bmcd_switch_port_speed_bits_per_second{port=\"node1\"} 1000000000\n",
-                "bmcd_switch_port_speed_bits_per_second{port=\"node2\"} 1000000000\n",
-                "bmcd_switch_port_speed_bits_per_second{port=\"node3\"} 1000000000\n",
-                "bmcd_switch_port_speed_bits_per_second{port=\"node4\"} 1000000000\n",
-                "bmcd_switch_port_speed_bits_per_second{port=\"ge0\"} 1000000000\n",
+                "bmcd_switch_port_speed_bits_per_second{port=\"node1\",kind=\"node\"} 1000000000\n",
+                "bmcd_switch_port_speed_bits_per_second{port=\"node2\",kind=\"node\"} 1000000000\n",
+                "bmcd_switch_port_speed_bits_per_second{port=\"node3\",kind=\"node\"} 1000000000\n",
+                "bmcd_switch_port_speed_bits_per_second{port=\"node4\",kind=\"node\"} 1000000000\n",
+                "bmcd_switch_port_speed_bits_per_second{port=\"ge0\",kind=\"uplink\"} 1000000000\n",
                 "\n",
                 "# HELP bmcd_switch_port_rx_bytes_total Bytes received on a switch port.\n",
                 "# TYPE bmcd_switch_port_rx_bytes_total counter\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"node1\"} 1234\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"node2\"} 1234\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"node3\"} 1234\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"node4\"} 1234\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"ge0\"} 1234\n",
-                "bmcd_switch_port_rx_bytes_total{port=\"ge1\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"node1\",kind=\"node\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"node2\",kind=\"node\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"node3\",kind=\"node\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"node4\",kind=\"node\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"ge0\",kind=\"uplink\"} 1234\n",
+                "bmcd_switch_port_rx_bytes_total{port=\"ge1\",kind=\"uplink\"} 1234\n",
                 "\n",
                 "# HELP bmcd_switch_port_tx_bytes_total Bytes transmitted on a switch port.\n",
                 "# TYPE bmcd_switch_port_tx_bytes_total counter\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"node1\"} 5678\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"node2\"} 5678\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"node3\"} 5678\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"node4\"} 5678\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"ge0\"} 5678\n",
-                "bmcd_switch_port_tx_bytes_total{port=\"ge1\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"node1\",kind=\"node\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"node2\",kind=\"node\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"node3\",kind=\"node\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"node4\",kind=\"node\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"ge0\",kind=\"uplink\"} 5678\n",
+                "bmcd_switch_port_tx_bytes_total{port=\"ge1\",kind=\"uplink\"} 5678\n",
                 "\n",
                 "# HELP bmcd_switch_port_rx_errors_total Receive errors on a switch port.\n",
                 "# TYPE bmcd_switch_port_rx_errors_total counter\n",
-                "bmcd_switch_port_rx_errors_total{port=\"node1\"} 0\n",
-                "bmcd_switch_port_rx_errors_total{port=\"node2\"} 0\n",
-                "bmcd_switch_port_rx_errors_total{port=\"node3\"} 0\n",
-                "bmcd_switch_port_rx_errors_total{port=\"node4\"} 0\n",
-                "bmcd_switch_port_rx_errors_total{port=\"ge0\"} 0\n",
-                "bmcd_switch_port_rx_errors_total{port=\"ge1\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"node1\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"node2\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"node3\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"node4\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"ge0\",kind=\"uplink\"} 0\n",
+                "bmcd_switch_port_rx_errors_total{port=\"ge1\",kind=\"uplink\"} 0\n",
                 "\n",
                 "# HELP bmcd_switch_port_tx_errors_total Transmit errors on a switch port.\n",
                 "# TYPE bmcd_switch_port_tx_errors_total counter\n",
-                "bmcd_switch_port_tx_errors_total{port=\"node1\"} 0\n",
-                "bmcd_switch_port_tx_errors_total{port=\"node2\"} 0\n",
-                "bmcd_switch_port_tx_errors_total{port=\"node3\"} 0\n",
-                "bmcd_switch_port_tx_errors_total{port=\"node4\"} 0\n",
-                "bmcd_switch_port_tx_errors_total{port=\"ge0\"} 0\n",
-                "bmcd_switch_port_tx_errors_total{port=\"ge1\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"node1\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"node2\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"node3\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"node4\",kind=\"node\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"ge0\",kind=\"uplink\"} 0\n",
+                "bmcd_switch_port_tx_errors_total{port=\"ge1\",kind=\"uplink\"} 0\n",
                 "\n",
                 "# HELP bmcd_node_power_state Whether a compute module is powered on.\n",
                 "# TYPE bmcd_node_power_state gauge\n",
