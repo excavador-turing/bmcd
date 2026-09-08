@@ -1,0 +1,147 @@
+name: Release
+
+# A pushed tag is the only thing that publishes here, the same rule the BMC-UI
+# fork's release workflow follows: cutting a release has to be a decision
+# somebody made, not a side effect of a merge.
+on:
+  push:
+    tags: ["v*"]
+
+# Never cancel a release in flight: the tag is already public by the time this
+# starts.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release steps; nothing else here writes
+
+    # Actions are pinned by commit, with the moving tag in the comment: a
+    # retagged action cannot change what runs in a job that can publish
+    # releases.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The tag is the version users see; Cargo.toml is the version the binary
+      # reports through `/api/bmc?opt=get&type=about`. If those two disagree a
+      # board will report something that matches no release, so disagreeing is
+      # a hard error rather than a warning nobody reads.
+      - name: tag matches Cargo.toml
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' bmcd/Cargo.toml | head -1)"
+          echo "tag=${tag} manifest=${manifest}"
+          if [ "${tag}" != "${manifest}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match bmcd/Cargo.toml ${manifest}" >&2
+            exit 1
+          fi
+
+      - name: system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libusb-1.0-0-dev libssl-dev pkg-config libudev-dev
+
+      # Same pin as cargo_ci.yml. A release must not be the first place a
+      # different toolchain gets used.
+      - name: rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: '1.85.0'
+          rustflags: ''
+
+      # The gate. cargo_ci.yml runs on pushes to `hive` and on pull requests,
+      # neither of which covers a tag -- so without this a release could be cut
+      # from a commit that never built.
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      # No cross-compiled binary is published on purpose. The only consumer is
+      # the firmware build, which compiles bmcd itself inside Buildroot against
+      # that image's toolchain and sysroot; a binary built here would be built
+      # by a different toolchain, and shipping one would invite somebody to
+      # install it on a board where it does not match. What is useful to
+      # publish is the exact source the firmware pinned, and its checksum.
+      #
+      # Fixed ownership, sorted names and the tag commit's timestamp, gzipped
+      # with -n, so re-running the same tag does not produce a different
+      # sha256 purely because of when it ran.
+      - name: stage the source tarball
+        run: |
+          set -eu
+          mkdir -p artifacts
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          git archive --format=tar --prefix="bmcd-${GITHUB_REF_NAME}/" HEAD \
+            | gzip -9 -n > "artifacts/bmcd-${GITHUB_REF_NAME}.tar.gz"
+          tar -tzf "artifacts/bmcd-${GITHUB_REF_NAME}.tar.gz" | head -5
+
+      # SHA256SUMS lists BARE BASENAMES, and the guard below fails the release
+      # if one ever does not. `sha256sum -c` resolves each name relative to the
+      # current directory, so a line carrying a path fails to OPEN the file on
+      # the verifying machine -- a different failure from a mismatch, and one a
+      # build script can step over as though the check had passed.
+      - name: checksums
+        run: |
+          set -eu
+          cd artifacts
+          sha256sum -- *.tar.gz > SHA256SUMS
+          if grep -q '/' SHA256SUMS; then
+            echo "SHA256SUMS contains a path; it must list basenames only" >&2
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: archive artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: bmcd-${{ github.ref_name }}
+          path: artifacts/*
+
+      # draft: true, then publish in a separate step. With immutable releases
+      # enabled, assets are locked the moment a release is published, and the
+      # action publishes before uploading. A draft accepts assets; the edit
+      # below makes the whole set visible at once.
+      - name: release (draft, with assets)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          body: |
+            bmcd built from the `hive` branch of this fork, for the Turing Pi 2
+            BMC firmware build to consume.
+
+            **Not a Turing Pi release.** The firmware pins this repository by
+            commit and compiles it inside Buildroot, so no binary is published
+            here -- a binary built by this runner would not match the board's
+            toolchain. The tarball is the source that was tagged.
+
+            Verify with:
+
+            ```
+            sha256sum -c SHA256SUMS
+            ```
+
+            SHA256SUMS lists bare filenames, so run it from the directory
+            holding the tarball.
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false
