@@ -22,6 +22,7 @@ use crate::app::bmc_info::{
 use crate::app::firmware_info::get_firmware_slots;
 use crate::app::health_info::get_health;
 use crate::app::metrics_token;
+use crate::app::update_check;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
@@ -206,6 +207,7 @@ async fn api_entry(
         ("thermal", false) => get_thermal_info().await.into(),
         ("about", false) => get_about().await.into(),
         ("metrics_token", false) => get_metrics_token().await,
+        ("update_check", false) => get_update_check().await.into(),
         ("metrics_token", true) => rotate_metrics_token().await,
         _ => (
             StatusCode::BAD_REQUEST,
@@ -225,6 +227,17 @@ fn reload_self() -> impl Into<LegacyResponse> {
     });
 
     ()
+}
+
+/// Whether a newer firmware release exists on either channel.
+///
+/// Answered by `tpi-selfupdate --check --json`, which already owns release
+/// resolution, rather than by a second implementation here that would be
+/// free to disagree with the updater that actually performs the upgrade.
+/// Cached, because unauthenticated GitHub allows 60 requests an hour and a
+/// browser left on the firmware page would spend them.
+async fn get_update_check() -> impl Into<LegacyResponse> {
+    json!(update_check::get().await)
 }
 
 /// Hands the metrics token to an administrator so a scrape can be configured.
