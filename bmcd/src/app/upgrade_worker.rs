@@ -243,7 +243,7 @@ const OTA_SUFFIX: &str = ".tpu";
 /// Returns `None` for anything else rather than guessing. A hand-built or
 /// renamed image genuinely has no tag to report, and a wrong version on the
 /// firmware page is worse than an absent one.
-fn tag_from_ota_name(file_name: &str) -> Option<&str> {
+pub(crate) fn tag_from_ota_name(file_name: &str) -> Option<&str> {
     let tag = file_name
         .strip_prefix(OTA_PREFIX)?
         .strip_suffix(OTA_SUFFIX)?;

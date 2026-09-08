@@ -19,7 +19,9 @@ use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
+use crate::app::firmware_catalog;
 use crate::app::firmware_info::get_firmware_slots;
+use crate::app::firmware_sources;
 use crate::app::health_info::get_health;
 use crate::app::metrics_token;
 use crate::app::switch_info::get_switch_ports;
@@ -208,6 +210,9 @@ async fn api_entry(
         ("about", false) => get_about().await.into(),
         ("metrics_token", false) => get_metrics_token().await,
         ("update_check", false) => get_update_check().await.into(),
+        ("firmware_sources", false) => get_firmware_sources().await.into(),
+        ("firmware_sources", true) => set_firmware_sources(query).await,
+        ("firmware_available", false) => get_firmware_available(query).await.into(),
         ("metrics_token", true) => rotate_metrics_token().await,
         _ => (
             StatusCode::BAD_REQUEST,
@@ -227,6 +232,58 @@ fn reload_self() -> impl Into<LegacyResponse> {
     });
 
     ()
+}
+
+/// The configured firmware sources.
+async fn get_firmware_sources() -> impl Into<LegacyResponse> {
+    json!(firmware_sources::load().await)
+}
+
+/// Replaces the configured sources.
+///
+/// Validated before it is written, not at install time: a list that saves and
+/// then fails on use is much harder to understand than one refused as it is
+/// written. The commonest mistake -- an http source pointed at a `.tpu` rather
+/// than the directory holding version folders -- would otherwise list nothing,
+/// and an empty list is indistinguishable from a source with no new versions.
+async fn set_firmware_sources(query: Query) -> LegacyResponse {
+    if !firmware_sources::storage_available() {
+        return LegacyResponse::Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no overlay mounted, so sources cannot be stored".into(),
+        );
+    }
+
+    let Some(body) = query.get("sources") else {
+        return LegacyResponse::bad_request("Missing `sources` parameter");
+    };
+
+    let parsed: firmware_sources::Sources = match serde_json::from_str(body) {
+        Ok(parsed) => parsed,
+        Err(e) => return LegacyResponse::bad_request(format!("`sources` is not valid: {e}")),
+    };
+
+    if let Err(e) = firmware_sources::validate(&parsed) {
+        return LegacyResponse::bad_request(e);
+    }
+
+    match firmware_sources::store(&parsed).await {
+        Ok(()) => LegacyResponse::ok(json!(parsed)),
+        Err(e) => LegacyResponse::Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not store the sources: {e}").into(),
+        ),
+    }
+}
+
+/// What every enabled source is offering.
+///
+/// `refresh=1` skips the cache, which is what a "check now" control needs: a
+/// page that can only report what it thought half an hour ago cannot confirm a
+/// release published since.
+async fn get_firmware_available(query: Query) -> impl Into<LegacyResponse> {
+    let force = query.contains_key("refresh");
+    json!(firmware_catalog::get(force).await)
 }
 
 /// Whether a newer firmware release exists on either channel.
@@ -469,7 +526,7 @@ async fn read_os_release() -> std::io::Result<HashMap<String, String>> {
 /// key `get_about` sends as `version`, with the quotes os-release puts around
 /// a value stripped -- `get_about` passes them through, and something may be
 /// matching on that, so it is left as it is.
-pub(super) async fn firmware_version() -> Option<String> {
+pub(crate) async fn firmware_version() -> Option<String> {
     let os_release = read_os_release().await.ok()?;
     os_release
         .get("VERSION")
@@ -762,10 +819,42 @@ async fn handle_transfer_request(
     query: Query,
 ) -> LegacyResult<String> {
     let (process_name, upgrade_command) = match query.get("type").map(|c| c.as_str()) {
-        Some("firmware") => (
-            "firmware upgrade service".to_string(),
-            UpgradeCommand::OsUpgrade,
-        ),
+        Some("firmware") => {
+            // Refuse to stage a second image over one that is already armed.
+            //
+            // `osupdate` writes into the volume `nextboot` points at, so
+            // starting a second upgrade destroys the image the board is about
+            // to boot while leaving the environment pointing at it -- the one
+            // state in this whole design with nothing to fall back to.
+            // `tpi-selfupdate` has always refused it; the API had not, so the
+            // web interface could do what the command line would not.
+            //
+            // `force` exists because the refusal must not become a trap: a
+            // board whose staged image is known bad needs a way forward that
+            // is not a reboot onto it.
+            if !query.contains_key("force") {
+                let slots = get_firmware_slots(firmware_version().await).await;
+                if slots.update_staged == Some(true) {
+                    let staged = slots
+                        .staged
+                        .as_ref()
+                        .and_then(|s| s.version.clone())
+                        .unwrap_or_else(|| "an image".to_string());
+                    return Err(LegacyResponse::Error(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "{staged} is already staged for the next boot; reboot to take it, \
+                             or pass force=1 to replace it"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            (
+                "firmware upgrade service".to_string(),
+                UpgradeCommand::OsUpgrade,
+            )
+        }
         Some("flash") => {
             let node = get_node_param(&query)?;
             (
