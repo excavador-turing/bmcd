@@ -364,7 +364,12 @@ async fn install_firmware(query: Query) -> LegacyResponse {
             // The updater logs to stderr; its last line is the reason it
             // stopped, and is far more useful than an exit code.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.lines().last().unwrap_or("no output").trim().to_string();
+            let detail = stderr
+                .lines()
+                .last()
+                .unwrap_or("no output")
+                .trim()
+                .to_string();
             LegacyResponse::Error(StatusCode::BAD_REQUEST, detail.into())
         }
         Ok(Err(e)) => LegacyResponse::Error(
