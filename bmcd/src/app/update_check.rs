@@ -163,7 +163,7 @@ mod tests {
     /// rather than against something this crate produced.
     #[test]
     fn the_updaters_object_deserialises() {
-        let line = r#"{"channel":"stable","repo":"excavador/tp2-bmc-firmware","running":"v2.4.0","target":"v2.5.0","update_available":true}"#;
+        let line = r#"{"channel":"stable","repo":"excavador-turing/BMC-Firmware","running":"v2.4.0","target":"v2.5.0","update_available":true}"#;
         let s: ChannelState = serde_json::from_str(line).expect("parses");
         assert_eq!(s.channel, "stable");
         assert_eq!(s.running, "v2.4.0");
