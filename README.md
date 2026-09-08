@@ -12,71 +12,32 @@
 > fork](https://github.com/excavador/tp2-bmc-firmware) pins it *by commit* and
 > builds it into the image, so a change here is not real until that pin moves.
 
-## Running now
+## Running now: `v2.6.0`
 
-One change from this branch is on hardware: firmware
-[`v2.2.0-unstable-hive.5`](https://github.com/excavador/tp2-bmc-firmware/releases)
-pins bmcd at `27ec80f`. It was measured on the board after that flash.
+Every functional change on this branch is on hardware. Firmware
+[`v2.5.0`](https://github.com/excavador/tp2-bmc-firmware/releases) pins bmcd
+at `9474e75`, and everything below was measured on the board after that
+flash rather than inferred from a build.
+
+This section used to say the opposite -- it described `27ec80f` under
+firmware `hive.5` and carried a companion section headed "Built, not yet on
+a board". Both went stale across ten releases while the code kept moving,
+which is its own lesson: a fork's README is the one file nothing fails when
+it is wrong.
 
 | verified | evidence |
-|---|---|
-| **A daemon restart — and therefore a firmware upgrade — no longer power-cycles running compute modules.** On start the daemon used to restore `activated_nodes` from `bmcd.bin` and drive the rails to it, so a stale persisted value switched running nodes off or on. It now reads the node enable lines back: when any node reads on, that live state is the truth and is written back to the persistency; only when all four read off (a cold boot) is the persisted state restored. Fixes upstream [bmcd#90](https://github.com/turing-machines/bmcd/issues/90) | Two firmware flashes and a daemon restart with four modules powered: every rail stayed on, every `/proc/uptime` stayed monotonic |
+| -- | -- |
+| **Node power state survives a BMC reboot.** The daemon reads the live rail state on start and adopts it, instead of re-applying what `bmcd.bin` persisted | Ten flashes and daemon restarts with four modules powered: every rail stayed on, every `/proc/uptime` monotonic. Fixes upstream [bmcd#90](https://github.com/turing-machines/bmcd/issues/90) |
+| **`power_on_time` is per node, and is a duration** | Upstream inferred it from one shared bit, so the read could only ever agree for node 1. Confirmed live on 2026-09-08: node 1 reported 126327 s power-on against 58 s of OS uptime after a manual reboot -- the field tracks the rail, not the operating system |
+| **An authenticated Prometheus endpoint**, with a credential that opens it and nothing else | 77 metric lines under the token; 401 for root, for a wrong token, and for the token against `/api/bmc` |
+| **The About payload carries the kernel release** | `"kernel":"6.12.109"` on the board, matching `/proc/sys/kernel/osrelease` |
+| **`firmware_slots` reports which image is staged** | A real stage wrote `VERSION=v2.5.0` with the checksum the updater had just verified; the promotion script cleared it. Proven by mutation too: no note reports `null`, a note reports every field, removing it returns to `null` |
+| **`type=update_check` reports whether a newer release exists** | Answered by `tpi-selfupdate --check --json`, so the interface and the updater cannot disagree about what an upgrade would install |
+| **HTTP/2 is refused rather than downgraded after the parser ran** | `curl --http2` negotiates HTTP/1.1. It previously answered `HTTP/2 401` -- the request had been through the h2 stack before authentication rejected it |
+| **A serial console per module over a websocket** | A browser cannot set `Authorization` on a WS handshake, so the token rides the subprotocol, the pattern Kubernetes uses |
+| **Firmware uploads are staged on disk, not in a 58 MB RAM disk** | Prefers `/mnt/sdcard`, then `/mnt/overlay`, then `/tmp` -- the first that is a real mount with room |
+| **New API types**: `network`, `thermal`, `firmware_slots`, `health`, `metrics_token`, `update_check` | All answering on the board |
 
-Two commits carry it. `810e134` adds `PowerController::get_power_node`, the
-read-back counterpart of `set_power_node` — on the latching board the kernel
-keeps the node enable latches across a reboot of the BMC, so what it returns is
-what the nodes actually get, not what the daemon last asked for. `27ec80f` puts
-`initialize_power` in front of the old two lines and logs which of the two paths
-it took.
-
-Both paths still call `activate_slot`, deliberately: after a warm boot the
-kernel initialises regulator state from the device tree rather than from the
-preserved latch, so writing `enabled` to a rail that is already on is
-electrically a no-op that brings the regulator bookkeeping in line with the
-hardware — without it a later power *off* would not reach the rail. When the
-lines cannot be read the daemon warns and takes the cold-boot path, which is the
-old behaviour. The stubbed HAL returns all-off, which keeps the stub on the
-cold-boot path.
-
-## Built, not yet on a board
-
-**Nothing in this section has run on hardware.** Every functional commit after
-`27ec80f` is in no flashed image: the firmware's `hive` branch still pins
-`27ec80f`, and the bump to `df1e8ec` sits on an open firmware pull request.
-Read these as a diff with an argument behind it, not as behaviour.
-
-Four of them do come from measurements taken on the board -- the switch link
-state (`ge1` sitting at `lowerlayerdown`), the board serial in the EEPROM, three
-power-on times resetting to the BMC's own uptime, and `tpi info` disagreeing
-with the about page -- but the *fixes* have not been back on hardware. They were
-the last four when that was written; there are ten more behind them now.
-
-| not yet proven | what the change does |
-|---|---|
-| **A browser can open the serial console** | `/api/bmc/serial/ws` sits inside the authenticated `/api/bmc` scope, and the browser `WebSocket` constructor cannot set `Authorization` -- so the console worked from `curl` and answered a page with 401. A handshake that sends no `Authorization` header may now carry its bearer token as a websocket subprotocol, `Sec-WebSocket-Protocol: bmcd.serial.v1, bmcd.bearer.<token>`, which is what the Kubernetes API server does for `exec` and `attach`. The handshake response names the plain protocol back, never the credential, because a browser closes a connection the server did not answer with one of the names it offered. Not a query parameter: this daemon traces request paths, so a `?token=` would write the credential into the log. The fallback is read only off a complete handshake and only when `Authorization` is absent, so it is not a second way to authenticate a REST call; `Bearer`, `Basic` and the loopback exemption are untouched |
-| **The SoC temperature is reachable over the API** | The firmware only just gained a working SoC thermal sensor -- it was never described in any device tree, and the node had to be added -- and nothing in the daemon exposed it, so the web UI could not show a temperature at all. `opt=get&type=thermal` now returns two lists: every `thermal_zone*` as a `name` (the zone's `type`, `bmc-thermal` here) and a `temperature_c`, and every `cooling_device*` as a `name`, `cur_state` and `max_state`. Read straight from `/sys/class/thermal`, no shelling out. Millidegrees are converted to degrees at one decimal -- the board reads `52539`, which is `52.5` -- because raw millidegrees are unreadable and a whole degree throws away detail the sensor has. Each cooling device also carries `levels` and `max_level` -- the PWM duty behind each step, so a client can show a real percentage instead of "4 of 6". That mapping is in the device tree and nowhere in `/sys/class/thermal`, so it is read off the board's own tree at request time: the device's `type` names the platform driver, the driver's directory names the device bound to it, and that device's `of_node` symlink lands on the node, whose `cooling-levels` property is raw big-endian cells -- `0 16 32 64 102 170 254` here, and `max_level` is the last of them, 254, not 255. No path in the device tree is assumed. The table is reported only when its length matches `max_state + 1`, which is how the pwm-fan driver derives that number in the first place; a length that disagrees, a driver with no bound device or with more than one, and a node with no `cooling-levels` are all `"levels": null` rather than another fan's numbers. A board with no thermal zone at all, which is every image before this one and every v2.4 board, is a 200 with two empty lists: a caller has to be able to tell "this board cannot measure temperature" from "this board is at 0 degrees". `type=cooling` is untouched |
-| **The switch's own link state is reachable over the API** | Nothing in the daemon reported anything about the on-board Ethernet switch, although the kernel registers a netdev per port and knows all of it. `opt=get&type=network` now returns, for each of `node1`-`node4`, `ge0` and `ge1`: whether it is a node port or an uplink, whether the kernel has it at all, carrier, `operstate`, speed, duplex and the four byte/error counters. Read straight from `/sys/class/net`, no shelling out. The failure it exists for is a kernel where the switch driver does not probe -- the BMC stays perfectly reachable over its own interface while all four compute modules are cut off -- so every port is always listed and an absent one is `"present": false` rather than a missing entry or a 500 |
-| **The A/B firmware slots are reachable over the API** | The board takes firmware upgrades A/B -- the new image goes into the rootfs UBI volume that is not running, `nextboot` sends U-Boot at it once, and a promotion script keeps it or puts the old one back -- and nothing in the API said which volume the board booted, how big either is, whether an upgrade is waiting for the next boot, or what the promotion script decided last time. `opt=get&type=firmware_slots` now answers all four, from `/sys/class/ubi`, `fw_printenv -n nextboot` and the tail of `/mnt/overlay/postupdate.log`. The running slot is the volume with a `ubiblock` device attached, not the one called `rootfs`. Its version comes from `/etc/os-release`; **the rollback volume is not mounted, so it has a name and a size and no version** rather than a guessed one. A board with no UBI, or without `fw_printenv`, answers 200 with `"present": false` and nulls -- and `update_staged` is `null` rather than `false`, because "nothing is staged" and "the environment could not be read" are different answers. Not `type=firmware`: that name has belonged to the transfer machinery since long before this fork |
-| **The BMC's own condition is reachable over the API** | Everything the daemon reported was about the four compute modules or the board's peripherals; nothing was about the board running the daemon, which has 116 MB of RAM, five spare NAND eraseblocks and two clocks. `opt=get&type=health` now returns uptime and load from `/proc`, memory in bytes rather than meminfo's kibibytes, UBI's own eraseblock accounting from `/sys/class/ubi/ubi0` -- the same 2040 total, 5 available, 0 bad and 40 reserved that `ubinfo` prints, without the fork or the dependency on mtd-utils being in the image -- and every RTC the kernel registered. Clock synchronisation is the one thing that is not a file read: `chronyc tracking` is parsed for the stratum, the source and the offset, reported as system clock minus true time so a board that is behind is negative. `measured_by` says so. A board with no chrony answers `null` rather than `false`, because "not synchronised" and "we cannot tell" are different answers, and which of the two RTCs has a battery behind it is not claimed at all -- the kernel does not expose it |
-| **There is a Prometheus scrape endpoint** | `/metrics` used to return the web UI's `index.html` through the catch-all, which is worse than a 404: a scraper sees HTTP 200 and a document it cannot parse. It now returns the text exposition format -- SoC temperature and fan state, per-port link, speed and byte/error counters, per-node power state and power-on time, the health values above, and the firmware slots as an info metric. Hand-written, no metrics crate: the format is two comment lines and a sample per value, and this daemon is cross-compiled into a firmware image that is at 78% of its flash slot. **It is authenticated**, behind the same `LinuxAuthenticator` that wraps `/api/bmc`, which accepts HTTP Basic -- so a scrape config authenticates with `basic_auth` and nothing else. Adding a second unauthenticated surface next to what `/info` was at the time would have been the same finding twice; `/info` itself has since been removed outright (`e4e5eee`) |
-| **`type=about` reports the board's serial number** | The 24c02 EEPROM at i2c 0x50 holds the factory serial next to the product name and the hardware revision, and the daemon already parses that header -- `board_model` and `board_revision` come out of it. `get_about` now also sends `board_serial` from the `FactorySerial` field of the same read, with the fixed-width field's NUL padding stripped and an unprogrammed EEPROM reported as `null` rather than as a string of padding. `board_model` and `board_revision` are left byte-for-byte as they were, padding included, because something may be matching on them |
-| **`power_on_time` stops resetting for nodes 2, 3 and 4 on every daemon start** | `update_power_on_times` compared the new state of a node, which `bit_iterator` yields as 0 or 1, against `activated_nodes & (1 << idx)`, which is 0 or `1 << idx`. Those agree only for node 1. For every other node "already on, staying on" looked like a transition, so `initialize_power` -- which calls `activate_slot` on every start -- rewrote their power-on stamp to the moment the daemon came up. Measured after a BMC reboot with four modules running: node 1 at 52418 s, matching its own `/proc/uptime`, and nodes 2, 3 and 4 at 172 s, the BMC's own uptime. The comparison is now shifted down. Upstream bug, from 2023; boards carrying a wrong stamp recover it at the next real power cycle of that node |
-| **The About page stops saying `Build version: vundefined`** | The web UI reads the daemon version from a key named `build_version`; `get_about` only ever sent `bmcd_version`. It now sends the same value under both names — `bmcd_version` stays, it is the documented key of the legacy API. The value is bmcd's own crate version (`2.3.7`), not the firmware release. The UI's *other* version bug, the doubled `v` in `vv2.2.0-…`, is on the UI side and is untouched here |
-| **The About page reports the Buildroot release instead of the firmware name** | `get_about` filled its `buildroot` field from `PRETTY_NAME` in `/etc/os-release`, which our firmware stamps with the Turing Pi release — so a board built on Buildroot 2025.02.17 called its "Buildroot release" `Turing Pi v2.2.0`. It now prefers a `BUILDROOT_VERSION` key and falls back to `PRETTY_NAME`. The key is written by the firmware's `post_build.sh` from Buildroot's own `BR2_VERSION`, and that too is still on the open firmware PR, so an image built today has only the fallback to offer. `get_system_information` was left alone at the time and is fixed by the row below |
-| **`tpi info` reports the Buildroot release too** | The fix above only reached `get_about`. `get_system_information` -- `opt=get&type=other`, and the then-unauthenticated `GET /info`, since removed -- kept deriving its `buildroot` field from `PRETTY_NAME`, so on the same board `type=about` answered `2025.02.17` while `type=other` answered `Turing Pi v2.2.0`, and `tpi info` reads the latter. Both now call one `buildroot_release` helper rather than spelling the rule out a third time. `type=other` also loses the surrounding quotes it used to pass through from the raw os-release line |
-| **HTTP/2 is no longer offered, so its parser is not reachable before authentication** | The HTTPS listener advertised `h2` over ALPN, which puts HTTP/2 frame parsing in front of the authentication middleware -- an unauthenticated caller was inside the h2 codec just by connecting, and the h2 this tree resolves to is 0.3.27 with RUSTSEC-2026-0258 and no fixed 0.3.x to move to. The acceptor now offers `http/1.1` and nothing else, and an h2-only client gets no ALPN agreement rather than one the daemon does not want to honour. This could not be done by configuring the acceptor and calling `bind_openssl`: that method overwrites the ALPN callback with its own `h2`-preferring one, silently, so the listener is now assembled directly from an `HttpService`, `.h1()` rather than `.finish()`, which is what `bind_openssl` does internally minus the overwrite. Measured before and after against a running daemon, `openssl s_client -alpn h2,http/1.1` goes from `h2` to `http/1.1`, and an unauthenticated request goes from `HTTP/2 401` to `HTTP/1.1 401`. A websocket handshake from an h2-capable client used to negotiate `h2` and be answered 400 by the h2 dispatcher, since actix-web 4 cannot upgrade over HTTP/2; it now reaches the handler |
-| **A firmware upload is staged on disk rather than in the RAM disk** | `os_update` copied the whole uploaded image into `/tmp/os_upgrade` before handing it to `osupdate`. `select_staging_dir` now takes the first of `/mnt/sdcard`, `/mnt/overlay`, `/tmp` that is a mount point *of its own*, is mounted read-write, and has room for the image. The mount-point test is what rejects an SD card that is not inserted — `/mnt/sdcard` exists as an empty directory either way, and a write into it would land on the root filesystem. Node flashing does not go through here; `flash_node` streams straight to the node block device |
-
-Be careful with the last one, because the evidence is thinner than the story.
-A 38 MiB upload did die about five seconds in with `exit status: 141`, and the
-same write done by hand from the SD card completed. `/tmp` on this board is a
-58 MB tmpfs and the BMC has 116 MB of RAM in total, so memory pressure is the
-obvious reading — but **141 is 128+13, SIGPIPE, not the SIGKILL the OOM killer
-sends**. Take RAM exhaustion as a strong hypothesis, not as a demonstrated
-cause. What the change does prove is a class of failure removed: the image no
-longer competes with the daemon for the same memory. And when none of the three
-candidates qualifies it still falls back to `/tmp/os_upgrade`, so a board with
-neither a card nor a writable overlay is exactly where it was.
 
 ## Things this daemon does that the code does not say out loud
 
@@ -236,12 +197,42 @@ nothing but redirect. **This deletes a public interface of upstream's daemon** �
 anything outside this estate polling `http://<board>/info`, a discovery script
 or a monitoring probe, stops getting an answer.
 
-### The scrape endpoint authenticates like everything else
+### The scrape endpoint has a credential of its own
 
-`GET /metrics` answers in the Prometheus text exposition format, and it is
-inside the authentication middleware -- `main` wraps it with the same
-`LinuxAuthenticator` as `/api/bmc`. Basic is what a scraper can send, and the
-daemon validates it against the shadow hash on every request:
+`GET /metrics` answers in the Prometheus text exposition format, and since
+v2.6.0 it is **not** behind the `LinuxAuthenticator` that guards `/api/bmc`.
+It takes a separate token instead.
+
+This is worth stating plainly because the obvious design is wrong here.
+`LinuxAuthenticator` parses `/etc/shadow`, verifies a hash, and stops; there
+is no role, no permission and no per-route check anywhere in the module. So
+**every account with a valid shadow entry can power four compute modules off
+and flash the firmware.** While `/metrics` shared that authenticator, the
+only credential that could scrape the board was one that could also destroy
+it -- and a scrape config is a bad place to keep such a thing. Adding a
+second Unix account would not have helped: it would have created a second
+credential with the same authority.
+
+The token lives at `/mnt/overlay/metrics-token`, mode 0600, on the overlay
+because both firmware images mount it -- a scrape must not break because the
+board took an A/B update. It is created on **first read**, so a board nobody
+scrapes never carries a credential, and it is rotated from the web
+interface or through `opt=set&type=metrics_token`. The Basic username is
+`metrics`, which is deliberately not a Unix account: nothing resolves it
+against `/etc/passwd`.
+
+Measured on the board when firmware v2.5.0 was flashed:
+
+| request | answer |
+| -- | -- |
+| `metrics` + token -> `/metrics` | **200** |
+| `metrics` + token -> `/api/bmc` | **401** |
+| `root` + root's password -> `/metrics` | **401** |
+| `metrics` + a wrong token -> `/metrics` | **401** |
+| `root` + the token -> `/metrics` | **401** |
+
+The second row is the one that matters: if it ever answers 200, the token is
+merely a second root credential and the whole arrangement is pointless.
 
 ```yaml
 scrape_configs:
@@ -251,8 +242,8 @@ scrape_configs:
     static_configs:
       - targets: ['<board>:443']
     basic_auth:
-      username: root
-      password_file: /etc/prometheus/bmc-password
+      username: metrics
+      password_file: /etc/prometheus/bmc-metrics-token
     tls_config:
       # the daemon serves its own certificate; pin it with ca_file instead if
       # you have one
@@ -261,9 +252,7 @@ scrape_configs:
 
 Scrape the HTTPS port directly. Port 80 is the redirect server, and while a
 scraper that follows redirects will land on the right place, it lands there
-with an extra round trip per scrape. The loopback exemption applies here as it
-does everywhere else: something running on the board itself needs no
-credentials.
+with an extra round trip per scrape.
 
 Absence is a missing metric, not a zero. A board with no thermal zone has no
 `bmcd_temperature_celsius` at all -- not a `# TYPE` line with nothing under it,
