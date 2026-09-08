@@ -241,6 +241,11 @@ async fn get_about() -> impl Into<LegacyResponse> {
     }
 
     let hostname = read_hostname().await.unwrap_or_default();
+    // A board that cannot read this still has an About page worth rendering,
+    // so an unreadable kernel is "unknown" rather than a failed request.
+    let kernel = read_kernel_release()
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
     let (board_model, board_revision, board_serial) = read_board_info().await.unwrap_or_default();
 
     json!(
@@ -257,6 +262,9 @@ async fn get_about() -> impl Into<LegacyResponse> {
             "build_version": bmcd_version,
             "buildtime": build_time,
             "buildroot": buildroot,
+            // The one field an operator wants after a kernel bump, and the
+            // only way to answer it before this was `uname -r` over SSH.
+            "kernel": kernel,
         }
     )
 }
@@ -409,6 +417,22 @@ fn buildroot_release(os_release: &HashMap<String, String>) -> Option<String> {
         .get("BUILDROOT_VERSION")
         .or_else(|| os_release.get("PRETTY_NAME"))
         .map(|release| release.trim_matches('"').to_string())
+}
+
+/// The kernel release, as `uname -r` reports it -- `6.12.109`.
+///
+/// `/proc/sys/kernel/osrelease` is the sibling of the hostname file read
+/// below and holds exactly the release, so there is nothing to parse. The
+/// alternative, `/proc/version`, wraps the same string in a banner carrying
+/// the build host and a build timestamp; an About page needs neither, and
+/// `/info` has already been one unauthenticated surface too many.
+async fn read_kernel_release() -> io::Result<String> {
+    let release = tokio::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .await?
+        .trim_end_matches(['\0', '\n'])
+        .to_string();
+
+    Ok(release)
 }
 
 async fn read_hostname() -> io::Result<String> {
