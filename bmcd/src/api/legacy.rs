@@ -213,6 +213,7 @@ async fn api_entry(
         ("firmware_sources", false) => get_firmware_sources().await.into(),
         ("firmware_sources", true) => set_firmware_sources(query).await,
         ("firmware_available", false) => get_firmware_available(query).await.into(),
+        ("firmware_install", true) => install_firmware(query).await,
         ("metrics_token", true) => rotate_metrics_token().await,
         _ => (
             StatusCode::BAD_REQUEST,
@@ -284,6 +285,97 @@ async fn set_firmware_sources(query: Query) -> LegacyResponse {
 async fn get_firmware_available(query: Query) -> impl Into<LegacyResponse> {
     let force = query.contains_key("refresh");
     json!(firmware_catalog::get(force).await)
+}
+
+/// Stages a chosen version from a configured source.
+///
+/// Delegates to `tpi-selfupdate`, which downloads, verifies against the
+/// publisher's `SHA256SUMS` where one exists, checks the image fits the UBI
+/// slot, and arms `nextboot`. Reimplementing that here would give the
+/// interface a second install path free to disagree with the command line --
+/// and the command line is what a person falls back to when the interface is
+/// the thing that broke.
+///
+/// Local candidates do NOT come through here: those are a file that already
+/// exists, and the existing transfer endpoint installs them without a
+/// download.
+async fn install_firmware(query: Query) -> LegacyResponse {
+    let Some(source_id) = query.get("source") else {
+        return LegacyResponse::bad_request("Missing `source` parameter");
+    };
+    let Some(version) = query.get("version") else {
+        return LegacyResponse::bad_request("Missing `version` parameter");
+    };
+
+    let sources = firmware_sources::load().await;
+    let Some(source) = sources.sources.iter().find(|s| &s.id == source_id) else {
+        return LegacyResponse::bad_request(format!("no source called {source_id:?}"));
+    };
+
+    // The same refusal the transfer endpoint makes, for the same reason:
+    // osupdate writes into the volume nextboot points at.
+    if !query.contains_key("force") {
+        let slots = get_firmware_slots(firmware_version().await).await;
+        if slots.update_staged == Some(true) {
+            return LegacyResponse::Error(
+                StatusCode::CONFLICT,
+                "an update is already staged for the next boot; reboot to take it, \
+                 or pass force=1 to replace it"
+                    .into(),
+            );
+        }
+    }
+
+    let mut args: Vec<String> = vec!["--tag".into(), version.clone()];
+    match source.kind {
+        firmware_sources::SourceKind::Github => {
+            args.push("--repo".into());
+            args.push(source.location.clone());
+        }
+        firmware_sources::SourceKind::Http => {
+            args.push("--url".into());
+            args.push(source.location.clone());
+        }
+        firmware_sources::SourceKind::Local => {
+            return LegacyResponse::bad_request(
+                "a local image is installed through opt=set&type=firmware with local=1",
+            );
+        }
+    }
+    // Installing a version that is not newer is a deliberate act the caller
+    // has already been warned about; the updater refuses it otherwise.
+    if query.contains_key("allow_downgrade") {
+        args.push("--allow-downgrade".into());
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("/sbin/tpi-selfupdate")
+            .args(&args)
+            .output()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => LegacyResponse::ok(json!({
+            "staged": version,
+            "source": source_id,
+        })),
+        Ok(Ok(output)) => {
+            // The updater logs to stderr; its last line is the reason it
+            // stopped, and is far more useful than an exit code.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().last().unwrap_or("no output").trim().to_string();
+            LegacyResponse::Error(StatusCode::BAD_REQUEST, detail.into())
+        }
+        Ok(Err(e)) => LegacyResponse::Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot run the updater: {e}").into(),
+        ),
+        Err(e) => LegacyResponse::Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("install task failed: {e}").into(),
+        ),
+    }
 }
 
 /// Whether a newer firmware release exists on either channel.
