@@ -20,8 +20,8 @@ use crate::app::bmc_info::{
     get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
 };
 use crate::app::firmware_info::get_firmware_slots;
-use crate::app::metrics_token;
 use crate::app::health_info::get_health;
+use crate::app::metrics_token;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;

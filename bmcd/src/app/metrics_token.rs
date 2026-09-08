@@ -98,10 +98,7 @@ fn parse(body: &str) -> Option<MetricsToken> {
 }
 
 fn render(token: &MetricsToken) -> String {
-    format!(
-        "TOKEN={}\nCREATED_AT={}\n",
-        token.token, token.created_at
-    )
+    format!("TOKEN={}\nCREATED_AT={}\n", token.token, token.created_at)
 }
 
 /// Reads the stored token, if there is one.
