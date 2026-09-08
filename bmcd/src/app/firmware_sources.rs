@@ -74,10 +74,23 @@ pub struct Sources {
 
 /// What a board carries when nobody has configured anything.
 ///
-/// This fork's own releases, and the SD card. Upstream is deliberately NOT
-/// here: it publishes no checksums and stops at v2.0.5, so following it would
-/// walk a board backwards onto unverifiable images. It is one `add` away for
-/// anyone who wants it, which is the right amount of friction.
+/// This fork's releases, the SD card, and BOTH of Turing Pi's own channels.
+///
+/// Upstream was omitted from an earlier draft on the grounds that it stops at
+/// v2.0.5 and its HTTP server publishes no checksums, so following it would
+/// walk a board backwards onto unverifiable images. Including it is the better
+/// call, and the reason is worth stating: those risks are handled where they
+/// belong rather than by pretending the sources do not exist. An older release
+/// is reported as `older` and hidden until asked for; an image with no
+/// published checksum is labelled `tls` rather than `verified`; and installing
+/// either takes a confirmation that says which it is. Omission would have
+/// hidden the option without removing the hazard, and left an operator who
+/// wanted a stock image to type the location from memory.
+///
+/// Both of Turing Pi's channels are listed because THEY DISAGREE: as of
+/// 2026-09-08 the GitHub releases reach v2.1.0 while firmware.turingpi.com
+/// stops at v2.0.5. A source is a claim about what exists, and one publisher
+/// can make two different ones.
 impl Default for Sources {
     fn default() -> Self {
         Self {
@@ -94,6 +107,20 @@ impl Default for Sources {
                     kind: SourceKind::Local,
                     label: "SD card".to_string(),
                     location: "/mnt/sdcard/firmware".to_string(),
+                    enabled: true,
+                },
+                Source {
+                    id: "turingpi".to_string(),
+                    kind: SourceKind::Github,
+                    label: "Turing Pi (official releases)".to_string(),
+                    location: "turing-machines/BMC-Firmware".to_string(),
+                    enabled: true,
+                },
+                Source {
+                    id: "turingpi-http".to_string(),
+                    kind: SourceKind::Http,
+                    label: "Turing Pi (firmware.turingpi.com)".to_string(),
+                    location: "https://firmware.turingpi.com/turing-pi2".to_string(),
                     enabled: true,
                 },
             ],
@@ -206,15 +233,36 @@ mod tests {
         assert!(validate(&Sources::default()).is_ok());
     }
 
+    /// Upstream ships by two routes that disagree with each other, and both
+    /// are offered. This asserts the default set rather than a count, because
+    /// the interesting property is WHICH sources are there.
     #[test]
-    fn upstream_is_not_configured_by_default() {
-        // It publishes no checksums and stops at v2.0.5; adding it must be a
-        // decision somebody made.
+    fn both_of_turing_pis_channels_are_offered() {
         let d = Sources::default();
-        assert!(!d
+        assert!(d
             .sources
             .iter()
-            .any(|s| s.location.contains("turing-machines")));
+            .any(|s| s.location == "turing-machines/BMC-Firmware"));
+        assert!(d
+            .sources
+            .iter()
+            .any(|s| s.location == "https://firmware.turingpi.com/turing-pi2"));
+    }
+
+    /// The HTTP source must be the DIRECTORY of version folders. Pointing it
+    /// at an image lists nothing, and nothing looks exactly like a source with
+    /// no new versions -- so the default must not itself be the mistake the
+    /// validator exists to catch.
+    #[test]
+    fn the_shipped_http_source_is_a_directory_not_an_image() {
+        let d = Sources::default();
+        let http = d
+            .sources
+            .iter()
+            .find(|s| matches!(s.kind, SourceKind::Http))
+            .expect("an http source ships by default");
+        assert!(!http.location.ends_with(".tpu"));
+        assert!(validate(&d).is_ok());
     }
 
     #[test]
