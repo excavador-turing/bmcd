@@ -804,6 +804,7 @@ mod tests {
                 update_staged: Some(false),
                 nextboot: None,
                 last_promotion: None,
+            staged: None,
             },
         }
     }
@@ -861,6 +862,7 @@ mod tests {
                 update_staged: None,
                 nextboot: None,
                 last_promotion: None,
+            staged: None,
             },
         }
     }

@@ -371,7 +371,7 @@ async fn read_promotion(path: &Path) -> Option<Promotion> {
 /// removes it. Unknown keys are ignored rather than rejected: a future
 /// stager may record more than this daemon reads, and that is not an error.
 async fn read_staged(path: &Path) -> Option<StagedImage> {
-    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let file = tokio::fs::File::open(path).await.ok()?;
     let mut buffer = Vec::with_capacity(STAGED_MARKER_MAX as usize);
     file.take(STAGED_MARKER_MAX)
         .read_to_end(&mut buffer)

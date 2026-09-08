@@ -868,7 +868,7 @@ mod test {
         assert_eq!(trim_eeprom_field("\u{fffd}".repeat(16)), None);
     }
 
-    use crate::app::firmware_info::{FirmwareSlots, Promotion, Slot};
+    use crate::app::firmware_info::{FirmwareSlots, Promotion, Slot, StagedImage};
 
     /// The exact bytes `opt=get&type=firmware_slots` puts on the wire for the
     /// board as it reads today: `rootfs` running out of volume 1 with an
@@ -902,6 +902,13 @@ mod test {
                 timestamp: "Mon Sep  7 19:30:22 UTC 2026".to_string(),
                 message: "switch ports present: node1 node2 node3 node4".to_string(),
             }),
+            staged: Some(StagedImage {
+                version: Some("v2.4.0".to_string()),
+                sha256: Some("00707f1f".to_string()),
+                staged_at: Some("2026-09-08T03:03:30Z".to_string()),
+                source: Some("tpi-selfupdate".to_string()),
+                file: None,
+            }),
         };
 
         let response = HttpResponse::from(LegacyResponse::from(json!(slots)));
@@ -919,6 +926,8 @@ mod test {
                 r#""nextboot":null,"present":true,"#,
                 r#""rollback":{"size_bytes":37011456,"version":null,"volume":"rootfs_prev","volume_id":3},"#,
                 r#""running":{"size_bytes":37019648,"version":"v2.2.0-unstable-hive.5","volume":"rootfs","volume_id":1},"#,
+                r#""staged":{"file":null,"sha256":"00707f1f","source":"tpi-selfupdate","#,
+                r#""staged_at":"2026-09-08T03:03:30Z","version":"v2.4.0"},"#,
                 r#""update_staged":false"#,
                 r#"}}]}"#,
             )
@@ -939,6 +948,7 @@ mod test {
             update_staged: None,
             nextboot: None,
             last_promotion: None,
+            staged: None,
         };
 
         let response = HttpResponse::from(LegacyResponse::from(json!(slots)));
@@ -951,7 +961,8 @@ mod test {
             std::str::from_utf8(&body).expect("utf8"),
             concat!(
                 r#"{"response":[{"result":{"last_promotion":null,"nextboot":null,"#,
-                r#""present":false,"rollback":null,"running":null,"update_staged":null}}]}"#,
+                r#""present":false,"rollback":null,"running":null,"staged":null,"#,
+                r#""update_staged":null}}]}"#,
             )
         );
     }
