@@ -53,6 +53,20 @@ const PROMOTION_LOG: &str = "/mnt/overlay/postupdate.log";
 const PROMOTION_LOG_TAIL: u64 = 8192;
 /// The marker the promotion script puts between its timestamp and its verdict.
 const PROMOTION_MARKER: &str = "postupdate:";
+/// Where whatever staged an image records WHICH image it staged.
+///
+/// The staged image lands in a static UBI volume that is never mounted, so
+/// its `/etc/os-release` cannot be read from a running system -- the same
+/// reason the rollback slot reports no version. It does not have to be read:
+/// the thing doing the staging knows the tag, and writes it here. The
+/// overlay is the right home because BOTH images mount it, so the note
+/// survives the reboot it describes; `postupdate.log` is next to it for the
+/// same reason. The promotion script removes this file once it has decided.
+const STAGED_MARKER: &str = "/mnt/overlay/staged-firmware";
+/// A staged marker is a handful of short lines. Bound the read anyway: this
+/// file is written by a shell script on a 116 MB board, and a truncated or
+/// runaway write must not be slurped into memory.
+const STAGED_MARKER_MAX: u64 = 4096;
 
 /// One firmware slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,6 +98,25 @@ pub struct Promotion {
     pub message: String,
 }
 
+/// What is waiting in the staging volume, according to whatever put it there.
+///
+/// Every field is optional because this file is written by something else --
+/// `tpi-selfupdate`, or the daemon's own upgrade worker -- and a marker from
+/// an older writer should degrade to "less is known", never to no answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StagedImage {
+    /// The release tag, as the stager spelled it: `v2.4.0`.
+    pub version: Option<String>,
+    /// The checksum the stager verified before writing the volume, so a
+    /// caller can tell two builds of one tag apart.
+    pub sha256: Option<String>,
+    /// When it was staged, in the board's own idea of the time.
+    pub staged_at: Option<String>,
+    /// What staged it -- `tpi-selfupdate`, `upload`. Useful when a board has
+    /// a staged image nobody remembers arming.
+    pub source: Option<String>,
+}
+
 /// The A/B slot state of the board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FirmwareSlots {
@@ -107,6 +140,11 @@ pub struct FirmwareSlots {
     pub nextboot: Option<String>,
     /// The last line the promotion script wrote, when there is a log.
     pub last_promotion: Option<Promotion>,
+    /// Which image is staged, when whatever staged it left a note. `None`
+    /// means no note was found -- on a board where `update_staged` is true
+    /// that means the image was staged by something that does not write one,
+    /// not that nothing is staged.
+    pub staged: Option<StagedImage>,
 }
 
 /// One UBI volume, before it is decided what part it plays.
@@ -150,6 +188,7 @@ pub async fn get_firmware_slots(running_version: Option<String>) -> FirmwareSlot
         update_staged,
         nextboot,
         last_promotion: read_promotion(Path::new(PROMOTION_LOG)).await,
+        staged: read_staged(Path::new(STAGED_MARKER)).await,
     }
 }
 
@@ -322,6 +361,48 @@ async fn read_promotion(path: &Path) -> Option<Promotion> {
         .find_map(parse_promotion)
 }
 
+/// Reads the staged-image note, when one is there.
+///
+/// `KEY=VALUE` lines, because a shell script writes it and a shell script
+/// removes it. Unknown keys are ignored rather than rejected: a future
+/// stager may record more than this daemon reads, and that is not an error.
+async fn read_staged(path: &Path) -> Option<StagedImage> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut buffer = Vec::with_capacity(STAGED_MARKER_MAX as usize);
+    file.take(STAGED_MARKER_MAX)
+        .read_to_end(&mut buffer)
+        .await
+        .ok()?;
+
+    let staged = parse_staged(&String::from_utf8_lossy(&buffer));
+    // An empty or unparseable file is not a staged image. Reporting one with
+    // every field null would say "something is staged but nothing is known
+    // about it", which is a different claim and a wrong one.
+    (staged != StagedImage::default()).then_some(staged)
+}
+
+/// Parses the `KEY=VALUE` body of a staged-image note.
+fn parse_staged(body: &str) -> StagedImage {
+    let mut staged = StagedImage::default();
+    for line in body.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "VERSION" => staged.version = Some(value),
+            "SHA256" => staged.sha256 = Some(value),
+            "STAGED_AT" => staged.staged_at = Some(value),
+            "SOURCE" => staged.source = Some(value),
+            _ => {}
+        }
+    }
+    staged
+}
+
 /// Splits one log line into the date the script printed and what it said.
 /// A line without the marker is not one of its lines and is skipped.
 fn parse_promotion(line: &str) -> Option<Promotion> {
@@ -386,6 +467,34 @@ mod tests {
             .await
             .expect("ubi device");
         pick_slots(&volumes, Some("v2.2.0-unstable-hive.5".to_string()))
+    }
+
+    #[test]
+    fn a_staged_note_is_read_key_by_key() {
+        let staged = parse_staged(
+            "VERSION=v2.4.0\nSHA256=00707f1f\nSTAGED_AT=2026-09-08T03:03:30Z\nSOURCE=tpi-selfupdate\n",
+        );
+        assert_eq!(staged.version.as_deref(), Some("v2.4.0"));
+        assert_eq!(staged.sha256.as_deref(), Some("00707f1f"));
+        assert_eq!(staged.staged_at.as_deref(), Some("2026-09-08T03:03:30Z"));
+        assert_eq!(staged.source.as_deref(), Some("tpi-selfupdate"));
+    }
+
+    /// A future stager may record more than this daemon reads, and a shell
+    /// script may quote what it writes. Neither is an error.
+    #[test]
+    fn unknown_keys_and_quotes_do_not_derail_the_parse() {
+        let staged = parse_staged("VERSION=\"v2.4.0\"\nSIZE_BYTES=36974592\njunk\n\n");
+        assert_eq!(staged.version.as_deref(), Some("v2.4.0"));
+        assert_eq!(staged.sha256, None);
+    }
+
+    /// An empty or blank marker must not be reported as "something is staged
+    /// but nothing is known about it" -- that is a different claim.
+    #[test]
+    fn an_empty_note_carries_nothing() {
+        assert_eq!(parse_staged(""), StagedImage::default());
+        assert_eq!(parse_staged("VERSION=\n"), StagedImage::default());
     }
 
     #[tokio::test]
