@@ -168,10 +168,7 @@ pub fn validate(sources: &Sources) -> Result<(), String> {
             // indistinguishable from a source with no new versions.
             SourceKind::Http => {
                 if !source.location.starts_with("http") {
-                    return Err(format!(
-                        "source {:?} should be an http(s) URL",
-                        source.id
-                    ));
+                    return Err(format!("source {:?} should be an http(s) URL", source.id));
                 }
                 if source.location.ends_with(".tpu") {
                     return Err(format!(
@@ -182,10 +179,7 @@ pub fn validate(sources: &Sources) -> Result<(), String> {
             }
             SourceKind::Local => {
                 if !source.location.starts_with('/') {
-                    return Err(format!(
-                        "source {:?} should be an absolute path",
-                        source.id
-                    ));
+                    return Err(format!("source {:?} should be an absolute path", source.id));
                 }
             }
         }

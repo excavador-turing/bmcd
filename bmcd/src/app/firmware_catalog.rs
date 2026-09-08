@@ -185,7 +185,8 @@ fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> 
     }
 
     let mut candidates = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", source.location))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", source.location))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("tpu") {
@@ -219,7 +220,10 @@ fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> 
     Ok(candidates)
 }
 
-fn resolve(source: &Source, running_hint: &str) -> (Vec<Candidate>, Option<String>, Option<String>) {
+fn resolve(
+    source: &Source,
+    running_hint: &str,
+) -> (Vec<Candidate>, Option<String>, Option<String>) {
     match source.kind {
         SourceKind::Local => match list_local(source, running_hint) {
             Ok(c) => (c, None, None),
@@ -288,11 +292,7 @@ pub async fn get(force: bool) -> Catalog {
         .await
         .unwrap_or_else(|| "unknown".to_string());
 
-    let enabled: Vec<Source> = sources
-        .sources
-        .into_iter()
-        .filter(|s| s.enabled)
-        .collect();
+    let enabled: Vec<Source> = sources.sources.into_iter().filter(|s| s.enabled).collect();
 
     let hint = running_hint.clone();
     let resolved = tokio::task::spawn_blocking(move || {
@@ -367,7 +367,10 @@ mod tests {
         let l: Listing = serde_json::from_str(line).expect("parses");
         assert_eq!(l.running, "v2.6.0");
         assert_eq!(l.releases.len(), 1);
-        assert_eq!(relation_from(l.releases[0].relation.as_deref()), Relation::Current);
+        assert_eq!(
+            relation_from(l.releases[0].relation.as_deref()),
+            Relation::Current
+        );
     }
 
     /// The shape the HTTP listing emits has a `url` key rather than `repo`,
@@ -376,6 +379,9 @@ mod tests {
     fn the_http_listing_shape_parses_too() {
         let line = r#"{"url":"https://x/y","running":"v2.6.0","releases":[{"tag":"v2.0.5","prerelease":false,"newer":false,"current":false,"relation":"older"}]}"#;
         let l: Listing = serde_json::from_str(line).expect("parses");
-        assert_eq!(relation_from(l.releases[0].relation.as_deref()), Relation::Older);
+        assert_eq!(
+            relation_from(l.releases[0].relation.as_deref()),
+            Relation::Older
+        );
     }
 }
