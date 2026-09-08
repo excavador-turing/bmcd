@@ -22,11 +22,11 @@ use crate::app::bmc_info::{
 use crate::app::firmware_info::get_firmware_slots;
 use crate::app::health_info::get_health;
 use crate::app::metrics_token;
-use crate::app::update_check;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
 use crate::app::transfer_action::UpgradeCommand;
+use crate::app::update_check;
 use crate::hal::{NodeId, UsbMode, UsbRoute};
 use crate::serial_service::serial::SerialConnections;
 use crate::serial_service::{legacy_serial_get_handler, legacy_serial_set_handler};
