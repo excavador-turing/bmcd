@@ -115,6 +115,10 @@ pub struct StagedImage {
     /// What staged it -- `tpi-selfupdate`, `upload`. Useful when a board has
     /// a staged image nobody remembers arming.
     pub source: Option<String>,
+    /// The file it came from, when the stager knew a name but not a tag --
+    /// an uploaded image whose filename does not follow the release naming
+    /// has a file and no version, and saying so beats inventing a version.
+    pub file: Option<String>,
 }
 
 /// The A/B slot state of the board.
@@ -397,6 +401,7 @@ fn parse_staged(body: &str) -> StagedImage {
             "SHA256" => staged.sha256 = Some(value),
             "STAGED_AT" => staged.staged_at = Some(value),
             "SOURCE" => staged.source = Some(value),
+            "FILE" => staged.file = Some(value),
             _ => {}
         }
     }

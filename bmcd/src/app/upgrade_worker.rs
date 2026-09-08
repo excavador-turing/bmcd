@@ -211,8 +211,59 @@ impl UpgradeWorker {
             bail!("failed firmware upgrade ({})", success);
         }
 
+        // Record WHICH image is now staged, so the web interface can name the
+        // pending version instead of only reporting that something is pending.
+        // `tpi-selfupdate` writes the same note for the path it owns; this is
+        // the upload path. Written only after `osupdate` succeeded, so a note
+        // never claims an image that was not staged, and never fatal -- the
+        // upgrade has happened by this point and failing it here would report
+        // a false failure for a board that is correctly armed.
+        if let Err(e) = write_staged_note(&file_name.to_string_lossy()).await {
+            tracing::warn!("could not record the staged version: {e}");
+        }
+
         Ok(())
     }
+}
+
+/// Where the staged version is recorded for the API to report. Owned by
+/// `S99postupdate`, which removes it once it has promoted or rejected the
+/// image; both firmware images mount `/mnt/overlay`, so the note survives the
+/// reboot it describes.
+const STAGED_NOTE: &str = "/mnt/overlay/staged-firmware";
+
+/// The release filename shape this fork publishes, used to recover a tag from
+/// an uploaded file.
+const OTA_PREFIX: &str = "tp2-bmc-firmware-ota-";
+const OTA_SUFFIX: &str = ".tpu";
+
+/// Recovers the release tag from a published OTA filename, when the name
+/// follows the shape this fork publishes: `tp2-bmc-firmware-ota-v2.3.0.tpu`.
+///
+/// Returns `None` for anything else rather than guessing. A hand-built or
+/// renamed image genuinely has no tag to report, and a wrong version on the
+/// firmware page is worse than an absent one.
+fn tag_from_ota_name(file_name: &str) -> Option<&str> {
+    let tag = file_name
+        .strip_prefix(OTA_PREFIX)?
+        .strip_suffix(OTA_SUFFIX)?;
+    (!tag.is_empty()).then_some(tag)
+}
+
+/// Writes the staged-image note. `KEY=VALUE`, the same shape the firmware's
+/// `tpi-selfupdate` writes and `firmware_info` reads.
+async fn write_staged_note(file_name: &str) -> std::io::Result<()> {
+    let mut note = String::new();
+    if let Some(tag) = tag_from_ota_name(file_name) {
+        note.push_str(&format!("VERSION={tag}\n"));
+    }
+    note.push_str(&format!("FILE={file_name}\n"));
+    note.push_str(&format!(
+        "STAGED_AT={}\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+    ));
+    note.push_str("SOURCE=upload\n");
+    tokio::fs::write(STAGED_NOTE, note).await
 }
 
 /// Selects the directory to stage a firmware image in. Returns the first entry
@@ -376,5 +427,32 @@ mod test {
         assert_eq!(expected_crc, write_watcher.crc());
         assert_eq!(&buffer, buf_writer.get_ref());
         assert_eq!(*receiver.borrow_and_update(), buffer.len() as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_published_ota_name_yields_its_tag() {
+        assert_eq!(
+            tag_from_ota_name("tp2-bmc-firmware-ota-v2.3.0.tpu"),
+            Some("v2.3.0")
+        );
+        assert_eq!(
+            tag_from_ota_name("tp2-bmc-firmware-ota-v2.2.0-unstable-hive.12.tpu"),
+            Some("v2.2.0-unstable-hive.12")
+        );
+    }
+
+    /// A hand-built or renamed image has no tag to report, and inventing one
+    /// would put a wrong version on the firmware page -- worse than none.
+    #[test]
+    fn anything_else_yields_no_tag() {
+        assert_eq!(tag_from_ota_name("firmware.tpu"), None);
+        assert_eq!(tag_from_ota_name("tp2-bmc-firmware-ota-v2.3.0.img"), None);
+        assert_eq!(tag_from_ota_name("tp2-bmc-firmware-ota-.tpu"), None);
+        assert_eq!(tag_from_ota_name(""), None);
     }
 }
