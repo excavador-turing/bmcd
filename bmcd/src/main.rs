@@ -144,6 +144,11 @@ async fn main() -> anyhow::Result<()> {
     // request carries no `Host` header. Nothing in bmcd reads either; the peer
     // address the authenticator makes its loopback decision on comes from the
     // socket, not from here.
+    // Cloned before the server factory takes ownership of them.
+    let metrics_bmc = bmc.clone();
+    let metrics_host = config.host.clone();
+    let metrics_port = config.metrics_port;
+
     let run_server = Server::build()
         .workers(2)
         .bind("bmcd", (config.host.clone(), config.port), move || {
@@ -163,23 +168,6 @@ async fn main() -> anyhow::Result<()> {
                         // same app data, same dispatcher.
                         .configure(paths::config),
                 )
-                // Prometheus scrape endpoint. Wrapped in the same authenticator
-                // as `/api/bmc`, deliberately: it reports the board's firmware
-                // versions, its NAND wear and its per-port traffic counters, and
-                // an unauthenticated second surface next to `/info` is a finding
-                // waiting to be filed. The authenticator accepts HTTP Basic,
-                // which is what a scrape config can send.
-                // NOT wrapped in `authentication`. That authenticator checks
-                // /etc/shadow, and there is no per-route authorization behind
-                // it, so every credential it accepts can also power a node
-                // off and flash firmware -- which is not what belongs in a
-                // scrape config. This scope authenticates with its own token
-                // instead; see `app::metrics_token` and `api::metrics`.
-                .service(
-                    web::scope("/metrics")
-                        .app_data(bmc.clone())
-                        .configure(metrics::config),
-                )
                 // Serve a static tree of files of the web UI. Must be the last item.
                 .service(Files::new("/", &config.www).index_file("index.html"))
                 .default_service(web::to(move || {
@@ -195,7 +183,33 @@ async fn main() -> anyhow::Result<()> {
         })?
         .run();
 
-    let mut futures = vec![run_server];
+    // `/metrics` on its own listener: plain HTTP, no credential.
+    //
+    // It used to be a scope on this same TLS port behind a bespoke token. The
+    // token existed for exactly one reason -- so that a credential in a scrape
+    // config could not also reach `/api/bmc` and power a node off -- and on a
+    // listener that serves nothing but `/metrics` there is nothing else to
+    // reach. The property is kept; the mechanism is a port instead of a
+    // secret, which is one fewer thing to mint, store, rotate and leak.
+    //
+    // Plain HTTP because the TLS it sat behind was scraped with verification
+    // skipped: the board's certificate is expired and carries no SAN, so
+    // nothing could verify it. Unverified TLS is a handshake per scrape on a
+    // Cortex-A7 in exchange for nothing, and saying "plain, on a management
+    // network" is more honest than implying a protection that was not there.
+    //
+    // What protects it is the network. This binds the same `host` as the API,
+    // so binding the daemon to a management address later covers both.
+    let metrics_server = HttpServer::new(move || {
+        App::new()
+            .app_data(metrics_bmc.clone())
+            .service(web::scope("/metrics").configure(metrics::config))
+    })
+    .workers(1)
+    .bind((metrics_host, metrics_port))?
+    .run();
+
+    let mut futures = vec![run_server, metrics_server];
     if config.redirect_http {
         // redirect requests to 'HTTPS'
         futures.push(

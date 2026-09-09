@@ -15,8 +15,7 @@
 //! Everything a person has configured, as one document.
 //!
 //! Board B is a named milestone, and the first thing anyone will want is "make
-//! it like board A". Today that is five settings re-entered by hand plus a
-//! metrics token re-pasted into a scrape config.
+//! it like board A". Today that is five settings re-entered by hand.
 //!
 //! ## An allow-list, never "everything on the overlay"
 //!
@@ -24,11 +23,13 @@
 //! of tools that were removed. Copying the overlay wholesale would clone that
 //! junk to a board that never had those tools. Every field below is named.
 //!
-//! ## The token is what makes an export sensitive
+//! ## Nothing here is a credential
 //!
-//! The metrics token is a credential. An export carrying it can scrape any
-//! board it is applied to, so it is included only when asked for and the
-//! document says on its face which kind it is.
+//! It used to carry the metrics token, which made an export a secret and gave
+//! the document a `secrets` tier and a `contains_secrets` flag. `/metrics`
+//! needs no credential any more, so there is no secret left to carry and the
+//! whole tier is gone. An export from an older board still imports; the
+//! `secrets` it carries are simply ignored.
 //!
 //! ## The node store is read through its own API
 //!
@@ -64,10 +65,6 @@ pub struct ConfigExport {
     /// found on a workstation six months later identifiable.
     pub exported_at: String,
     pub exported_from: ExportOrigin,
-    /// True when `secrets` is present. On its face, because the difference
-    /// decides how the file must be handled.
-    pub contains_secrets: bool,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,8 +73,6 @@ pub struct ConfigExport {
     pub firmware_sources: Option<crate::app::firmware_sources::Sources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<NodeSettings>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secrets: Option<Secrets>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,15 +83,6 @@ pub struct ExportOrigin {
     pub board_serial: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firmware: Option<String>,
-}
-
-/// The credential tier. Separate from the settings above so that "export
-/// without secrets" is a different shape and not a field someone has to
-/// remember to strip.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Secrets {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics_token: Option<String>,
 }
 
 /// What can be applied, and what could not.
@@ -113,7 +99,7 @@ pub struct ImportReport {
 /// hostname; a daemon that cannot read one setting should still hand over the
 /// other four, because the alternative is an operator with nothing at all in
 /// front of a board B.
-pub async fn export(bmc: &BmcApplication, with_secrets: bool) -> ConfigExport {
+pub async fn export(bmc: &BmcApplication) -> ConfigExport {
     let hostname = crate::app::hostname::current().await;
     let ntp = crate::app::ntp::load().await;
     let sources = crate::app::firmware_sources::load().await;
@@ -137,14 +123,6 @@ pub async fn export(bmc: &BmcApplication, with_secrets: bool) -> ConfigExport {
         }
     };
 
-    let secrets = if with_secrets {
-        Some(Secrets {
-            metrics_token: crate::app::metrics_token::peek().await,
-        })
-    } else {
-        None
-    };
-
     ConfigExport {
         format_version: FORMAT_VERSION,
         exported_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -156,7 +134,6 @@ pub async fn export(bmc: &BmcApplication, with_secrets: bool) -> ConfigExport {
                 .and_then(|(_, _, serial)| serial),
             firmware: crate::api::legacy::firmware_version().await,
         },
-        contains_secrets: secrets.is_some(),
         hostname,
         // An empty list is the shipped default, and exporting it as "no NTP
         // configuration" is right: an import should then leave the target's
@@ -164,7 +141,6 @@ pub async fn export(bmc: &BmcApplication, with_secrets: bool) -> ConfigExport {
         ntp_servers: (!ntp.servers.is_empty()).then_some(ntp.servers),
         firmware_sources: Some(sources),
         nodes,
-        secrets,
     }
 }
 
@@ -262,20 +238,6 @@ pub async fn import(bmc: &BmcApplication, document: &ConfigExport) -> Result<Imp
         report.skipped.push("node names: not in the export".into());
     }
 
-    match document
-        .secrets
-        .as_ref()
-        .and_then(|s| s.metrics_token.as_ref())
-    {
-        Some(token) => match crate::app::metrics_token::adopt(token).await {
-            Ok(()) => report.applied.push("metrics token".into()),
-            Err(e) => report.failed.push(format!("metrics token: {e}")),
-        },
-        None => report
-            .skipped
-            .push("metrics token: not in the export, so the board keeps its own".into()),
-    }
-
     Ok(report)
 }
 
@@ -293,7 +255,7 @@ fn node_id(id: u8) -> Option<NodeId> {
 mod tests {
     use super::*;
 
-    fn document(secrets: Option<Secrets>) -> ConfigExport {
+    fn document() -> ConfigExport {
         ConfigExport {
             format_version: FORMAT_VERSION,
             exported_at: "2026-09-09T00:00:00Z".into(),
@@ -302,7 +264,6 @@ mod tests {
                 board_serial: Some("XZCT250200139".into()),
                 firmware: Some("v2.8.1".into()),
             },
-            contains_secrets: secrets.is_some(),
             hostname: Some("hive-a-bmc".into()),
             ntp_servers: Some(vec!["192.168.77.1".into()]),
             firmware_sources: None,
@@ -312,35 +273,42 @@ mod tests {
                 module_name: Some("RK1".into()),
                 uart_baud: None,
             }]),
-            secrets,
         }
     }
 
-    /// An export without secrets must not carry the key at all, so a file that
-    /// looks safe cannot turn out to have an empty credential field that a
-    /// later version fills in.
+    /// The document carries no credential at all any more, so a `secrets`
+    /// key must never appear. Asserted on the serialised form rather than the
+    /// type, because the risk is a field a later version adds back silently.
     #[test]
-    fn an_export_without_secrets_has_no_secrets_key() {
-        let json = serde_json::to_string(&document(None)).expect("serialises");
-        // The key, not the substring: `contains_secrets` contains "secrets",
-        // and asserting on that passed for the wrong reason.
-        assert!(!json.contains("\"secrets\""), "{json}");
-        assert!(json.contains("\"contains_secrets\":false"), "{json}");
+    fn an_export_carries_no_secrets_key() {
+        let json = serde_json::to_string(&document()).expect("serialises");
+        assert!(!json.contains("secret"), "{json}");
     }
 
+    /// A file written by a board that still had a metrics token must still
+    /// import. Its `secrets` and `contains_secrets` are unknown fields now,
+    /// and serde ignores unknown fields -- so the settings still apply and
+    /// the credential is simply dropped, which is what should happen to a
+    /// credential nothing takes.
     #[test]
-    fn an_export_with_secrets_says_so_on_its_face() {
-        let json = serde_json::to_string(&document(Some(Secrets {
-            metrics_token: Some("deadbeef".into()),
-        })))
-        .expect("serialises");
-        assert!(json.contains("\"contains_secrets\":true"), "{json}");
-        assert!(json.contains("metrics_token"), "{json}");
+    fn a_document_from_an_older_board_still_parses() {
+        let legacy = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "exported_at": "2026-09-09T00:00:00Z",
+            "exported_from": {"hostname": "hive-a-bmc"},
+            "contains_secrets": true,
+            "hostname": "hive-a-bmc",
+            "secrets": {"metrics_token": "deadbeef"},
+        });
+
+        let parsed: ConfigExport =
+            serde_json::from_value(legacy).expect("an older export still parses");
+        assert_eq!(parsed.hostname.as_deref(), Some("hive-a-bmc"));
     }
 
     #[test]
     fn a_document_round_trips() {
-        let original = document(None);
+        let original = document();
         let json = serde_json::to_string(&original).expect("serialises");
         let parsed: ConfigExport = serde_json::from_str(&json).expect("parses");
         assert_eq!(parsed.hostname.as_deref(), Some("hive-a-bmc"));

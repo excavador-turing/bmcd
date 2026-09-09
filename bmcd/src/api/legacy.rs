@@ -23,7 +23,6 @@ use crate::app::firmware_catalog;
 use crate::app::firmware_info::get_firmware_slots;
 use crate::app::firmware_sources;
 use crate::app::health_info::get_health;
-use crate::app::metrics_token;
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
@@ -292,18 +291,16 @@ async fn dispatch_inner(
         ("cooling", true) => set_cooling_info(bmc, query).await.into(),
         ("thermal", false) => get_thermal_info().await.into(),
         ("about", false) => get_about().await.into(),
-        ("metrics_token", false) => get_metrics_token().await,
         ("update_check", false) => get_update_check().await.into(),
         ("firmware_sources", false) => get_firmware_sources().await.into(),
         ("firmware_sources", true) => set_firmware_sources(query).await,
         ("firmware_available", false) => get_firmware_available(query).await.into(),
         ("firmware_install", true) => install_firmware(query).await,
-        ("metrics_token", true) => rotate_metrics_token().await,
         ("ntp", false) => get_ntp().await.into(),
         ("ntp", true) => set_ntp(query).await,
         ("hostname", false) => get_hostname().await.into(),
         ("hostname", true) => set_hostname(query).await,
-        ("config", false) => get_config(bmc, query).await.into(),
+        ("config", false) => get_config(bmc).await.into(),
         ("config", true) => set_config(bmc, query).await,
         _ => (
             StatusCode::BAD_REQUEST,
@@ -327,13 +324,12 @@ fn reload_self() -> impl Into<LegacyResponse> {
 
 /// Everything a person has configured, as one document.
 ///
-/// `secrets=1` includes the metrics token, and that is what makes an export a
-/// credential: applied to another board it can scrape it. The document says
-/// `contains_secrets` on its face so the difference is visible in the file
-/// rather than remembered from the request that produced it.
-async fn get_config(bmc: &BmcApplication, query: Query) -> impl Into<LegacyResponse> {
-    let with_secrets = query.contains_key("secrets");
-    json!(crate::app::config_export::export(bmc, with_secrets).await)
+/// Nothing in the document is a credential. It used to carry the metrics
+/// token behind `secrets=1`, which made the file a secret and gave it a
+/// `contains_secrets` flag; `/metrics` needs no credential now, so there is
+/// nothing left to gate and the parameter is gone.
+async fn get_config(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
+    json!(crate::app::config_export::export(bmc).await)
 }
 
 /// Applies an exported document.
@@ -596,62 +592,6 @@ async fn install_firmware(query: Query) -> LegacyResponse {
 /// browser left on the firmware page would spend them.
 async fn get_update_check() -> impl Into<LegacyResponse> {
     json!(update_check::get().await)
-}
-
-/// Hands the metrics token to an administrator so a scrape can be configured.
-///
-/// Reachable only through `/api/bmc`, which means only a shadow account can
-/// read it -- and such an account can already power a node off and flash the
-/// firmware, so handing it this secret grants nothing it did not have. The
-/// point of the token is the reverse direction: what the token can do is
-/// read `/metrics` and nothing else.
-///
-/// Generates one on first read rather than at install time, so a board that
-/// is never scraped never carries a credential.
-async fn get_metrics_token() -> LegacyResponse {
-    if !metrics_token::storage_available() {
-        return LegacyResponse::Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no overlay mounted, so a metrics token cannot be stored".into(),
-        );
-    }
-    match metrics_token::ensure().await {
-        Ok(token) => LegacyResponse::ok(json!({
-            "username": metrics_token::TOKEN_USERNAME,
-            "token": token.token,
-            "created_at": token.created_at,
-            "path": metrics_token::TOKEN_PATH,
-        })),
-        Err(e) => LegacyResponse::Error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read or create the metrics token: {e}").into(),
-        ),
-    }
-}
-
-/// Replaces the metrics token. The previous one stops working immediately --
-/// that is what rotation means, and it is why this is a separate credential:
-/// doing it cannot lock anyone out of the web interface, and rotating the
-/// root password cannot break a scrape.
-async fn rotate_metrics_token() -> LegacyResponse {
-    if !metrics_token::storage_available() {
-        return LegacyResponse::Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no overlay mounted, so a metrics token cannot be stored".into(),
-        );
-    }
-    match metrics_token::rotate().await {
-        Ok(token) => LegacyResponse::ok(json!({
-            "username": metrics_token::TOKEN_USERNAME,
-            "token": token.token,
-            "created_at": token.created_at,
-            "rotated": true,
-        })),
-        Err(e) => LegacyResponse::Error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not rotate the metrics token: {e}").into(),
-        ),
-    }
 }
 
 async fn get_about() -> impl Into<LegacyResponse> {

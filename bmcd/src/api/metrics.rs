@@ -38,12 +38,9 @@ use crate::app::bmc_application::BmcApplication;
 use crate::app::cooling_device::CoolingDevice;
 use crate::app::firmware_info::{get_firmware_slots, FirmwareSlots};
 use crate::app::health_info::{get_health, Health};
-use crate::app::metrics_token;
 use crate::app::switch_info::{get_switch_ports, PortKind, SwitchPort};
 use crate::hal::NodeId;
-use actix_web::http::header;
-use actix_web::{web, HttpRequest, HttpResponse, Responder};
-use base64::{engine::general_purpose, Engine as _};
+use actix_web::{web, HttpResponse, Responder};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -93,52 +90,13 @@ pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("").route(web::get().to(handle_metrics)));
 }
 
-async fn handle_metrics(req: HttpRequest, bmc: web::Data<BmcApplication>) -> impl Responder {
-    if !authorized(&req).await {
-        // No WWW-Authenticate: this endpoint is for a scrape config, not a
-        // browser, and the fork already decided not to hand out challenges
-        // that make a browser pop a dialog on a failed login.
-        return HttpResponse::Unauthorized()
-            .content_type("text/plain; charset=utf-8")
-            .body("metrics requires the metrics token\n");
-    }
-
+/// No credential is asked for. This handler is only ever mounted on the
+/// metrics listener, which serves nothing else; see the note in `main`.
+async fn handle_metrics(bmc: web::Data<BmcApplication>) -> impl Responder {
     let snapshot = collect(bmc.as_ref()).await;
     HttpResponse::Ok()
         .content_type(CONTENT_TYPE)
         .body(render(&snapshot))
-}
-
-/// Whether the request carries the metrics token.
-///
-/// This scope is deliberately NOT wrapped in the `LinuxAuthenticator` that
-/// guards `/api/bmc`. That authenticator checks `/etc/shadow` and nothing
-/// else, and there is no per-route authorization behind it -- so any
-/// credential it accepts can also power a node off and flash the firmware.
-/// A scrape config is the wrong place for such a credential, so `/metrics`
-/// takes its own, which is useless anywhere else. See `app::metrics_token`.
-async fn authorized(req: &HttpRequest) -> bool {
-    let Some(value) = req.headers().get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some(encoded) = value.strip_prefix("Basic ") else {
-        return false;
-    };
-    let Ok(decoded) = general_purpose::STANDARD.decode(encoded.trim()) else {
-        return false;
-    };
-    let Ok(text) = String::from_utf8(decoded) else {
-        return false;
-    };
-    // split_once, not split(':').collect(): a password may contain a colon,
-    // and only the FIRST separator is the field boundary.
-    let Some((username, password)) = text.split_once(':') else {
-        return false;
-    };
-    metrics_token::verify(username, password).await
 }
 
 /// Reads everything a scrape reports. Every source here already answers with
@@ -786,78 +744,6 @@ fn optional_u64(value: Option<u64>) -> Vec<Sample> {
     value
         .map(|value| vec![Sample::bare(value as f64)])
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod authorization_tests {
-    use super::*;
-    use actix_web::test::TestRequest;
-
-    fn basic(user: &str, pass: &str) -> String {
-        format!(
-            "Basic {}",
-            general_purpose::STANDARD.encode(format!("{user}:{pass}"))
-        )
-    }
-
-    /// Every one of these must be refused. There is no positive case here on
-    /// purpose: the token path is a compile-time constant pointing at the
-    /// board's overlay, so a passing token cannot be constructed in a unit
-    /// test -- and the cases that matter for safety are the refusals. The
-    /// positive case is covered on hardware, by scraping the board.
-    #[actix_web::test]
-    async fn nothing_without_the_metrics_token_is_authorized() {
-        for (name, req) in [
-            ("no header", TestRequest::default().to_http_request()),
-            (
-                "empty header",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, ""))
-                    .to_http_request(),
-            ),
-            (
-                "bearer instead of basic",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, "Bearer sometoken"))
-                    .to_http_request(),
-            ),
-            (
-                "basic with junk that is not base64",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, "Basic !!!not-base64!!!"))
-                    .to_http_request(),
-            ),
-            (
-                "basic with no colon",
-                TestRequest::default()
-                    .insert_header((
-                        header::AUTHORIZATION,
-                        format!("Basic {}", general_purpose::STANDARD.encode("nocolon")),
-                    ))
-                    .to_http_request(),
-            ),
-            (
-                "root, which guards /api/bmc but must NOT reach /metrics",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, basic("root", "whatever")))
-                    .to_http_request(),
-            ),
-            (
-                "the right username with the wrong secret",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, basic("metrics", "wrong")))
-                    .to_http_request(),
-            ),
-            (
-                "an empty secret, which must not match an absent token",
-                TestRequest::default()
-                    .insert_header((header::AUTHORIZATION, basic("metrics", "")))
-                    .to_http_request(),
-            ),
-        ] {
-            assert!(!authorized(&req).await, "should have been refused: {name}");
-        }
-    }
 }
 
 #[cfg(test)]

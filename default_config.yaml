@@ -7,6 +7,15 @@ www: /srv/bmcd/www/
 # if true, users trying to access the daemon over HTTP, will be redirected to
 # HTTPS.
 redirect_http: true
+# Where /metrics is served: its own listener, plain HTTP, no credential.
+#
+# Not 443, which serves the API and the web interface; not 9100, which means
+# node-exporter to every scrape config and dashboard in this estate. The
+# endpoint carries temperatures, counters and versions -- nothing secret --
+# and what protects it is the network, not a token. It binds the same `host`
+# as the API above, so restricting the daemon to a management address
+# restricts both listeners at once.
+metrics_port: 9110
 store:
   # The bmcd contains a write mechanism that writes its internal key/value store
   # back to the file-system. This happens on a timeout started from the last

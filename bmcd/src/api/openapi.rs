@@ -39,7 +39,6 @@ fn known_params(alias: &Alias) -> &'static [(&'static str, &'static str)] {
             "refresh",
             "`1` starts a re-poll of every source behind the answer; the answer itself is what was cached",
         )],
-        ("config", Method::Get) => &[("secrets", "`1` includes the metrics token, which makes the document a credential")],
         ("reset", Method::Post) => &[("node", "1-4")],
         ("usb", Method::Post) => &[
             ("node", "1-4: which node the bus is routed to"),
@@ -117,7 +116,6 @@ const UNTYPED: &[&str] = &[
     "/sdcard",
     "/info",
     "/firmware/available",
-    "/metrics-token",
     "/hostname",
     "/ntp",
     "/config",

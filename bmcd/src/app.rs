@@ -21,7 +21,6 @@ pub mod firmware_info;
 pub mod firmware_sources;
 pub mod health_info;
 pub mod hostname;
-pub mod metrics_token;
 pub mod ntp;
 pub mod switch_info;
 pub mod sysfs;

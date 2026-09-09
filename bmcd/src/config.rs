@@ -28,6 +28,14 @@ pub struct Config {
     pub authentication: Authentication,
     pub host: String,
     pub port: u16,
+    /// Where `/metrics` is served, on its own plain-HTTP listener.
+    ///
+    /// Defaulted rather than required, so a configuration file written for an
+    /// older bmcd still parses. It binds the same `host` as the API, so
+    /// restricting the daemon to a management address covers both listeners
+    /// with one setting.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
     pub www: PathBuf,
     pub redirect_http: bool,
     pub log: Log,
@@ -72,4 +80,15 @@ impl Config {
 
         Ok(config.try_deserialize()?)
     }
+}
+
+/// Port 9110, chosen rather than inherited.
+///
+/// Not 443, which serves the API and the web interface. Not 9100, which means
+/// node-exporter to every scrape config and dashboard in this estate, so a
+/// BMC answering there would be read as a node with the wrong metric
+/// families. Nothing else here uses 9110, and the `job` and `instance` labels
+/// are what actually disambiguate a target.
+fn default_metrics_port() -> u16 {
+    9110
 }

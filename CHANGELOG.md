@@ -8,6 +8,56 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.27.0] — 2026-09-09
+
+### Changed
+
+- **`/metrics` moved to its own listener: port 9110, plain HTTP, no
+  credential** (SQU-178). It used to sit on `:443` beside the API and the web
+  interface, behind TLS and a token of its own.
+
+  The token existed for one reason — so that a credential in a scrape config
+  could not also reach `/api/bmc` and power four compute modules off. On a
+  listener that serves nothing but `/metrics` there is nothing else to reach.
+  The property is kept and the mechanism is a port instead of a secret, which
+  is one fewer thing to mint, store, rotate and leak.
+
+  The TLS was always scraped with verification disabled, because the board's
+  certificate is expired and carries no SAN, so nothing could verify it.
+  Unverified TLS is a handshake per scrape on a Cortex-A7 in exchange for
+  nothing. What protects the endpoint is the network, and the listener binds
+  the same `host` as the API, so restricting the daemon to a management
+  address restricts both.
+
+  `metrics_port` is a new key in `default_config.yaml`, defaulted so that a
+  configuration file written for an older bmcd still parses. A request to
+  `/metrics` on `:443` now answers 404.
+
+### Removed
+
+- **The metrics token, entirely.** `GET /api/bmc/metrics-token`,
+  `POST /api/bmc/metrics-token/rotate`, the `metrics_token` operation, the
+  bearer check on `/metrics`, and `/mnt/overlay/metrics-token`. Removed rather
+  than left dormant: an endpoint that still exists is an endpoint someone will
+  use.
+
+- **The config export's `secrets` tier.** The metrics token was the only thing
+  in it, so `secrets`, `contains_secrets` and the `secrets=1` parameter all
+  described a credential that no longer exists. An empty `secrets=1` would be
+  a control that lies.
+
+  `format_version` is unchanged at 1 on purpose: an export written by an older
+  board still imports, because serde ignores the `secrets` and
+  `contains_secrets` it carries. A test asserts that. The token inside it is
+  dropped, which is the right fate for a credential nothing takes.
+
+### Side effect worth recording
+
+The promotion gate no longer depends on the `/api/bmc` loopback bypass. It
+used to reach through it to mint itself a token; it now makes one plain
+request to 9110. The on-board `tpi` is the only remaining user of the bypass
+(SQU-165).
+
 ## [2.26.0] — 2026-09-09
 
 ### Added
