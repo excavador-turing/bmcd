@@ -151,10 +151,37 @@ jobs:
           target: armv7-unknown-linux-gnueabihf
           rustflags: ''
 
-      # armv7-unknown-linux-gnueabihf is the triple Buildroot's rust-bin uses
-      # for this board. PKG_CONFIG_ALLOW_CROSS is what lets pkg-config answer
-      # for an architecture that is not the host's; without it the openssl-sys
-      # build script refuses rather than looking in the sysroot.
+      # A PROXY TARGET, deliberately. Buildroot builds this board soft-float
+      # (`BR2_ARM_EABI=y`), so the real triple is armv7-unknown-linux-gnueabi
+      # -- see CC_armv7_unknown_linux_gnueabi in the firmware's bmcd.mk. That
+      # is Debian's `armel`, an architecture Ubuntu does not carry, so its
+      # system libraries cannot be installed on this runner.
+      #
+      # armv7-unknown-linux-gnueabihf stands in for it, and the step below
+      # asserts what makes that safe: rustc's cfg for the two differs in
+      # `target_abi` and nothing else -- same arch, endianness, pointer width
+      # and env. Type layout and integer widths, the entire class of error
+      # this job exists to catch, are identical.
+      #
+      # The gap is code branching on `cfg(target_abi)` or on the float ABI.
+      # There is none in this workspace, and the assertion fails if the two
+      # targets ever diverge in anything further.
+      - name: the proxy target still stands in for the board's
+        run: |
+          set -eu
+          rustc --print cfg --target=armv7-unknown-linux-gnueabi \
+            | sort | grep -v target_abi > /tmp/board.cfg
+          rustc --print cfg --target=armv7-unknown-linux-gnueabihf \
+            | sort | grep -v target_abi > /tmp/proxy.cfg
+          if ! diff /tmp/board.cfg /tmp/proxy.cfg; then
+            echo "::error::gnueabihf no longer stands in for the board's gnueabi"
+            exit 1
+          fi
+          echo "the two targets differ only in target_abi, as assumed"
+
+      # PKG_CONFIG_ALLOW_CROSS is what lets pkg-config answer for an
+      # architecture that is not the host's; without it the openssl-sys build
+      # script refuses rather than looking in the sysroot.
       - name: cargo check (armv7)
         env:
           PKG_CONFIG_ALLOW_CROSS: '1'

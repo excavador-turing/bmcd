@@ -24,6 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   clippy stays green while the new job fails with `expected u32, found u64` at
   the comparison. That asymmetry is the whole point.
 
+  The board is actually built **soft-float** (`BR2_ARM_EABI=y`), so its triple
+  is `armv7-unknown-linux-gnueabi` -- Debian's `armel`, which Ubuntu does not
+  carry. The hard-float target stands in for it, and the job asserts what makes
+  that safe: rustc's cfg for the two differs in `target_abi` and nothing else,
+  so type layout and integer widths are identical. The assertion fails if they
+  ever diverge further.
+
 
 ## [2.19.1] — 2026-09-09
 
