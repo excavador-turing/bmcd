@@ -144,6 +144,10 @@ pub struct FirmwareSlots {
     pub nextboot: Option<String>,
     /// The last line the promotion script wrote, when there is a log.
     pub last_promotion: Option<Promotion>,
+    /// How the gate has decided over this board's life. `None` on a board
+    /// with no log, which is a board that has never taken an OTA update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_history: Option<PromotionHistory>,
     /// Which image is staged, when whatever staged it left a note. `None`
     /// means no note was found -- on a board where `update_staged` is true
     /// that means the image was staged by something that does not write one,
@@ -192,6 +196,7 @@ pub async fn get_firmware_slots(running_version: Option<String>) -> FirmwareSlot
         update_staged,
         nextboot,
         last_promotion: read_promotion(Path::new(PROMOTION_LOG)).await,
+        promotion_history: read_promotion_history(Path::new(PROMOTION_LOG)).await,
         staged: read_staged(Path::new(STAGED_MARKER)).await,
     }
 }
@@ -340,6 +345,59 @@ async fn read_nextboot() -> (Option<bool>, Option<String>) {
     }
 }
 
+/// How the health gate has decided, over the life of this board.
+///
+/// The gate's history lived only in `/mnt/overlay/postupdate.log`, so
+/// "nineteen consecutive clean promotions" was a number somebody counted by
+/// hand and wrote on a website, where it went stale the next day.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PromotionHistory {
+    /// Boots that ran the gate at all: one per "tentative boot" line.
+    pub attempts: u64,
+    /// Of those, the ones the gate refused.
+    pub rolled_back: u64,
+    /// The rest. Derived rather than counted, because the gate has no single
+    /// line that means "kept": it can finish through the metrics check, or by
+    /// skipping it on a board with no `curl`, or by promoting anyway when
+    /// there is no volume to fall back to. Deriving covers all three; the one
+    /// inaccuracy is a board cut mid-gate, whose unfinished attempt counts
+    /// here. That is rare and errs towards over-reporting success, which is
+    /// worth saying out loud in the metric's help text.
+    pub promoted: u64,
+}
+
+/// The whole log, not the tail: the counts are over the board's life, and a
+/// tail would silently start over. Capped so a log that somehow grows without
+/// bound cannot be read into memory whole.
+const PROMOTION_LOG_MAX: u64 = 1024 * 1024;
+
+/// Marks a boot that ran the gate.
+const ATTEMPT_MARKER: &str = "tentative boot";
+/// Marks the gate refusing the image it booted.
+const ROLLBACK_MARKER: &str = "rolling back to the volume";
+
+/// Counts what the gate has done.
+pub async fn read_promotion_history(path: &Path) -> Option<PromotionHistory> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut buffer = Vec::new();
+    file.take(PROMOTION_LOG_MAX)
+        .read_to_end(&mut buffer)
+        .await
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&buffer);
+    let mut history = PromotionHistory::default();
+    for line in text.lines() {
+        if line.contains(ATTEMPT_MARKER) {
+            history.attempts += 1;
+        } else if line.contains(ROLLBACK_MARKER) {
+            history.rolled_back += 1;
+        }
+    }
+    history.promoted = history.attempts.saturating_sub(history.rolled_back);
+    Some(history)
+}
+
 /// Reads the last thing the promotion script said, from the tail of its log.
 async fn read_promotion(path: &Path) -> Option<Promotion> {
     let mut file = tokio::fs::File::open(path).await.ok()?;
@@ -436,6 +494,83 @@ async fn read_attribute<T: std::str::FromStr>(dir: &Path, attribute: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::TempDir;
+
+    /// The board's own log on 2026-09-09: fifteen boots ran the gate and one
+    /// was refused. Worth pinning as a test, because the hand-counted number
+    /// on the website said nineteen -- which is the whole reason this metric
+    /// exists.
+    #[tokio::test]
+    async fn the_gates_history_is_counted_from_its_own_log() {
+        let dir = TempDir::new("promotion").expect("tempdir");
+        let log = dir.path().join("postupdate.log");
+
+        let mut text = String::new();
+        for _ in 0..14 {
+            text.push_str("Tue Sep  8 22:00:00 UTC 2026 postupdate: tentative boot; checking this image before making it permanent\n");
+            text.push_str("Tue Sep  8 22:00:03 UTC 2026 postupdate: bmcd answered after 3s\n");
+            text.push_str(
+                "Tue Sep  8 22:00:03 UTC 2026 postupdate: metrics answer, with bmcd_build_info\n",
+            );
+        }
+        text.push_str("Tue Sep  8 23:29:54 UTC 2026 postupdate: tentative boot; checking this image before making it permanent\n");
+        text.push_str("Tue Sep  8 23:29:57 UTC 2026 postupdate: FAILED: staged v0.0.1 but this image reports v2.8.1-rc1\n");
+        text.push_str("Tue Sep  8 23:29:57 UTC 2026 postupdate: rolling back to the volume named rootfs by rebooting\n");
+        tokio::fs::write(&log, text).await.expect("write");
+
+        let history = read_promotion_history(&log).await.expect("read");
+        assert_eq!(history.attempts, 15);
+        assert_eq!(history.rolled_back, 1);
+        assert_eq!(history.promoted, 14);
+    }
+
+    /// A board that has never taken an OTA update has no log, and that is not
+    /// a failure -- it must not render as zero promotions, which would look
+    /// like a board whose every update was refused.
+    #[tokio::test]
+    async fn no_log_is_no_history_rather_than_zero() {
+        let dir = TempDir::new("promotion").expect("tempdir");
+        assert!(read_promotion_history(&dir.path().join("absent.log"))
+            .await
+            .is_none());
+    }
+
+    /// A gate cut off before it decided leaves an attempt with no verdict.
+    /// It counts as promoted, which over-reports success by one -- the metric
+    /// says so in its help text rather than pretending otherwise.
+    #[tokio::test]
+    async fn an_unfinished_attempt_counts_as_promoted_and_that_is_documented() {
+        let dir = TempDir::new("promotion").expect("tempdir");
+        let log = dir.path().join("postupdate.log");
+        tokio::fs::write(
+            &log,
+            "x postupdate: tentative boot; checking this image before making it permanent\n",
+        )
+        .await
+        .expect("write");
+        let history = read_promotion_history(&log).await.expect("read");
+        assert_eq!(
+            (history.attempts, history.rolled_back, history.promoted),
+            (1, 0, 1)
+        );
+    }
+
+    /// More rollbacks than attempts cannot happen, but a truncated or
+    /// hand-edited log could produce it, and a subtraction that wraps would
+    /// render an absurd counter.
+    #[tokio::test]
+    async fn a_nonsensical_log_does_not_wrap_the_counter() {
+        let dir = TempDir::new("promotion").expect("tempdir");
+        let log = dir.path().join("postupdate.log");
+        tokio::fs::write(
+            &log,
+            "x postupdate: rolling back to the volume named rootfs\n",
+        )
+        .await
+        .expect("write");
+        let history = read_promotion_history(&log).await.expect("read");
+        assert_eq!(history.promoted, 0);
+    }
     use std::fs;
     use std::path::PathBuf;
 

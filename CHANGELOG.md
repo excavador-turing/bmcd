@@ -10,6 +10,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.17.0] — 2026-09-09
+
+### Added
+
+- **`bmcd_firmware_promotion_total{result}`** (SQU-141), counted from the
+  gate's own log. Its history lived only in `/mnt/overlay/postupdate.log`, so
+  "nineteen consecutive clean promotions" was a number counted by hand and
+  written on a website, where it went stale.
+
+  It had also gone *wrong*: the board's own log says **fifteen boots ran the
+  gate and one was refused** — fourteen promotions, not nineteen. The
+  hand-counted figure had drifted, which is the entire argument for the
+  metric. The site's number will link to a query instead of a claim.
+
+  `promoted` is derived as attempts minus rollbacks, because the gate has no
+  single line meaning *kept*: it can finish through the metrics check, by
+  skipping that check on a board with no `curl`, or by promoting anyway when
+  there is no volume to fall back to. Deriving covers all three. The one
+  inaccuracy is a board cut off mid-gate, whose unfinished attempt counts as
+  promoted — said plainly in the metric's help text rather than hidden.
+- `firmware_slots` carries `promotion_history`, so the same counts are
+  available without a scrape credential.
+
 ## [2.16.0] — 2026-09-09
 
 ### Added
@@ -327,7 +350,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.16.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.17.0...hive
+[2.17.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.17.0
 [2.16.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.16.0
 [2.15.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.1
 [2.15.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.0

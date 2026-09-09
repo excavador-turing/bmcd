@@ -1304,6 +1304,7 @@ mod test {
                 timestamp: "Mon Sep  7 19:30:22 UTC 2026".to_string(),
                 message: "switch ports present: node1 node2 node3 node4".to_string(),
             }),
+            promotion_history: None,
             staged: Some(StagedImage {
                 version: Some("v2.4.0".to_string()),
                 sha256: Some("00707f1f".to_string()),
@@ -1350,6 +1351,7 @@ mod test {
             update_staged: None,
             nextboot: None,
             last_promotion: None,
+            promotion_history: None,
             staged: None,
         };
 

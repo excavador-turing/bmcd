@@ -669,6 +669,29 @@ fn render_health(out: &mut String, health: &Health) {
 }
 
 fn render_firmware(out: &mut String, firmware: &FirmwareSlots) {
+    // The gate's history. Without this, "nineteen consecutive clean
+    // promotions" is a number counted by hand and written on a website, where
+    // it goes stale; with it, a dashboard shows the gate and an alert can fire
+    // on a rollback the moment one happens.
+    if let Some(history) = firmware.promotion_history {
+        family(
+            out,
+            "bmcd_firmware_promotion_total",
+            "counter",
+            "Boots that ran the firmware health gate, by what the gate decided.              `promoted` is derived as attempts minus rollbacks, because the gate has              no single line meaning `kept`; a board cut off mid-gate therefore counts              as promoted.",
+            &[
+                Sample::new(
+                    labels(&[("result", "promoted")]),
+                    history.promoted as f64,
+                ),
+                Sample::new(
+                    labels(&[("result", "rolled_back")]),
+                    history.rolled_back as f64,
+                ),
+            ],
+        );
+    }
+
     let slots = [
         ("running", &firmware.running),
         ("rollback", &firmware.rollback),
@@ -932,6 +955,7 @@ mod tests {
                 update_staged: Some(false),
                 nextboot: None,
                 last_promotion: None,
+                promotion_history: None,
                 staged: None,
             },
         }
@@ -990,6 +1014,7 @@ mod tests {
                 update_staged: None,
                 nextboot: None,
                 last_promotion: None,
+                promotion_history: None,
                 staged: None,
             },
         }
