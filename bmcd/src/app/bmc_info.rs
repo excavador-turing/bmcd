@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::Serialize;
 
 pub fn get_ipv4_address() -> Option<String> {
@@ -32,7 +33,7 @@ pub fn get_ipv4_address() -> Option<String> {
     None
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct NetInfo {
     device: String,
     ip: String,
@@ -75,7 +76,7 @@ pub fn get_fs_stat(device: &str) -> anyhow::Result<(u64, u64)> {
     Ok((total, free))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct StorageInfo {
     name: String,
     total_bytes: u64,

@@ -95,13 +95,17 @@ impl Display for NodeId {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub enum UsbRoute {
     Bmc,
     AlternativePort,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub enum UsbMode {
     Host,
     Device,

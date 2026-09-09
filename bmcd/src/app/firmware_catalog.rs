@@ -27,6 +27,7 @@
 //! never rendered as "nothing new" -- those are different claims and only the
 //! caller knows which one it is about to make.
 use crate::app::firmware_sources::{Source, SourceKind};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -58,7 +59,7 @@ const FRESH_AFTER_ERROR: Duration = Duration::from_secs(120);
 /// measured on hardware, `sort -V` put `local` first and every release,
 /// including genuinely older code, came out as an upgrade. Saying "unknown" is
 /// the honest answer and lets the page say so rather than implying an order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Relation {
     Current,
@@ -73,7 +74,7 @@ pub enum Relation {
 /// checksum published by the release and verified on download; TLS only,
 /// because the publisher ships no checksums at all (upstream's server does
 /// not); and a local file whose provenance is whatever put it there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Trust {
     Verified,
@@ -81,7 +82,7 @@ pub enum Trust {
     Unverified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Candidate {
     pub version: String,
     pub relation: Relation,
@@ -95,7 +96,7 @@ pub struct Candidate {
     pub size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SourceCatalog {
     pub id: String,
     pub label: String,
@@ -110,7 +111,7 @@ pub struct SourceCatalog {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Catalog {
     pub checked_at: String,
     pub running: String,

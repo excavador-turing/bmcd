@@ -40,6 +40,7 @@
 
 use crate::app::bmc_application::{BmcApplication, NodeInfo};
 use crate::hal::NodeId;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -47,7 +48,7 @@ use std::collections::HashMap;
 /// ignores what it does not know and reports what it could not apply.
 pub const FORMAT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeSettings {
     pub id: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,7 +59,7 @@ pub struct NodeSettings {
     pub uart_baud: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigExport {
     pub format_version: u32,
     /// When and from what. Not read back on import; it is what makes a file
@@ -75,7 +76,7 @@ pub struct ConfigExport {
     pub nodes: Option<Vec<NodeSettings>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExportOrigin {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -86,7 +87,7 @@ pub struct ExportOrigin {
 }
 
 /// What can be applied, and what could not.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct ImportReport {
     pub applied: Vec<String>,
     pub skipped: Vec<String>,

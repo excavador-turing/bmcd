@@ -364,7 +364,10 @@ async fn get_hostname() -> impl Into<LegacyResponse> {
         .await
         .ok()
         .map(|s| s.trim().to_string());
-    json!({ "hostname": live, "on_next_boot": persisted })
+    json!(crate::api::responses::Hostname {
+        hostname: live,
+        on_next_boot: persisted,
+    })
 }
 
 /// Renames the board.
@@ -393,13 +396,13 @@ async fn set_hostname(query: Query) -> LegacyResponse {
 async fn get_ntp() -> impl Into<LegacyResponse> {
     let config = crate::app::ntp::load().await;
     let health = crate::app::health_info::get_health().await;
-    json!({
-        "servers": config.servers,
+    json!(crate::api::responses::Ntp {
+        servers: config.servers,
         // False on an image whose chrony.conf predates the `sourcedir` line.
         // Without it a saved list is written and silently never read, and the
         // page should say so rather than show a setting that does nothing.
-        "configurable": crate::app::ntp::sourcedir_configured(),
-        "clock": health.clock,
+        configurable: crate::app::ntp::sourcedir_configured(),
+        clock: health.clock,
     })
 }
 
@@ -618,36 +621,29 @@ async fn get_about() -> impl Into<LegacyResponse> {
         .unwrap_or_else(|_| "unknown".to_string());
     let (board_model, board_revision, board_serial) = read_board_info().await.unwrap_or_default();
 
-    json!(
-        {
-            "board_model": board_model,
-            "board_revision": board_revision,
-            "board_serial": board_serial,
-            "hostname": hostname,
-            "api": API_VERSION,
-            "version": version,
-            "bmcd_version": bmcd_version,
-            // feeds the "Build version" field of the web UI about page, which
-            // renders "vundefined" without it.
-            "build_version": bmcd_version,
-            "buildtime": build_time,
-            "buildroot": buildroot,
-            // The one field an operator wants after a kernel bump, and the
-            // only way to answer it before this was `uname -r` over SSH.
-            "kernel": kernel,
-        }
-    )
+    json!(crate::api::responses::About {
+        board_model,
+        board_revision,
+        board_serial,
+        hostname,
+        api: API_VERSION.to_string(),
+        version,
+        bmcd_version: bmcd_version.to_string(),
+        // Feeds the "Build version" field of the web UI's About page, which
+        // renders "vundefined" without it.
+        build_version: bmcd_version.to_string(),
+        buildtime: build_time.to_string(),
+        buildroot,
+        // The one field an operator wants after a kernel bump, and the only
+        // way to answer it before this was `uname -r` over SSH.
+        kernel,
+    })
 }
 
 async fn get_info() -> impl Into<LegacyResponse> {
     let storage = get_storage_info();
     let ips = get_net_interfaces().await;
-    json!(
-        {
-            "ip": ips,
-            "storage": storage,
-        }
-    )
+    json!(crate::api::responses::BoardInfo { ip: ips, storage })
 }
 
 /// The A/B firmware slots: which UBI volume the board booted from, which one
@@ -907,14 +903,13 @@ async fn get_node_power(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
     let n3 = get_node_power_status(bmc, NodeId::Node3).await;
     let n4 = get_node_power_status(bmc, NodeId::Node4).await;
 
-    json!(
-     [{
-        "node1": n1,
-        "node2": n2,
-        "node3": n3,
-        "node4": n4,
-    }]
-    )
+    // A one-element array, which is upstream's shape for this endpoint.
+    json!([crate::api::responses::NodePower {
+        node1: n1,
+        node2: n2,
+        node3: n3,
+        node4: n4,
+    }])
 }
 
 async fn get_node_power_status(bmc: &BmcApplication, node: NodeId) -> String {
@@ -934,14 +929,8 @@ fn get_sdcard_info() -> LegacyResponse {
     match get_fs_stat("/mnt/sdcard") {
         Ok((total, free)) => {
             let used = total - free;
-            json!(
-                 [{
-                    "total": total,
-                    "use": used,
-                    "free": free,
-                }]
-            )
-            .into()
+            // A one-element array, which is upstream's shape here.
+            json!([crate::api::responses::SdCard { total, used, free }]).into()
         }
         Err(_) => (
             StatusCode::BAD_REQUEST,
@@ -1016,14 +1005,13 @@ async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
         UsbConfig::Flashing(node, route) => (node, UsbMode::Flash, route),
     };
 
-    json!(
-        [{
-            "mode": mode,
-            "node": node.to_string(),
-            "route": route,
-            "bus_type": bus_type,
-        }]
-    )
+    // A one-element array, which is upstream's shape for this endpoint.
+    json!([crate::api::responses::UsbState {
+        mode,
+        node: node.to_string(),
+        route,
+        bus_type: bus_type.to_string(),
+    }])
 }
 
 /// `opt=set&type=cooling&device=<name>&speed=<step>[&mode=auto|manual]`

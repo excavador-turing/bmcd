@@ -76,8 +76,27 @@ impl From<()> for LegacyResponse {
 
 impl From<anyhow::Error> for LegacyResponse {
     fn from(e: anyhow::Error) -> Self {
+        // A caller's mistake is a 400; everything else is a 500. Decided by
+        // downcasting to a typed error rather than by reading the message,
+        // because the message is for a person and would take the status with
+        // it the first time somebody reworded it.
+        //
+        // The status is load-bearing on the path form, where a refusal is
+        // `application/problem+json` and a client branches on it: 500 is the
+        // canonical retryable status, so telling a client 500 for "that
+        // device does not exist" asks it to retry an answer that will never
+        // change.
+        let status = if e
+            .root_cause()
+            .is::<crate::app::cooling_device::CoolingRequestError>()
+        {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+
         LegacyResponse::Error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             format!("Failed to {}: {}", e, e.root_cause()).into(),
         )
     }
@@ -162,5 +181,47 @@ impl Responder for Null {
 impl From<()> for Null {
     fn from(_: ()) -> Self {
         Null {}
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::app::cooling_device::CoolingRequestError;
+
+    fn status_of(error: anyhow::Error) -> StatusCode {
+        match LegacyResponse::from(error) {
+            LegacyResponse::Error(status, _) => status,
+            other => panic!("an error converted to {other:?}"),
+        }
+    }
+
+    /// The whole point is that the two are told apart, so both directions are
+    /// asserted. One test proving 400 would pass just as well if everything
+    /// became 400, which would be a different bug with the same shape.
+    #[test]
+    fn a_callers_mistake_is_a_400_and_a_board_failure_is_a_500() {
+        assert_eq!(
+            status_of(CoolingRequestError::NoSuchDevice("nope".into()).into()),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(CoolingRequestError::SpeedTooHigh { given: 9, max: 6 }.into()),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(anyhow::anyhow!("the sysfs write failed")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// The handlers wrap with `.context(...)`, so the typed error is the root
+    /// cause rather than the top of the chain. A check that only looked at
+    /// the outermost error would see a plain string and answer 500.
+    #[test]
+    fn the_status_survives_the_context_the_handler_adds() {
+        let wrapped = anyhow::Error::from(CoolingRequestError::NoSuchDevice("nope".into()))
+            .context("hold fan at step");
+        assert_eq!(status_of(wrapped), StatusCode::BAD_REQUEST);
     }
 }

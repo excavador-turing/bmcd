@@ -68,7 +68,7 @@ pub enum UsbConfig {
     Flashing(NodeId, UsbRoute),
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct NodeInfo {
     pub name: Option<String>,
     pub module_name: Option<String>,

@@ -12,7 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
+
+/// What a caller got wrong, as opposed to what the board could not do.
+///
+/// The distinction reaches the wire: these become 400, and everything else
+/// stays 500. It matters more than it looks, because `problem+json` exists so
+/// a generated client can branch on `status` -- and 500 is the canonical
+/// retryable one, so a client told 500 for "you named a device that does not
+/// exist" will retry forever against an answer that cannot change.
+///
+/// A typed error rather than matching on the message: the text is for a
+/// person, and a status derived from it would break the first time somebody
+/// improved the wording.
+#[derive(Debug, thiserror::Error)]
+pub enum CoolingRequestError {
+    #[error("cooling device: `{0}` does not exist")]
+    NoSuchDevice(String),
+    #[error("given speed '{given}' exceeds maximum speed of '{max}'")]
+    SpeedTooHigh { given: c_ulong, max: c_ulong },
+    #[error(
+        "cooling device `{0}` is not bound to a thermal zone, so there is no governor to pause"
+    )]
+    NoThermalZone(String),
+}
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::{collections::HashMap, ffi::c_ulong, fs, io, path::Path, time::Duration};
@@ -158,17 +181,17 @@ pub async fn set_cooling_state(device: &str, speed: &c_ulong) -> anyhow::Result<
         .join("cur_state");
 
     let devices = get_cooling_state().await;
-    let device = devices
+    let found = devices
         .iter()
         .find(|d| d.device == device)
-        .ok_or(anyhow!("cooling device: `{}` does not exist", device))?;
+        .ok_or_else(|| CoolingRequestError::NoSuchDevice(device.to_string()))?;
 
-    if speed > &device.max_speed {
-        bail!(
-            "given speed '{}' exceeds maximum speed of '{}'",
-            speed,
-            device.max_speed
-        );
+    if speed > &found.max_speed {
+        return Err(CoolingRequestError::SpeedTooHigh {
+            given: *speed,
+            max: found.max_speed,
+        }
+        .into());
     }
 
     tokio::fs::write(device_path, speed.to_string()).await?;
@@ -267,12 +290,12 @@ pub async fn set_cooling_override(device: &str, step: Option<c_ulong>) -> anyhow
     let found = devices
         .iter()
         .find(|d| d.device == device)
-        .ok_or(anyhow!("cooling device: `{}` does not exist", device))?;
+        .ok_or_else(|| CoolingRequestError::NoSuchDevice(device.to_string()))?;
 
-    let zone = found.zone.clone().ok_or(anyhow!(
-        "cooling device `{}` is not bound to a thermal zone, so there is no governor to pause",
-        device
-    ))?;
+    let zone = found
+        .zone
+        .clone()
+        .ok_or_else(|| CoolingRequestError::NoThermalZone(device.to_string()))?;
 
     let Some(step) = step else {
         set_governor(&zone, true).await?;
@@ -283,11 +306,11 @@ pub async fn set_cooling_override(device: &str, step: Option<c_ulong>) -> anyhow
     // Validated before anything is paused: a step this board cannot reach
     // must not cost it its governor.
     if step > found.max_speed {
-        bail!(
-            "given speed '{}' exceeds maximum speed of '{}'",
-            step,
-            found.max_speed
-        );
+        return Err(CoolingRequestError::SpeedTooHigh {
+            given: step,
+            max: found.max_speed,
+        }
+        .into());
     }
 
     set_governor(&zone, false).await?;

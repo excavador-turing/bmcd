@@ -99,7 +99,38 @@ fn response_schemas() -> Vec<(&'static str, Value)> {
         ("/firmware/slots", component_ref("FirmwareSlots")),
         ("/firmware/sources", component_ref("Sources")),
         ("/firmware/check", component_ref("UpdateCheck")),
+        ("/firmware/available", component_ref("Catalog")),
+        ("/about", component_ref("About")),
+        ("/info", component_ref("BoardInfo")),
+        ("/hostname", component_ref("Hostname")),
+        ("/ntp", component_ref("Ntp")),
+        ("/config", component_ref("ConfigExport")),
+        // Four nodes, always. The daemon's own type is `[NodeInfo; 4]`, and
+        // saying so lets a generated client index it without a length check
+        // that can never fail.
+        (
+            "/nodes",
+            json!({
+                "type": "array", "items": component_ref("NodeInfo"),
+                "minItems": 4, "maxItems": 4
+            }),
+        ),
+        // Upstream's single-element arrays, described as they are rather than
+        // flattened. A schema claiming an object here would be a lie that
+        // compiles, and a client has to index them either way.
+        ("/power", one_of_array("NodePower")),
+        ("/usb", one_of_array("UsbState")),
+        ("/sdcard", one_of_array("SdCard")),
     ]
+}
+
+/// An array that always holds exactly one object, which is upstream's shape
+/// for `power`, `usb` and `sdcard`.
+fn one_of_array(name: &str) -> Value {
+    json!({
+        "type": "array", "items": component_ref(name),
+        "minItems": 1, "maxItems": 1
+    })
 }
 
 /// The operations whose answer this document does not describe.
@@ -108,18 +139,16 @@ fn response_schemas() -> Vec<(&'static str, Value)> {
 /// source, so there is no type to derive a schema from. Listed rather than
 /// left implicit: a test requires every GET alias to be either described or
 /// named here, which is what stops the list quietly growing.
-const UNTYPED: &[&str] = &[
-    "/about",
-    "/power",
-    "/nodes",
-    "/usb",
-    "/sdcard",
-    "/info",
-    "/firmware/available",
-    "/hostname",
-    "/ntp",
-    "/config",
-];
+/// Empty, and meant to stay that way.
+///
+/// Ten operations sat here until SQU-177: their handlers assembled an answer
+/// with `json!` from several sources, so there was no type to derive a schema
+/// from. Each now has one, reconstructed from what the handler already sent.
+///
+/// The list survives because the test that reads it is what stops a new
+/// undescribed operation appearing quietly. Adding a path here is a
+/// deliberate act with a reason attached; leaving one out fails the build.
+const UNTYPED: &[&str] = &[];
 
 fn component_ref(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{}", name) })
@@ -164,6 +193,48 @@ fn components() -> serde_json::Map<String, Value> {
         (
             "UpdateCheck",
             serde_json::to_value(schemars::schema_for!(crate::app::update_check::UpdateCheck)),
+        ),
+        (
+            "Catalog",
+            serde_json::to_value(schemars::schema_for!(crate::app::firmware_catalog::Catalog)),
+        ),
+        (
+            "ConfigExport",
+            serde_json::to_value(schemars::schema_for!(
+                crate::app::config_export::ConfigExport
+            )),
+        ),
+        (
+            "NodeInfo",
+            serde_json::to_value(schemars::schema_for!(crate::app::bmc_application::NodeInfo)),
+        ),
+        (
+            "About",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::About)),
+        ),
+        (
+            "BoardInfo",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::BoardInfo)),
+        ),
+        (
+            "Hostname",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::Hostname)),
+        ),
+        (
+            "Ntp",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::Ntp)),
+        ),
+        (
+            "NodePower",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::NodePower)),
+        ),
+        (
+            "UsbState",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::UsbState)),
+        ),
+        (
+            "SdCard",
+            serde_json::to_value(schemars::schema_for!(crate::api::responses::SdCard)),
         ),
     ];
 
@@ -678,6 +749,80 @@ mod tests {
                 overridden,
             };
             assert_valid("CoolingDevice", &serde_json::to_value(&device).unwrap());
+        }
+    }
+
+    /// `use` is a Rust keyword, so the field is `used` and renamed on the
+    /// wire. A schema that published `used` would describe a key the board
+    /// has never sent -- and this is the exact class of mistake the contract
+    /// tests exist for.
+    #[test]
+    fn the_sdcard_schema_uses_the_wire_name_not_the_rust_name() {
+        let card = crate::api::responses::SdCard {
+            total: 31_914_983_424,
+            used: 1_234_567_890,
+            free: 30_680_415_534,
+        };
+
+        let sent = serde_json::to_value(&card).unwrap();
+        assert!(
+            sent.get("use").is_some(),
+            "the fixture no longer exercises the rename"
+        );
+        assert!(sent.get("used").is_none());
+        assert_valid("SdCard", &sent);
+    }
+
+    /// A board whose EEPROM has no serial. Every other field on `About` is a
+    /// plain string that falls back to "unknown", so this is the only one
+    /// that can be absent and the only one worth a case of its own.
+    #[test]
+    fn about_matches_its_schema_with_and_without_a_serial() {
+        for serial in [Some("XZCT250200139".to_string()), None] {
+            let about = crate::api::responses::About {
+                board_model: "Turing Pi 2".to_string(),
+                board_revision: "2.5.2".to_string(),
+                board_serial: serial,
+                hostname: "hive-bmc".to_string(),
+                api: "1.1".to_string(),
+                version: "v2.15.0".to_string(),
+                bmcd_version: "2.28.0".to_string(),
+                build_version: "2.28.0".to_string(),
+                buildtime: "2026-09-09 17:00:00-00:00".to_string(),
+                buildroot: "2025.02.17".to_string(),
+                kernel: "6.12.109".to_string(),
+            };
+            assert_valid("About", &serde_json::to_value(&about).unwrap());
+        }
+    }
+
+    /// The board reports `"Unknown"` for a rail it could not read, so these
+    /// are strings and not booleans. A schema saying boolean would generate a
+    /// client that cannot represent the third case.
+    #[test]
+    fn node_power_is_strings_because_a_rail_can_be_unreadable() {
+        let power = crate::api::responses::NodePower {
+            node1: "1".to_string(),
+            node2: "0".to_string(),
+            node3: "Unknown".to_string(),
+            node4: "1".to_string(),
+        };
+        assert_valid("NodePower", &serde_json::to_value(&power).unwrap());
+    }
+
+    /// Both halves absent: a board mid-rename whose /etc/hostname is missing
+    /// and whose live name could not be read.
+    #[test]
+    fn hostname_matches_its_schema_when_neither_half_is_readable() {
+        for (live, next) in [
+            (Some("hive-bmc".to_string()), Some("hive-a-bmc".to_string())),
+            (None, None),
+        ] {
+            let hostname = crate::api::responses::Hostname {
+                hostname: live,
+                on_next_boot: next,
+            };
+            assert_valid("Hostname", &serde_json::to_value(&hostname).unwrap());
         }
     }
 

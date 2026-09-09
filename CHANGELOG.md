@@ -8,6 +8,56 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.28.0] — 2026-09-09
+
+### Added
+
+- **Every read operation now describes what it answers with** (SQU-177). Ten
+  handlers built their response with `json!` from several sources, so there
+  was no type to derive a schema from and the document said only "not
+  described here". `UNTYPED` is now empty.
+
+  The shapes are **reconstructions, not designs**: every field is what the
+  handler already sent, under the name it already used. A rename would break
+  `tpi` and the web interface for no gain. Where a shape is odd the oddity is
+  preserved and explained — `power`, `usb` and `sdcard` answer a one-element
+  array, which is upstream's convention, and the document says so rather than
+  claiming an object a client cannot index.
+
+  Two details worth having in writing. `sdcard`'s used-bytes field is `use` on
+  the wire, because that is what upstream sent, and `use` is a Rust keyword —
+  so the field is renamed, and a test asserts the wire name rather than the
+  Rust one. And `power` reports strings, not booleans, because a rail the
+  daemon cannot read is `"Unknown"`; a boolean schema would generate a client
+  that cannot represent the third case.
+
+  Four new contract tests, in the style of the six from 2.25.0. Proven by
+  removing the `use` rename: the fixture fails saying it no longer exercises
+  what it was written for.
+
+### Fixed
+
+- **A caller's mistake answers 400, not 500** (was SQU-176). Naming a cooling
+  device that does not exist, or a step above the fan's maximum, is a client
+  error, and the board answered as though it had failed.
+
+  It matters because `problem+json` exists so a generated client can branch on
+  `status`, and 500 is the canonical retryable one — so a client told 500 for
+  "that device does not exist" retries forever against an answer that cannot
+  change.
+
+  Decided by downcasting a typed `CoolingRequestError`, not by matching on the
+  message: the message is for a person and would take the status with it the
+  first time somebody reworded it. The handlers wrap with `.context(...)`, so
+  the check is against the root cause, and there is a test for exactly that.
+
+### Changed
+
+- `schemars` derives reach eleven more types. The release binary is
+  **13,024,808 bytes**, up from 12,938,240 measured at 2.26.0 — about 86 KB
+  across both this release and 2.27.0's removals, which were not measured
+  separately. A quarter of a percent of the rootfs.
+
 ## [2.27.0] — 2026-09-09
 
 ### Changed
