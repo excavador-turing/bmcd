@@ -95,6 +95,75 @@ jobs:
       - name: cargo test (stubbed)
         run: cargo test --workspace --features stubbed --locked
 
+  cross:
+    name: cross-compile for the board
+    runs-on: ubuntu-latest
+
+    # Cost one firmware build round trip on 2026-09-09 (SQU-171). bmcd 2.15.0
+    # multiplied two `statvfs` counts. They are `u64` on x86-64 and **`u32` on
+    # this board's 32-bit ARM**, so every job above was green and the Buildroot
+    # cross-compile failed two hours later -- which was, until this job, the
+    # only thing in the estate that compiled bmcd for the target at all.
+    #
+    # A `check`, not a build: it type-checks against the target's libc and
+    # integer widths, which is the entire class of error this exists to catch.
+    # It does not need to link, and the check itself takes about 20 seconds.
+    #
+    # Verified by reintroducing the 2.15.0 expression on a scratch tree: the
+    # clippy job above stays green while this one fails with
+    #   error[E0308]: expected `u32`, found `u64`
+    # at the comparison. That asymmetry is the whole point of the job.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Ubuntu's main archive carries amd64 only; armhf lives on
+      # ports.ubuntu.com. Without splitting the sources by architecture,
+      # `apt-get update` 404s on every armhf index and the cross libraries
+      # below cannot be found.
+      - name: armhf sysroot
+        run: |
+          set -eu
+          sudo sed -i 's/^Components: main/Architectures: amd64\nComponents: main/' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list.d/armhf.sources >/dev/null <<'SRC'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Architectures: armhf
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SRC
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update -qq
+          # The same three libraries the host job installs, for the target:
+          # libusb (rockusb/rusb), OpenSSL (actix-web) and libudev
+          # (evdev/serialport). Their build scripts resolve through pkg-config
+          # against this sysroot rather than vendoring, which is what keeps the
+          # job at seconds instead of compiling OpenSSL from source.
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-arm-linux-gnueabihf libc6-dev-armhf-cross \
+            libusb-1.0-0-dev:armhf libssl-dev:armhf libudev-dev:armhf
+
+      - name: rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: '1.98.1'
+          target: armv7-unknown-linux-gnueabihf
+          rustflags: ''
+
+      # armv7-unknown-linux-gnueabihf is the triple Buildroot's rust-bin uses
+      # for this board. PKG_CONFIG_ALLOW_CROSS is what lets pkg-config answer
+      # for an architecture that is not the host's; without it the openssl-sys
+      # build script refuses rather than looking in the sysroot.
+      - name: cargo check (armv7)
+        env:
+          PKG_CONFIG_ALLOW_CROSS: '1'
+          PKG_CONFIG_PATH: /usr/lib/arm-linux-gnueabihf/pkgconfig
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: |
+          cargo check --target armv7-unknown-linux-gnueabihf \
+            --workspace --all-targets --locked
+
   cargo-deny:
     name: licences, bans, sources
     runs-on: ubuntu-latest

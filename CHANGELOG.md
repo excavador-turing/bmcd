@@ -10,6 +10,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **CI compiles for the board** (SQU-171). 2.15.0 multiplied two `statvfs`
+  counts, which are `u64` on x86-64 and `u32` on this board's 32-bit ARM. Every
+  CI job was green and the Buildroot cross-compile failed two hours later,
+  because that build was the only thing in the estate that compiled this daemon
+  for the target.
+
+  A new `cross` job runs `cargo check` against
+  `armv7-unknown-linux-gnueabihf` with an armhf sysroot, in about twenty
+  seconds. Verified by reintroducing the 2.15.0 expression on a scratch tree:
+  clippy stays green while the new job fails with `expected u32, found u64` at
+  the comparison. That asymmetry is the whole point.
+
+
 ## [2.19.0] — 2026-09-09
 
 ### Added
