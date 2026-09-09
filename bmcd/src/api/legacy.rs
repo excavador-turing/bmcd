@@ -58,7 +58,7 @@ use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
 use super::get_node_param;
-type Query = web::Query<std::collections::HashMap<String, String>>;
+pub(crate) type Query = web::Query<std::collections::HashMap<String, String>>;
 
 /// version 1:
 ///
@@ -173,12 +173,29 @@ async fn api_entry(
         _ => return LegacyResponse::bad_request("Missing `opt` parameter"),
     };
 
-    let Some(ty) = query.get("type") else {
+    let Some(ty) = query.get("type").cloned() else {
         return LegacyResponse::bad_request("Missing `type` parameter");
     };
 
-    let bmc = bmc.as_ref();
-    match (ty.as_ref(), is_set) {
+    dispatch(bmc.as_ref(), serial, &ty, is_set, query).await
+}
+
+/// Routes one `(type, opt=set)` pair to its handler.
+///
+/// Split out of `api_entry` so it has two callers: the legacy
+/// `?opt=&type=` form above, and the path-per-operation form in
+/// `api::paths`, which maps `GET /api/bmc/thermal` to exactly the arm
+/// `?opt=get&type=thermal` reaches. One table of handlers, two spellings --
+/// the point being that a documented path can never drift from what the
+/// query form does, because there is nothing else it could do.
+pub(crate) async fn dispatch(
+    bmc: &BmcApplication,
+    serial: web::Data<SerialConnections>,
+    ty: &str,
+    is_set: bool,
+    query: Query,
+) -> LegacyResponse {
+    match (ty, is_set) {
         ("usb_boot", true) => usb_boot(bmc, query).await.into(),
         ("clear_usb_boot", true) => clear_usb_boot(bmc).into(),
         ("firmware_slots", false) => get_firmware_slot_info().await.into(),

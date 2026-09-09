@@ -23,6 +23,7 @@ mod streaming_data_service;
 mod usb_boot;
 mod utils;
 
+use crate::api::paths;
 use crate::config::Config;
 use crate::serial_service::{serial::SerialConnections, serial_config};
 use crate::{
@@ -125,8 +126,12 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(streaming_data_service.clone())
                         .app_data(serial_service.clone())
                         .configure(serial_config)
-                        // Legacy API
-                        .configure(legacy::config),
+                        // Legacy API: `GET /api/bmc?opt=&type=`
+                        .configure(legacy::config)
+                        // The same operations, one path each, for clients
+                        // that read the specification. Same authenticator,
+                        // same app data, same dispatcher.
+                        .configure(paths::config),
                 )
                 // Prometheus scrape endpoint. Wrapped in the same authenticator
                 // as `/api/bmc`, deliberately: it reports the board's firmware

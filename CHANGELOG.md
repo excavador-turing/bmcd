@@ -10,6 +10,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.16.0] — 2026-09-09
+
+### Added
+
+- **One path per operation** (SQU-149, step 1). `GET /api/bmc/thermal`,
+  `POST /api/bmc/hostname`, and thirty-three more, each reaching **the same
+  arm of the same dispatcher** as its `?opt=&type=` form — there is no second
+  implementation to drift. The legacy form stays exactly as it is; it is what
+  upstream's `tpi`, this fork's `tpi`, the web interface and a decade of
+  scripts speak.
+
+  What differs, and only on the new paths: a success answers with the bare
+  result rather than `{"response":[{"result":…}]}`; a refusal answers with
+  `application/problem+json` (RFC 9457) carrying the same message the legacy
+  form puts in `result`; mutations are `POST` and take parameters as a form or
+  a JSON body as well as in the query string, with the query string winning on
+  a clash. `POST /firmware/sources` and `POST /config` accept the document
+  itself as the JSON body — the shape a person would write — rather than only
+  the escaped-string-in-a-parameter shape the legacy form needs.
+
+- **`GET /api/bmc/openapi.json`**, OpenAPI 3.1, built from the same table that
+  registers the routes, so an operation cannot be documented without existing
+  or exist without being documented. This release describes every operation's
+  path, method, summary, the parameters that are known, and the error shape.
+  **Response bodies are still `{}`**: typing them from the serde types the
+  handlers return is the next step, and an untyped-but-honest response is
+  better than a typed one guessed from memory — the day before this was
+  written, a client shipped three formatters against shapes this daemon has
+  never sent.
+
+### Changed
+
+- `api_entry`'s dispatch is a function of its own, with two callers.
+
 ## [2.15.1] — 2026-09-09
 
 ### Fixed
@@ -293,7 +327,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.15.1...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.16.0...hive
+[2.16.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.16.0
 [2.15.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.1
 [2.15.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.0
 [2.14.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.14.0

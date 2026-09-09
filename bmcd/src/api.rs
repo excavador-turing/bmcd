@@ -14,6 +14,8 @@
 pub mod into_legacy_response;
 pub mod legacy;
 pub mod metrics;
+pub mod openapi;
+pub mod paths;
 use self::into_legacy_response::{LegacyResponse, LegacyResult};
 use crate::hal::NodeId;
 use actix_web::web;
