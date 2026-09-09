@@ -14,6 +14,7 @@
 mod event_listener;
 mod io;
 
+use crate::usb_boot::topology::UsbPortPath;
 use anyhow::bail;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ pub use event_listener::*;
 pub use io::*;
 use std::{path::PathBuf, process::Output};
 use tokio::io::AsyncBufReadExt;
+use tracing::warn;
 
 pub fn string_from_utf16(bytes: &[u8], little_endian: bool) -> String {
     // as_chunks yields &[u8; 2], so the pair IS the array: the fallible
@@ -66,12 +68,29 @@ pub fn string_from_utf32(bytes: &[u8], little_endian: bool) -> String {
         .collect()
 }
 
-pub async fn get_device_path(allowed_vendors: &[&str]) -> anyhow::Result<PathBuf> {
+/// The block device a compute module presents over USB.
+///
+/// `expected_port` is where that module is wired, on a board whose device tree
+/// describes a fanout hub. With four modules behind one hub, several can be
+/// mass storage at the same time, and the old rule -- exactly one Rockchip
+/// device on the whole board, or refuse -- turned a routine two-module bench
+/// into "Several supported devices found". Filtering by port makes the
+/// ambiguity disappear rather than reporting it.
+///
+/// `None` means no hub is described (v2.4, one node visible at a time), and
+/// the old rule is kept: one match, or say so.
+pub async fn get_device_path(
+    allowed_vendors: &[&str],
+    expected_port: Option<&UsbPortPath>,
+) -> anyhow::Result<PathBuf> {
     let mut contents = tokio::fs::read_dir("/sys/block/").await.map_err(|err| {
         std::io::Error::new(err.kind(), format!("Failed to list devices: {}", err))
     })?;
 
     let mut matching_devices = vec![];
+    // Devices of the right vendor sitting on some other module's port. Named
+    // in the error, because "several found" was never the useful half.
+    let mut wrong_port = vec![];
 
     while let Some(entry) = contents.next_entry().await.map_err(|err| {
         std::io::Error::new(
@@ -88,21 +107,47 @@ pub async fn get_device_path(allowed_vendors: &[&str]) -> anyhow::Result<PathBuf
         };
         let vendor = vendor.trim();
 
-        for allowed_vendor in allowed_vendors {
-            if vendor == *allowed_vendor {
-                matching_devices.push(file_name.clone());
+        if !allowed_vendors.contains(&vendor) {
+            continue;
+        }
+
+        // Which port this block device hangs off. The canonical path of
+        // /sys/block/<dev> runs through every hub between the controller and
+        // the module, so the port's own directory is a component of it.
+        match expected_port {
+            None => matching_devices.push(file_name.clone()),
+            Some(port) => {
+                let link = tokio::fs::canonicalize(format!("/sys/block/{}", file_name)).await;
+                match link {
+                    Ok(path) if port.contains(&path) => matching_devices.push(file_name.clone()),
+                    Ok(_) => wrong_port.push(file_name.clone()),
+                    Err(e) => {
+                        warn!("cannot resolve /sys/block/{}: {}", file_name, e);
+                    }
+                }
             }
         }
     }
 
-    let name = match &matching_devices[..] {
-        [] => {
-            bail!("No supported USB devices found");
-        }
-        [device] => device.clone(),
-        _ => {
-            bail!("Several supported devices found");
-        }
+    let name = match (&matching_devices[..], expected_port) {
+        ([device], _) => device.clone(),
+        ([], Some(port)) if !wrong_port.is_empty() => bail!(
+            "no storage on {}; {} of the same kind {} on another port",
+            port,
+            wrong_port.join(", "),
+            if wrong_port.len() == 1 { "is" } else { "are" }
+        ),
+        ([], Some(port)) => bail!("no storage on {}", port),
+        ([], None) => bail!("No supported USB devices found"),
+        // Two devices on one hub port is a hub we do not know about, not a
+        // choice to make silently.
+        (several, Some(port)) => bail!(
+            "{} storage devices on {}: {}",
+            several.len(),
+            port,
+            several.join(", ")
+        ),
+        (_, None) => bail!("Several supported devices found"),
     };
 
     Ok(tokio::fs::canonicalize(format!("/dev/{}", name)).await?)

@@ -13,7 +13,7 @@ use crate::utils::get_device_path;
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use super::{UsbBoot, UsbBootError};
+use super::{topology::UsbPortPath, UsbBoot, UsbBootError};
 use async_trait::async_trait;
 use rockfile::boot::{
     RkBootEntry, RkBootEntryBytes, RkBootHeader, RkBootHeaderBytes, RkBootHeaderEntry,
@@ -37,6 +37,7 @@ impl UsbBoot for RockusbBoot {
     async fn load_as_block_device(
         &self,
         device: &rusb::Device<GlobalContext>,
+        port: Option<&UsbPortPath>,
     ) -> Result<std::path::PathBuf, UsbBootError> {
         if BootMode::Maskrom == device.device_descriptor()?.into() {
             info!("Maskrom mode detected. loading usb-plug..");
@@ -45,7 +46,7 @@ impl UsbBoot for RockusbBoot {
             download_boot(&mut transport).await?;
         }
 
-        get_device_path(&["Rockchip"])
+        get_device_path(&["Rockchip"], port)
             .await
             .map_err(UsbBootError::internal_error)
     }

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::UsbBoot;
-use crate::{usb_boot::UsbBootError, utils::get_device_path};
+use crate::{
+    usb_boot::{topology::UsbPortPath, UsbBootError},
+    utils::get_device_path,
+};
 use async_trait::async_trait;
 use std::{fmt::Display, time::Duration};
 use tokio::time::sleep;
@@ -30,10 +33,11 @@ impl UsbBoot for RpiBoot {
     async fn load_as_block_device(
         &self,
         _device: &rusb::Device<rusb::GlobalContext>,
+        port: Option<&UsbPortPath>,
     ) -> Result<std::path::PathBuf, UsbBootError> {
         load_rpi_boot().await?;
         tracing::info!("Checking for presence of a device file ('RPi-MSD-.*')...");
-        get_device_path(&["RPi-MSD-"])
+        get_device_path(&["RPi-MSD-"], port)
             .await
             .map_err(UsbBootError::internal_error)
     }

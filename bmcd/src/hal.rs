@@ -71,6 +71,15 @@ impl TryFrom<i32> for NodeId {
 }
 
 impl NodeId {
+    /// The node's number as a person says it: 1 through 4.
+    ///
+    /// The enum is zero-based because it indexes bitfields; every message and
+    /// every device-tree lookup counts from one, and converting at each site
+    /// is how an off-by-one gets in.
+    pub fn number(self) -> u8 {
+        self as u8 + 1
+    }
+
     pub fn to_bitfield(self) -> u8 {
         1 << self as u8
     }

@@ -8,6 +8,42 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.22.0] — 2026-09-09
+
+### Fixed
+
+- **A flash now targets the module that was asked for** (SQU-105). On a v2.5
+  board all four modules sit behind one GL850 hub, so every module in maskrom
+  enumerates at once — and `find_first` returned whichever answered first,
+  ignoring the requested node. Its comment still said "only one node can be
+  visible at any given time", which was true of v2.4's single mux. The result
+  was a flash of node 2 that wrote node 1 and reported success, or
+  "Several supported devices found" on a routine two-module bench.
+
+  A device is now accepted only on the hub port that node is wired to. A
+  device on any other port is refused, naming both: *"node 3 requested on
+  1-1.3; found Rockusb on 1-1.1 instead"*. The whole failure mode was a
+  success message, so the replacement had to be an error that says what it
+  found.
+
+  The same rule applies to the mass-storage side: `get_device_path` used to
+  demand exactly one Rockchip block device on the entire board and give up
+  otherwise. It now filters by port, so two modules in maskrom stop being an
+  ambiguity to report and become two ports to tell apart.
+
+- **The node-to-port mapping is read from the device tree, not assumed.** The
+  v2.5 DTS declares `hub@1` with `node1@1` through `node4@4`, and the kernel
+  publishes all of it under `/proc/device-tree`. Node N is port N on this
+  board; hard-coding that would have been correct and would still have been a
+  guess, and a wrong guess here writes the wrong module — which is the harm
+  being fixed. A unit test builds a tree wired in the opposite order and
+  requires the opposite answer.
+
+  A board that describes no such hub — v2.4, one node visible at a time —
+  yields no topology, and the first-match behaviour is kept unchanged. The
+  device tree is therefore also the board-revision test, which is better than
+  a revision string because it is the fact the kernel itself is acting on.
+
 ## [2.21.0] — 2026-09-09
 
 ### Added
