@@ -52,6 +52,7 @@ use openssl::{
 use std::{
     fs::OpenOptions,
     io::Read,
+    os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -236,10 +237,113 @@ fn init_logger(log_config: &Log) -> WorkerGuard {
     );
 
     let layers = full_layer.and_then(stdout_layer).with_filter(filter);
-    tracing_subscriber::registry().with(layers).init();
+
+    // The audit target goes to the system log as well as to the rotating
+    // file. Both `/tmp` and `/var/log` are tmpfs on this board, so a line that
+    // only reaches the file is gone at the next boot -- and a reboot is
+    // exactly the event you would be trying to account for. Whether syslogd
+    // then forwards anywhere is /etc/default/syslogd's business, not this
+    // daemon's.
+    let audit_layer = SyslogSink::open().map(|sink| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(sink)
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.target() == "audit"
+            }))
+    });
+
+    tracing_subscriber::registry()
+        .with(layers)
+        .with(audit_layer)
+        .init();
 
     tracing::info!("Turing Pi 2 BMC Daemon v{}", env!("CARGO_PKG_VERSION"));
     guard
+}
+
+/// Writes each formatted line to the system log as one datagram.
+///
+/// BusyBox `syslogd` listens on `/dev/log`, so this is all it takes to put a
+/// line somewhere that outlives the process and can be forwarded off the
+/// board. No syslog crate: the wire format for a local datagram is a priority
+/// in angle brackets and then the text, and pulling a dependency in to write
+/// eight bytes would be the larger change.
+#[derive(Clone)]
+struct SyslogSink {
+    socket: Arc<UnixDatagram>,
+}
+
+impl SyslogSink {
+    /// `None` when there is no system log to write to -- a workstation
+    /// running the tests, or a board whose syslogd has not started. The audit
+    /// line still reaches the rotating file in that case; this is the second
+    /// copy, not the only one.
+    fn open() -> Option<Self> {
+        let socket = UnixDatagram::unbound().ok()?;
+        match socket.connect("/dev/log") {
+            Ok(()) => Some(SyslogSink {
+                socket: Arc::new(socket),
+            }),
+            Err(e) => {
+                eprintln!("no system log for audit lines: {e}");
+                None
+            }
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyslogSink {
+    type Writer = SyslogLine;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SyslogLine {
+            socket: self.socket.clone(),
+            line: Vec::new(),
+        }
+    }
+}
+
+/// One event, accumulated and sent when the formatter is done with it.
+struct SyslogLine {
+    socket: Arc<UnixDatagram>,
+    line: Vec<u8>,
+}
+
+impl std::io::Write for SyslogLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.line.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.line.is_empty() {
+            return Ok(());
+        }
+
+        // authpriv.info: facility 10, severity 6. An audit trail is what
+        // authpriv is for, and a reader filtering their collector by facility
+        // should find these where they expect them.
+        let mut datagram = format!("<86>bmcd[{}]: ", std::process::id()).into_bytes();
+        datagram.extend_from_slice(self.line.trim_ascii_end());
+        self.line.clear();
+
+        // A full or absent socket must never take the daemon down, and must
+        // never turn into a log line of its own -- that is how a logging path
+        // becomes the outage.
+        let _ = self.socket.send(&datagram);
+        Ok(())
+    }
+}
+
+impl Drop for SyslogLine {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = self.flush();
+    }
 }
 
 fn config_path() -> PathBuf {

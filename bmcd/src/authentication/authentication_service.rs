@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::{
-    authentication_context::AuthenticationContext,
+    authentication_context::{Actor, AuthenticationContext},
     authentication_errors::{AuthenticationError, SchemedAuthError},
     passwd_validator::UnixValidator,
     websocket_subprotocol::{bearer_token, is_websocket_handshake},
@@ -21,7 +21,7 @@ use actix_web::{
     body::{EitherBody, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse},
     http::header::{self},
-    Error, HttpRequest, HttpResponse,
+    Error, HttpMessage, HttpRequest, HttpResponse,
 };
 use futures::future::LocalBoxFuture;
 use futures::StreamExt;
@@ -78,6 +78,10 @@ where
             .peer_addr
             .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
         {
+            // Recorded, not merely allowed. Every mutating call reads this
+            // back to say how it was authorised, and "it wasn't" is the
+            // answer worth being able to search for.
+            request.extensions_mut().insert(Actor::Loopback);
             return Box::pin(async move {
                 service
                     .call(request)
@@ -108,16 +112,18 @@ where
                 Err(e) => Err(e.into_basic_error()),
             };
 
-            if let Err(e) = authorized {
-                match e.retry_after() {
+            match authorized {
+                Err(e) => match e.retry_after() {
                     Some(seconds) => too_many_requests_response(request.request(), seconds, e),
                     None => unauthorized_response(request.request(), e, realm),
+                },
+                Ok(actor) => {
+                    request.extensions_mut().insert(actor);
+                    service
+                        .call(request)
+                        .await
+                        .map(ServiceResponse::map_into_left_body)
                 }
-            } else {
-                service
-                    .call(request)
-                    .await
-                    .map(ServiceResponse::map_into_left_body)
             }
         })
     }

@@ -185,7 +185,15 @@ async fn handle(
     }
 
     let is_set = alias.method == Method::Post;
-    let response = dispatch(bmc.as_ref(), serial, alias.ty, is_set, web::Query(params)).await;
+    let response = dispatch(
+        bmc.as_ref(),
+        serial,
+        alias.ty,
+        is_set,
+        web::Query(params),
+        req,
+    )
+    .await;
     unwrap(response)
 }
 

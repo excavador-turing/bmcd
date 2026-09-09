@@ -8,6 +8,44 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.23.0] — 2026-09-09
+
+### Added
+
+- **One audit line per mutating API call** (SQU-108). Until now a `power off`
+  from the web interface, from `tpi` on the board and from a token over the
+  network all looked the same in the log, because none of them was recorded
+  with an identity. Each now writes a line on an `audit` target naming the
+  action, the node, the caller, their address and the outcome.
+
+  Written around the dispatcher rather than in each handler, for the same
+  reason the dispatcher exists: there is one table of operations and two
+  spellings of it, so an endpoint added later cannot quietly miss the line.
+  Reads are not logged — they are most of the traffic and none of the risk.
+
+- **The loopback bypass is named in that line.** `/api/bmc` skips
+  authentication entirely for requests from the board itself; the line for one
+  says `loopback (unauthenticated)` rather than folding it in with a real
+  credential. It is the entry somebody reading an audit trail would most want
+  to be able to find, and it is the fault this fork already documents.
+
+- **Audit lines go to the system log as well as the rotating file.** Both
+  `/tmp` and `/var/log` are tmpfs on this board, so a line that reaches only
+  the file is gone at the next boot — which is exactly the event one would be
+  trying to account for. They are sent to `/dev/log` as `authpriv.info`; a
+  board with no syslogd keeps the file copy and says so once on startup.
+
+  Verified against the board's own BusyBox syslogd, which renders the datagram
+  as `Sep  9 14:57:06 hive-bmc authpriv.info bmcd[4242]: …`.
+
+### Changed
+
+- **A bearer token now remembers who it was issued to.** The token store held
+  only a last-access time, so a request authenticated by a token could not
+  name its user — every audit line for every logged-in operator would have
+  read the same. A unit test requires the username to come back from
+  authorisation rather than merely `Ok`.
+
 ## [2.22.0] — 2026-09-09
 
 ### Fixed

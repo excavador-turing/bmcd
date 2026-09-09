@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "bmcd"
-version = "2.22.0"
+version = "2.23.0"
 dependencies = [
  "actix",
  "actix-files",

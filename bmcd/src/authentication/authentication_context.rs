@@ -30,7 +30,13 @@ pub struct AuthenticationContext<P>
 where
     P: PasswordValidator + 'static,
 {
-    token_store: HashMap<String, Instant>,
+    /// Token to the user it was issued for, and when it was last used.
+    ///
+    /// The username is carried so that a request authenticated by a bearer
+    /// token can still say who is acting. Without it every audit line for
+    /// every logged-in operator reads the same, which is the gap this store
+    /// existed on the wrong side of.
+    token_store: HashMap<String, (String, Instant)>,
     passwds: HashMap<String, String>,
     password_validator: PhantomData<P>,
     expire_timeout: Duration,
@@ -66,23 +72,23 @@ where
     /// request. This imposes a small penalty on each request. Its deemed not
     /// significant enough to justify optimization given the expected volume
     /// of incoming authentication requests.
-    async fn new_and_remove_expired_tokens(&mut self, key: String) {
-        self.token_store.retain(|_, last_access| {
+    async fn new_and_remove_expired_tokens(&mut self, key: String, username: String) {
+        self.token_store.retain(|_, (_, last_access)| {
             let duration = Instant::now().saturating_duration_since(*last_access);
             duration <= self.expire_timeout
         });
 
-        self.token_store.insert(key, Instant::now());
+        self.token_store.insert(key, (username, Instant::now()));
     }
 
     async fn authorize_bearer(
         &mut self,
         peer: &str,
         token: &str,
-    ) -> Result<(), AuthenticationError> {
+    ) -> Result<String, AuthenticationError> {
         self.ban_patrol.patrole_ban(peer)?;
 
-        let Some(last_access) = self.token_store.get_mut(token) else {
+        let Some((username, last_access)) = self.token_store.get_mut(token) else {
             return Err(self
                 .ban_patrol
                 .penalize(peer)
@@ -93,9 +99,10 @@ where
         let instant = *last_access;
         let duration = Instant::now().saturating_duration_since(instant);
         if duration < self.expire_timeout {
+            let username = username.clone();
             *last_access = Instant::now();
             self.ban_patrol.clear_penalties(peer);
-            return Ok(());
+            return Ok(username);
         }
 
         self.token_store.remove(token);
@@ -134,7 +141,7 @@ where
         &mut self,
         peer: &str,
         credentials: &str,
-    ) -> Result<(), AuthenticationError> {
+    ) -> Result<String, AuthenticationError> {
         let decoded = general_purpose::STANDARD.decode(credentials)?;
         let utf8 = std::str::from_utf8(&decoded)?;
         let Some((user, pass)) = utf8.split_once(':') else {
@@ -143,22 +150,35 @@ where
             ));
         };
 
-        self.validate_credentials(peer, user, pass)
+        self.validate_credentials(peer, user, pass)?;
+        Ok(user.to_string())
     }
 
+    /// Authorise a request and say who it is.
+    ///
+    /// The username comes back rather than being discarded, because an audit
+    /// line that cannot name the operator is a log line.
     pub async fn authorize_request(
         &mut self,
         peer: &str,
         http_authorization_line: &str,
-    ) -> Result<(), SchemedAuthError> {
+    ) -> Result<Actor, SchemedAuthError> {
         match http_authorization_line.split_once(' ') {
             Some(("Bearer", token)) => self
                 .authorize_bearer(peer, token)
                 .await
+                .map(|name| Actor::User {
+                    name,
+                    scheme: "bearer",
+                })
                 .map_err(AuthenticationError::into_bearer_error),
             Some(("Basic", credentials)) => self
                 .authorize_basic(peer, credentials)
                 .await
+                .map(|name| Actor::User {
+                    name,
+                    scheme: "basic",
+                })
                 .map_err(AuthenticationError::into_basic_error),
             Some((auth, _)) => {
                 Err(AuthenticationError::SchemeNotSupported(auth.to_string()).into_unknown_error())
@@ -184,7 +204,8 @@ where
             .take(64)
             .map(char::from)
             .collect();
-        self.new_and_remove_expired_tokens(token.clone()).await;
+        self.new_and_remove_expired_tokens(token.clone(), credentials.username.clone())
+            .await;
 
         Ok(Session {
             id: token, // according Redfish spec, id refers to the session id.
@@ -194,6 +215,29 @@ where
             description: "User Session".to_string(),
             username: credentials.username,
         })
+    }
+}
+
+/// Who a request is, for the audit line.
+///
+/// `Loopback` is named rather than folded into "authenticated", because it is
+/// the bypass: `/api/bmc` skips authentication entirely for requests from the
+/// board itself, which is how the on-board `tpi` works without credentials and
+/// how the promotion gate reads its metrics token. An audit trail that cannot
+/// tell that apart from a real credential is not an audit trail — and this is
+/// the line somebody reading one would most want to find.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Actor {
+    Loopback,
+    User { name: String, scheme: &'static str },
+}
+
+impl std::fmt::Display for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Actor::Loopback => write!(f, "loopback (unauthenticated)"),
+            Actor::User { name, scheme } => write!(f, "{} ({})", name, scheme),
+        }
     }
 }
 
@@ -216,10 +260,18 @@ pub mod tests {
     use super::*;
     use std::ops::Sub;
 
+    /// Every token in a test context belongs to this user, so a test can
+    /// assert that authorising by token still names who is acting.
+    pub const TEST_TOKEN_OWNER: &str = "token_owner";
+
     pub fn build_test_context(
         token_data: impl IntoIterator<Item = (String, Instant)>,
         user_data: impl IntoIterator<Item = (String, String)>,
     ) -> AuthenticationContext<UnixValidator> {
+        let token_data = token_data
+            .into_iter()
+            .map(|(token, seen)| (token, (TEST_TOKEN_OWNER.to_string(), seen)));
+
         AuthenticationContext {
             token_store: HashMap::from_iter(token_data),
             passwds: HashMap::from_iter(user_data),
@@ -277,8 +329,14 @@ pub mod tests {
             ],
             Vec::new(),
         );
+        // Not merely `Ok`: a bearer token has to come back naming its user,
+        // or every audit line written for a logged-in operator reads the same
+        // and the trail cannot answer who did it.
         assert_eq!(
-            Ok(()),
+            Ok(Actor::User {
+                name: TEST_TOKEN_OWNER.to_string(),
+                scheme: "bearer",
+            }),
             context.authorize_request("peer1", "Bearer 123").await
         );
     }

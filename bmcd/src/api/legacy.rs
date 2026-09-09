@@ -29,6 +29,7 @@ use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
 use crate::app::transfer_action::UpgradeCommand;
 use crate::app::update_check;
+use crate::authentication::authentication_context::Actor;
 use crate::hal::{NodeId, UsbMode, UsbRoute};
 use crate::serial_service::serial::SerialConnections;
 use crate::serial_service::{legacy_serial_get_handler, legacy_serial_set_handler};
@@ -38,7 +39,7 @@ use actix_files::file_extension_to_mime;
 use actix_multipart::Multipart;
 use actix_web::guard::{fn_guard, GuardContext};
 use actix_web::http::{header, StatusCode};
-use actix_web::{get, post, web, HttpResponse, Responder};
+use actix_web::{get, post, web, HttpMessage, HttpRequest, HttpResponse, Responder};
 use anyhow::Context;
 use async_compression::tokio::bufread::GzipEncoder;
 use async_compression::Level;
@@ -163,6 +164,7 @@ async fn backup_handler() -> impl Responder {
 }
 
 async fn api_entry(
+    request: HttpRequest,
     bmc: web::Data<BmcApplication>,
     serial: web::Data<SerialConnections>,
     query: Query,
@@ -177,7 +179,7 @@ async fn api_entry(
         return LegacyResponse::bad_request("Missing `type` parameter");
     };
 
-    dispatch(bmc.as_ref(), serial, &ty, is_set, query).await
+    dispatch(bmc.as_ref(), serial, &ty, is_set, query, &request).await
 }
 
 /// Routes one `(type, opt=set)` pair to its handler.
@@ -189,6 +191,71 @@ async fn api_entry(
 /// the point being that a documented path can never drift from what the
 /// query form does, because there is nothing else it could do.
 pub(crate) async fn dispatch(
+    bmc: &BmcApplication,
+    serial: web::Data<SerialConnections>,
+    ty: &str,
+    is_set: bool,
+    query: Query,
+    request: &HttpRequest,
+) -> LegacyResponse {
+    let response = dispatch_inner(bmc, serial, ty, is_set, query.clone()).await;
+
+    if is_set {
+        audit(ty, &query, request, &response);
+    }
+
+    response
+}
+
+/// One line per mutating call, on its own `audit` target.
+///
+/// Placed around the dispatcher rather than inside each handler for the same
+/// reason the dispatcher exists at all: there is one table of operations and
+/// two spellings of it, so an audit line written here cannot be missing from
+/// an endpoint somebody adds later. Reads are not logged — they are the
+/// majority of the traffic and none of the risk.
+///
+/// The failure to fix is that a `power off` from the interface, from `tpi` on
+/// the board and from a token over the network all looked the same. So the
+/// line says which of those it was, and names the loopback bypass explicitly
+/// when that is the answer.
+fn audit(ty: &str, query: &Query, request: &HttpRequest, response: &LegacyResponse) {
+    let actor = request
+        .extensions()
+        .get::<Actor>()
+        .cloned()
+        // No actor recorded means the request never passed the authentication
+        // middleware. That should not happen, and saying so is better than
+        // quietly attributing it to nobody.
+        .map_or_else(|| "unattributed".to_string(), |actor| actor.to_string());
+
+    let peer = request
+        .connection_info()
+        .peer_addr()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let outcome = match response {
+        LegacyResponse::Error(status, message) => format!("{} {}", status.as_u16(), message),
+        _ => "ok".to_string(),
+    };
+
+    tracing::info!(
+        target: "audit",
+        action = ty,
+        node = query.get("node").map(String::as_str).unwrap_or("-"),
+        actor = actor,
+        peer = peer,
+        outcome = outcome,
+        "{} by {} from {}: {}",
+        ty,
+        actor,
+        peer,
+        outcome
+    );
+}
+
+async fn dispatch_inner(
     bmc: &BmcApplication,
     serial: web::Data<SerialConnections>,
     ty: &str,
