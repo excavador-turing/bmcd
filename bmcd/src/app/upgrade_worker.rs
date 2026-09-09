@@ -216,7 +216,7 @@ impl UpgradeWorker {
         // update rather than here.
         if !is_mount_point(std::path::Path::new(PARK_MOUNT)) {
             bail!(
-                "{PARK_MOUNT} is not mounted, so there is no card to park an image on.                  Insert one, or upload without parking to install straight away."
+                "{PARK_MOUNT} is not mounted, so there is no card to park an image on. Insert one, or upload without parking to install straight away."
             );
         }
         match statvfs(std::path::Path::new(PARK_MOUNT)) {

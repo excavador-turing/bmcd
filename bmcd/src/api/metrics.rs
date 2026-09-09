@@ -684,7 +684,7 @@ fn render_firmware(out: &mut String, firmware: &FirmwareSlots) {
             out,
             "bmcd_firmware_promotion_total",
             "counter",
-            "Boots that ran the firmware health gate, by what the gate decided.              `promoted` is derived as attempts minus rollbacks, because the gate has              no single line meaning `kept`; a board cut off mid-gate therefore counts              as promoted.",
+            "Boots that ran the firmware health gate, by what the gate decided. `promoted` is derived as attempts minus rollbacks, because the gate has no single line meaning `kept`; a board cut off mid-gate therefore counts as promoted.",
             &[
                 Sample::new(
                     labels(&[("result", "promoted")]),
@@ -838,7 +838,7 @@ mod authorization_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::firmware_info::Slot;
+    use crate::app::firmware_info::{Promotion, PromotionHistory, Slot};
     use crate::app::health_info::{Clock, Load, Memory, Nand, Rtc};
 
     fn port(name: &str, kind: PortKind, up: bool) -> SwitchPort {
@@ -1362,5 +1362,52 @@ mod tests {
         assert_eq!(millidegrees_to_degrees(52539), 52.5);
         assert_eq!(millidegrees_to_degrees(52999), 53.0);
         assert_eq!(millidegrees_to_degrees(0), 0.0);
+    }
+
+    /// A `# HELP` line is published to every scraper and shown in dashboard
+    /// tooltips, so it is prose with an audience.
+    ///
+    /// Wrapping one across source lines and letting rustfmt join it produces a
+    /// literal run of indentation in the middle of the sentence. Nothing
+    /// complains: it compiles, it renders, and the exposition is still valid.
+    /// It shipped that way in `bmcd_firmware_promotion_total` and was found by
+    /// reading the file rather than by any test.
+    #[test]
+    fn help_text_is_a_sentence_not_a_reflowed_source_line() {
+        // Both standing fixtures leave `promotion_history` at None, so a
+        // render of either omits the family whose HELP text was the defect
+        // this test was written for. Written against `a_healthy_board()`
+        // alone, it passed with the defect present -- green, and covering
+        // nothing. Fill the optional fields in.
+        let mut snapshot = a_healthy_board();
+        snapshot.firmware.promotion_history = Some(PromotionHistory {
+            attempts: 15,
+            rolled_back: 1,
+            promoted: 14,
+        });
+        snapshot.firmware.last_promotion = Some(Promotion {
+            timestamp: "23:29:57".to_string(),
+            message: "promoted".to_string(),
+        });
+
+        let rendered = render(&snapshot);
+
+        // Guard the guard: if a future change stops this family rendering,
+        // the loop below would go quiet rather than fail.
+        assert!(
+            rendered.contains("# HELP bmcd_firmware_promotion_total"),
+            "the fixture no longer renders the family this test exists for"
+        );
+
+        let offenders: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("# HELP"))
+            .filter(|l| l.contains("  "))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "HELP text carries collapsed source indentation:\n{}",
+            offenders.join("\n")
+        );
     }
 }

@@ -25,6 +25,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the comparison. That asymmetry is the whole point.
 
 
+## [2.19.1] — 2026-09-09
+
+### Fixed
+
+- **Two strings had source indentation in the middle of a sentence.** A literal
+  wrapped across source lines and joined by rustfmt keeps the leading spaces of
+  the continuation. Nothing complains: it compiles, it renders, and the
+  exposition stays valid Prometheus.
+
+  One was the `# HELP` text of `bmcd_firmware_promotion_total`, which is
+  published to every scraper and shown in dashboard tooltips. The other was the
+  error shown when parking an image with no SD card mounted.
+
+- **A test that covered nothing.** The guard written for the above passed with
+  the defect still present: both metric fixtures leave `promotion_history` at
+  `None`, so neither renders the family the test was written for. It now fills
+  the optional fields, and asserts the family is in the output before checking
+  it -- so the test cannot go quiet again.
+
 ## [2.19.0] — 2026-09-09
 
 ### Added
