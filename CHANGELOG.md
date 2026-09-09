@@ -8,6 +8,27 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.26.0] — 2026-09-09
+
+### Added
+
+- **`bmcd --openapi` prints the API document and exits** (SQU-149, towards
+  step 4). It needs neither a config file nor a board, which is the point:
+  the docs site has to render this spec, and until now the only place it
+  existed was a running BMC. That is a chicken-and-egg problem for anybody
+  deciding whether to install a release.
+
+- **The release publishes `openapi.json`**, emitted by the binary that
+  implements it and checksummed beside the source tarball. Emitted rather than
+  committed, so it cannot describe a version that is not the one being
+  released.
+
+  The step refuses a document with fewer than twenty paths or five schemas. A
+  generator that quietly fails produces a valid-looking file, and a
+  valid-looking file is what would get published. Checked both ways before
+  shipping: the real run reports `28 paths, 24 schemas` and exits 0; a stubbed
+  empty document exits 1 saying so.
+
 ## [2.25.0] — 2026-09-09
 
 ### Added

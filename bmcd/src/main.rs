@@ -41,7 +41,7 @@ use actix_web::{
 };
 use anyhow::Context;
 use app::{bmc_application::BmcApplication, event_application::run_event_listener};
-use clap::{command, value_parser, Arg};
+use clap::{command, value_parser, Arg, ArgAction};
 use config::Log;
 use futures::future::join_all;
 use openssl::{
@@ -64,7 +64,25 @@ const HTTP_PORT: u16 = 80;
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::load(&config_path()).context("Error parsing config file")?;
+    let arguments = arguments();
+
+    // Printing the API document needs neither a config file nor a board, and
+    // that is the point: the docs site has to render this spec, and the only
+    // other place it exists is a running BMC. Handled before anything is
+    // loaded so it works on a build machine.
+    if arguments.get_flag("openapi") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&api::openapi::document())?
+        );
+        return Ok(());
+    }
+
+    let config_path: PathBuf = arguments
+        .get_one::<PathBuf>("config")
+        .expect("`config` is required unless `--openapi` was given")
+        .into();
+    let config = Config::load(&config_path).context("Error parsing config file")?;
     let _logger_lifetime = init_logger(&config.log);
 
     let tls = load_tls_config(&config.tls)?;
@@ -346,18 +364,23 @@ impl Drop for SyslogLine {
     }
 }
 
-fn config_path() -> PathBuf {
+/// `--config` is required to run the daemon. `--openapi` prints the API
+/// document and exits, so it is required-unless rather than required.
+fn arguments() -> clap::ArgMatches {
     command!()
         .arg(
             Arg::new("config")
                 .long("config")
                 .value_parser(value_parser!(PathBuf))
-                .required(true),
+                .required_unless_present("openapi"),
+        )
+        .arg(
+            Arg::new("openapi")
+                .long("openapi")
+                .action(ArgAction::SetTrue)
+                .help("Print this daemon's OpenAPI 3.1 document and exit"),
         )
         .get_matches()
-        .get_one::<PathBuf>("config")
-        .expect("`config` argument required")
-        .into()
 }
 
 fn load_keys_from_pem<P: AsRef<Path>>(

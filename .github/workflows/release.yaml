@@ -86,6 +86,30 @@ jobs:
             | gzip -9 -n > "artifacts/bmcd-${GITHUB_REF_NAME}.tar.gz"
           tar -tzf "artifacts/bmcd-${GITHUB_REF_NAME}.tar.gz" | head -5
 
+      # The API document, emitted by the daemon that implements it.
+      #
+      # Published because the docs site has to render this spec and the only
+      # other place it exists is a running BMC -- which is a chicken-and-egg
+      # problem for anyone deciding whether to install this release. Emitted
+      # rather than committed, so it cannot describe a version that is not
+      # this one.
+      - name: stage the API document
+        run: |
+          set -eu
+          cargo run --locked --quiet -- --openapi > artifacts/openapi.json
+          # A document with no paths is what a silently-failing generator
+          # produces, and it would publish as a valid-looking file.
+          python3 - <<'PY'
+          import json, sys
+          doc = json.load(open("artifacts/openapi.json"))
+          paths = len(doc.get("paths", {}))
+          schemas = len(doc.get("components", {}).get("schemas", {}))
+          print(f"openapi {doc['openapi']} version {doc['info']['version']}: "
+                f"{paths} paths, {schemas} schemas")
+          if paths < 20 or schemas < 5:
+              sys.exit("the emitted document is too small to be the real one")
+          PY
+
       # SHA256SUMS lists BARE BASENAMES, and the guard below fails the release
       # if one ever does not. `sha256sum -c` resolves each name relative to the
       # current directory, so a line carrying a path fails to OPEN the file on
@@ -95,7 +119,7 @@ jobs:
         run: |
           set -eu
           cd artifacts
-          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -- *.tar.gz openapi.json > SHA256SUMS
           if grep -q '/' SHA256SUMS; then
             echo "SHA256SUMS contains a path; it must list basenames only" >&2
             exit 1
@@ -125,6 +149,11 @@ jobs:
           body: |
             bmcd built from the `hive` branch of this fork, for the Turing Pi 2
             BMC firmware build to consume.
+
+            `openapi.json` is this daemon's own description of its API,
+            emitted by the binary that implements it, so it describes this
+            release and no other. A board serves the same document at
+            `GET /api/bmc/openapi.json`.
 
             **Not a Turing Pi release.** The firmware pins this repository by
             commit and compiles it inside Buildroot, so no binary is published
