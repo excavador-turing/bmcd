@@ -317,6 +317,13 @@ fn refreshing() -> &'static AtomicBool {
 /// Measured on the board before this change: four sources, 16 s; and asking
 /// for one source cost the same 16 s, because the refresh was never per
 /// source in the first place.
+///
+/// **That 16 s no longer holds.** Timed twice on the board on 2026-09-09, by
+/// watching `checked_at` advance after a forced poll: **74 s and 78 s**. The
+/// slowest source is `firmware.turingpi.com`, and it got slower, not us --
+/// the shape is unchanged. Anything that waits on a poll must be sized
+/// against the larger figure; `tpi` 1.5.1 allows 180 s for exactly this and
+/// has a test pinning that bound to the measurement.
 async fn fan_out() -> Catalog {
     let sources = crate::app::firmware_sources::load().await;
     // The api layer already reads /etc/os-release for this; a second reader
