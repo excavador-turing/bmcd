@@ -17,6 +17,7 @@
 //! reports is what the kernel already knows; nothing here talks to the switch
 //! itself.
 use crate::app::sysfs::{read_attribute, read_attribute_string};
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::Path;
 
@@ -36,7 +37,7 @@ const SWITCH_PORTS: [(&str, PortKind); 6] = [
 ];
 
 /// What sits on the other side of a switch port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PortKind {
     /// Faces a compute module slot.
@@ -49,7 +50,7 @@ pub enum PortKind {
 /// `None` rather than a stand-in value: a port that is down has no speed and
 /// no duplex, and saying `0` there would read as a working port running at
 /// nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SwitchPort {
     /// Interface name, as the kernel spells it.
     pub name: String,

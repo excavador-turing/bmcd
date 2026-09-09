@@ -24,6 +24,7 @@
 //! device tree, and the board carries its own -- so the table is read from
 //! there rather than left for a UI to hardcode. See [`cooling_levels`].
 use crate::app::sysfs::{read_attribute, read_attribute_string};
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +40,7 @@ const THERMAL_CLASS: &str = "class/thermal";
 const PLATFORM_DRIVERS: &str = "bus/platform/drivers";
 
 /// One thermal zone: a sensor the kernel can read a temperature from.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct ThermalSensor {
     /// The zone's `type`, which is the name its driver registered -- ours is
     /// `bmc-thermal`, from the device tree node. Falls back to the directory
@@ -65,7 +66,7 @@ pub struct ThermalSensor {
 }
 
 /// One trip point: a temperature and what crossing it means.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Trip {
     /// The kernel's index for it, which is also its order.
     pub index: u32,
@@ -85,7 +86,7 @@ pub struct Trip {
 /// the fan control in the web UI writes back to. That one renames `pwm-fan`
 /// to the platform node behind it and reports the raw steps as `speed` and
 /// `max_speed`. This one passes the kernel's own names and numbers through.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Cooler {
     /// The device's `type`, as the driver spells it: `pwm-fan`. Falls back to
     /// the directory name.
@@ -112,7 +113,7 @@ pub struct Cooler {
 }
 
 /// Everything `/sys/class/thermal` has to say.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Thermal {
     pub sensors: Vec<ThermalSensor>,
     pub cooling: Vec<Cooler>,

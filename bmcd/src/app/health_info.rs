@@ -19,6 +19,7 @@
 //! about the board's peripherals. Nothing is about the board that runs the
 //! daemon, which has 116 MB of RAM, a NAND with a countable number of spare
 //! eraseblocks, and no battery on one of its two clocks.
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
@@ -37,7 +38,7 @@ const CHRONYC: &str = "chronyc";
 const NOT_SYNCHRONISED: &str = "Not synchronised";
 
 /// The one-, five- and fifteen-minute load averages.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Load {
     /// Whether `/proc/loadavg` could be read.
     pub present: bool,
@@ -51,7 +52,7 @@ pub struct Load {
 /// This is not an academic number on this board. It has 116 MB in total, and
 /// a firmware image being uploaded into `/tmp` is competing with the daemon
 /// for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Memory {
     /// Whether `/proc/meminfo` could be read.
     pub present: bool,
@@ -83,7 +84,7 @@ pub struct Memory {
 }
 
 /// What is left of the NAND, as UBI counts it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Nand {
     /// Whether the UBI device is there at all.
     pub present: bool,
@@ -104,7 +105,7 @@ pub struct Nand {
 }
 
 /// One real-time clock the kernel has.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Rtc {
     /// `rtc0`, `rtc1`.
     pub device: String,
@@ -114,7 +115,7 @@ pub struct Rtc {
 }
 
 /// Whether the board knows what time it is, and how well.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Clock {
     /// Every RTC the kernel has. An empty list is a board with none, which
     /// is a board whose clock starts at the epoch on every cold boot.
@@ -133,7 +134,7 @@ pub struct Clock {
 }
 
 /// The board's own condition.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Health {
     /// Seconds since the BMC booted, as `/proc/uptime` gives it. Not the
     /// uptime of any compute module.

@@ -8,6 +8,44 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.24.0] — 2026-09-09
+
+### Added
+
+- **The OpenAPI document now describes what seven operations answer with**
+  (SQU-149, step 2). `/thermal`, `/health`, `/cooling`, `/network`,
+  `/firmware/slots`, `/firmware/sources` and `/firmware/check` carry real
+  response schemas instead of `{}`.
+
+  The schemas are **derived from the very types the handlers serialise**, not
+  written out beside them. The failure this exists to stop is a client written
+  against a shape the daemon has never sent — `tpi` shipped three such
+  formatters, and nobody noticed because a fourth bug stopped any of them
+  running. A hand-written schema is that same failure with an extra step
+  between it and the reader.
+
+- **The operations that describe nothing are listed, not merely absent.**
+  Eleven handlers assemble their answer with `json!` from several sources and
+  have no single type to derive from. They are named in `UNTYPED`, their `200`
+  says so in words, and a test requires every read operation to be either
+  described or on that list. Proven by removing `/hostname` from it: the test
+  fails naming exactly that path.
+
+  Two more tests hold the rest together: nothing may be both described and
+  declared undescribed, and every `$ref` in the document must resolve to a
+  component that exists. A dangling `$ref` renders as an empty box in every
+  viewer and generates a client that will not compile.
+
+### Changed
+
+- `schemars` is a new dependency, and it costs **186 KB** of release binary,
+  measured rather than assumed: 12,747,768 bytes before, 12,938,240 after.
+  About half a percent of the rootfs, against a CI gate at ninety.
+
+  A first measurement said it was free, which was wrong: with nothing calling
+  the derived impls the linker had stripped them all. The number above is from
+  a build where the document actually references them.
+
 ## [2.23.0] — 2026-09-09
 
 ### Added

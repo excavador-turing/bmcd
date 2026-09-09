@@ -1,11 +1,12 @@
 [package]
 name = "bmcd"
-version = "2.23.0"
+version = "2.24.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.98.1"
 
 [dependencies]
+schemars = "1"
 actix = "0.13.5"
 actix-files = "0.6.6"
 # actix-http and actix-service are already in the tree as transitive

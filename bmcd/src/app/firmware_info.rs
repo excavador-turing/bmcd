@@ -18,6 +18,7 @@
 //! hold a firmware at any time and the daemon has never said which is which.
 //! Everything here is read; nothing in this module writes, boots or promotes
 //! anything.
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::io::SeekFrom;
 use std::path::Path;
@@ -73,7 +74,7 @@ const STAGED_MARKER: &str = "/mnt/overlay/staged-firmware";
 const STAGED_MARKER_MAX: u64 = 4096;
 
 /// One firmware slot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Slot {
     /// UBI volume name, as the volume itself spells it.
     pub volume: String,
@@ -90,7 +91,7 @@ pub struct Slot {
 }
 
 /// What the promotion script last said it did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Promotion {
     /// The date the script itself printed, passed through verbatim rather
     /// than reformatted: it is the board's own idea of the time, which on a
@@ -107,7 +108,7 @@ pub struct Promotion {
 /// Every field is optional because this file is written by something else --
 /// `tpi-selfupdate`, or the daemon's own upgrade worker -- and a marker from
 /// an older writer should degrade to "less is known", never to no answer.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct StagedImage {
     /// The release tag, as the stager spelled it: `v2.4.0`.
     pub version: Option<String>,
@@ -126,7 +127,7 @@ pub struct StagedImage {
 }
 
 /// The A/B slot state of the board.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FirmwareSlots {
     /// Whether the UBI device is there at all. False on a board that boots
     /// from something else, and on any kernel without UBI: the rest of the
@@ -365,7 +366,7 @@ async fn read_nextboot() -> (Option<bool>, Option<String>) {
 /// The gate's history lived only in `/mnt/overlay/postupdate.log`, so
 /// "nineteen consecutive clean promotions" was a number somebody counted by
 /// hand and wrote on a website, where it went stale the next day.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct PromotionHistory {
     /// Boots that ran the gate at all: one per "tentative boot" line.
     pub attempts: u64,

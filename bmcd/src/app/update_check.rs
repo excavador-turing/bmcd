@@ -31,6 +31,7 @@
 //! browser with the firmware page open would otherwise spend them. The board
 //! also has 116 MB of RAM and one slow core, so spawning two processes per
 //! page render is not free either.
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -50,7 +51,7 @@ const FRESH: Duration = Duration::from_secs(3600);
 const FRESH_AFTER_ERROR: Duration = Duration::from_secs(300);
 
 /// What one channel resolves to, straight from `tpi-selfupdate --json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, JsonSchema)]
 pub struct ChannelState {
     pub channel: String,
     pub repo: String,
@@ -60,7 +61,7 @@ pub struct ChannelState {
 }
 
 /// The answer the API returns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UpdateCheck {
     /// When this was last resolved, in the board's own idea of the time.
     pub checked_at: String,

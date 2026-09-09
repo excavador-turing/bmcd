@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use anyhow::{anyhow, bail};
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::{collections::HashMap, ffi::c_ulong, fs, io, path::Path, time::Duration};
 use tracing::{info, instrument, warn};
@@ -27,7 +28,7 @@ const THERMAL_CLASS: &str = "/sys/class/thermal";
 /// minute on a board with 116 MB of RAM.
 const CEILING_POLL: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct CoolingDevice {
     pub device: String,
     pub speed: c_ulong,

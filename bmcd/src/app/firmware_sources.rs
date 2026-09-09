@@ -29,6 +29,7 @@
 //! `/mnt/overlay/firmware-sources.json`. Both firmware images mount the
 //! overlay, so the source list survives an A/B promotion -- a list on the
 //! rootfs would be lost by the very upgrade it configured.
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -36,7 +37,7 @@ use std::path::Path;
 pub const SOURCES_PATH: &str = "/mnt/overlay/firmware-sources.json";
 
 /// Where a source's images come from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     /// A GitHub repository, `owner/repo`. Checksums are published and checked.
@@ -49,7 +50,7 @@ pub enum SourceKind {
     Local,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Source {
     /// Stable identifier, used by the install call. Not the label: renaming a
     /// source in the interface must not change what an install refers to.
@@ -67,7 +68,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Sources {
     pub sources: Vec<Source>,
 }

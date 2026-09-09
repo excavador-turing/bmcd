@@ -67,10 +67,144 @@ fn known_params(alias: &Alias) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// Response schemas, derived from the very types the handlers serialise.
+///
+/// Deriving rather than writing them out is the whole point of this. The
+/// failure being fixed is a client written against a shape the daemon has
+/// never sent -- `tpi` shipped three such formatters -- and a hand-written
+/// schema is that same failure with an extra step between it and the reader.
+///
+/// Not every operation is here. Several handlers assemble their answer with
+/// `json!` out of several sources and have no single type to derive from;
+/// those keep an untyped `200` whose description says so, and
+/// [`UNTYPED`] lists them, so that leaving a new one undescribed is a
+/// deliberate act rather than an omission.
+fn response_schemas() -> Vec<(&'static str, Value)> {
+    // `$ref` to a component, for an operation that answers with exactly one
+    // type; an inline shape for the two that wrap one.
+    vec![
+        ("/thermal", component_ref("Thermal")),
+        ("/health", component_ref("Health")),
+        (
+            "/cooling",
+            json!({ "type": "array", "items": component_ref("CoolingDevice") }),
+        ),
+        (
+            "/network",
+            json!({
+                "type": "object",
+                "properties": { "ports": { "type": "array", "items": component_ref("SwitchPort") } },
+                "required": ["ports"]
+            }),
+        ),
+        ("/firmware/slots", component_ref("FirmwareSlots")),
+        ("/firmware/sources", component_ref("Sources")),
+        ("/firmware/check", component_ref("UpdateCheck")),
+    ]
+}
+
+/// The operations whose answer this document does not describe.
+///
+/// Each of these handlers builds its response with `json!` from more than one
+/// source, so there is no type to derive a schema from. Listed rather than
+/// left implicit: a test requires every GET alias to be either described or
+/// named here, which is what stops the list quietly growing.
+const UNTYPED: &[&str] = &[
+    "/about",
+    "/power",
+    "/nodes",
+    "/usb",
+    "/sdcard",
+    "/info",
+    "/firmware/available",
+    "/metrics-token",
+    "/hostname",
+    "/ntp",
+    "/config",
+];
+
+fn component_ref(name: &str) -> Value {
+    json!({ "$ref": format!("#/components/schemas/{}", name) })
+}
+
+/// Every named type the schemas above refer to, ready for `components`.
+///
+/// `schema_for!` emits the root type plus a `$defs` of everything it nests,
+/// and refs of the form `#/$defs/Name`. OpenAPI keeps its schemas at
+/// `#/components/schemas/`, so both the definitions and every `$ref` are
+/// moved across.
+fn components() -> serde_json::Map<String, Value> {
+    let roots = [
+        (
+            "Thermal",
+            serde_json::to_value(schemars::schema_for!(crate::app::thermal_info::Thermal)),
+        ),
+        (
+            "Health",
+            serde_json::to_value(schemars::schema_for!(crate::app::health_info::Health)),
+        ),
+        (
+            "CoolingDevice",
+            serde_json::to_value(schemars::schema_for!(
+                crate::app::cooling_device::CoolingDevice
+            )),
+        ),
+        (
+            "SwitchPort",
+            serde_json::to_value(schemars::schema_for!(crate::app::switch_info::SwitchPort)),
+        ),
+        (
+            "FirmwareSlots",
+            serde_json::to_value(schemars::schema_for!(
+                crate::app::firmware_info::FirmwareSlots
+            )),
+        ),
+        (
+            "Sources",
+            serde_json::to_value(schemars::schema_for!(crate::app::firmware_sources::Sources)),
+        ),
+        (
+            "UpdateCheck",
+            serde_json::to_value(schemars::schema_for!(crate::app::update_check::UpdateCheck)),
+        ),
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (name, schema) in roots {
+        let mut schema = schema.expect("a generated schema is valid JSON");
+        // The nested types come along as $defs; they become components too.
+        if let Some(Value::Object(defs)) = schema.as_object_mut().and_then(|o| o.remove("$defs")) {
+            for (def_name, def) in defs {
+                out.entry(def_name).or_insert(retarget(def));
+            }
+        }
+        if let Some(object) = schema.as_object_mut() {
+            // Meta-keys that mean nothing inside an OpenAPI components entry.
+            object.remove("$schema");
+            object.remove("title");
+        }
+        out.insert(name.to_string(), retarget(schema));
+    }
+    out
+}
+
+/// Rewrites `#/$defs/X` to `#/components/schemas/X`, everywhere it appears.
+fn retarget(node: Value) -> Value {
+    match node {
+        Value::String(s) => Value::String(s.replace("#/$defs/", "#/components/schemas/")),
+        Value::Array(items) => Value::Array(items.into_iter().map(retarget).collect()),
+        Value::Object(fields) => {
+            Value::Object(fields.into_iter().map(|(k, v)| (k, retarget(v))).collect())
+        }
+        other => other,
+    }
+}
+
 /// The document. Regenerated on every request; it is a few kilobytes and
 /// the alternative is a cache that outlives a version bump.
 pub fn document() -> Value {
     let mut paths = serde_json::Map::new();
+    let schemas = response_schemas();
 
     for alias in ALIASES {
         let method = match alias.method {
@@ -91,7 +225,7 @@ pub fn document() -> Value {
             ),
             "responses": {
                 "200": {
-                    "description": "The result. Its shape is not yet described in this document; see the tool that consumes it.",
+                    "description": "The result.",
                     "content": { "application/json": { "schema": {} } }
                 },
                 "204": { "description": "Done, with nothing to report." },
@@ -137,11 +271,44 @@ pub fn document() -> Value {
             });
         }
 
+        match schemas.iter().find(|(path, _)| *path == alias.path) {
+            Some((_, schema)) if alias.method == Method::Get => {
+                operation["responses"]["200"]["content"]["application/json"]["schema"] =
+                    schema.clone();
+            }
+            _ if UNTYPED.contains(&alias.path) => {
+                operation["responses"]["200"]["description"] = json!(
+                    "The result. Its shape is not described here: this handler assembles \
+                     its answer from several sources rather than serialising one type."
+                );
+            }
+            _ => {
+                operation["responses"]["200"]["description"] =
+                    json!("The result. Its shape is not described in this document.");
+            }
+        }
+
         let entry = paths
             .entry(format!("/api/bmc{}", alias.path))
             .or_insert_with(|| json!({}));
         entry[method] = operation;
     }
+
+    let mut schema_components = components();
+    schema_components.insert(
+        "Problem".to_string(),
+        json!({
+            "type": "object",
+            "description": "RFC 9457. `detail` is the same message the legacy form puts in `result`.",
+            "properties": {
+                "type": { "type": "string" },
+                "title": { "type": "string" },
+                "status": { "type": "integer" },
+                "detail": { "type": "string" }
+            },
+            "required": ["title", "status"]
+        }),
+    );
 
     json!({
         "openapi": "3.1.0",
@@ -164,19 +331,7 @@ pub fn document() -> Value {
                 "basic": { "type": "http", "scheme": "basic",
                            "description": "The board's root credentials. Loopback on the board itself needs neither." }
             },
-            "schemas": {
-                "Problem": {
-                    "type": "object",
-                    "description": "RFC 9457. `detail` is the same message the legacy form puts in `result`.",
-                    "properties": {
-                        "type": { "type": "string" },
-                        "title": { "type": "string" },
-                        "status": { "type": "integer" },
-                        "detail": { "type": "string" }
-                    },
-                    "required": ["title", "status"]
-                }
-            }
+            "schemas": Value::Object(schema_components)
         }
     })
 }
@@ -273,5 +428,116 @@ mod tests {
     #[test]
     fn the_document_is_openapi_3_1() {
         assert_eq!(document()["openapi"], "3.1.0");
+    }
+
+    /// The one that stops the undescribed list growing by accident.
+    ///
+    /// Every read operation is either described by a schema or named in
+    /// `UNTYPED`. Adding an endpoint and saying nothing about what it answers
+    /// with fails here, which is the only moment anybody is thinking about it.
+    #[test]
+    fn every_read_operation_is_described_or_declared_undescribed() {
+        let described: Vec<&str> = response_schemas().iter().map(|(path, _)| *path).collect();
+
+        let missing: Vec<&str> = ALIASES
+            .iter()
+            .filter(|alias| alias.method == Method::Get)
+            .map(|alias| alias.path)
+            .filter(|path| !described.contains(path) && !UNTYPED.contains(path))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these read operations describe no response and are not in UNTYPED: {:?}",
+            missing
+        );
+    }
+
+    /// `UNTYPED` must not name something that is described, or an operation
+    /// that no longer exists -- either way it is a stale claim about the API.
+    #[test]
+    fn nothing_is_both_described_and_declared_undescribed() {
+        let described: Vec<&str> = response_schemas().iter().map(|(path, _)| *path).collect();
+        let read_paths: Vec<&str> = ALIASES
+            .iter()
+            .filter(|alias| alias.method == Method::Get)
+            .map(|alias| alias.path)
+            .collect();
+
+        for path in UNTYPED {
+            assert!(
+                !described.contains(path),
+                "{path} is described and also listed as undescribed"
+            );
+            assert!(
+                read_paths.contains(path),
+                "{path} is listed as undescribed and is not a read operation"
+            );
+        }
+    }
+
+    /// A `$ref` that points at nothing renders as an empty box in every
+    /// viewer and generates a client that will not compile.
+    #[test]
+    fn every_ref_resolves_to_a_component() {
+        let doc = document();
+        let components = doc["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas is an object");
+
+        let mut refs = Vec::new();
+        collect_refs(&doc, &mut refs);
+        assert!(!refs.is_empty(), "the document carries no $ref at all");
+
+        for reference in refs {
+            let name = reference
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("$ref outside components: {reference}"));
+            assert!(
+                components.contains_key(name),
+                "$ref names a component that does not exist: {reference}"
+            );
+        }
+    }
+
+    fn collect_refs(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    if key == "$ref" {
+                        if let Some(text) = value.as_str() {
+                            out.push(text.to_string());
+                        }
+                    } else {
+                        collect_refs(value, out);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect_refs(item, out)),
+            _ => {}
+        }
+    }
+
+    /// The schemas are derived, so this checks the derivation reached the
+    /// board's own fields rather than producing an empty object.
+    #[test]
+    fn the_thermal_schema_carries_the_fields_the_daemon_sends() {
+        let doc = document();
+        let thermal = &doc["components"]["schemas"]["Thermal"];
+
+        for field in ["sensors", "cooling"] {
+            assert!(
+                !thermal["properties"][field].is_null(),
+                "Thermal's schema is missing `{field}`; the derive is not reaching the type"
+            );
+        }
+
+        let cooler = &doc["components"]["schemas"]["Cooler"];
+        for field in ["cur_state", "max_state", "levels", "max_level"] {
+            assert!(
+                !cooler["properties"][field].is_null(),
+                "Cooler's schema is missing `{field}`"
+            );
+        }
     }
 }
