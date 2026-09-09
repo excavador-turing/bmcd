@@ -36,7 +36,10 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, trace};
 
-use super::cooling_device::{get_cooling_state, set_cooling_state, CoolingDevice};
+use super::cooling_device::{
+    get_cooling_state, resume_all_governors, set_cooling_override, set_cooling_state,
+    spawn_override_ceiling, CoolingDevice,
+};
 
 pub type NodeInfos = [NodeInfo; 4];
 type CoolingMap = HashMap<u64, c_ulong>;
@@ -248,6 +251,13 @@ impl BmcApplication {
     }
 
     async fn initialize_cooling(&self) -> anyhow::Result<()> {
+        // Before anything is read or replayed: a hold on the fan lives in the
+        // kernel, not in this process, so one left by a daemon that died is
+        // still in force now. Clearing it first also means the persisted
+        // speeds below are replayed under a running governor, as they always
+        // were.
+        resume_all_governors().await;
+
         let store = self.app_db.get::<CoolingMap>(COOLING_DEVICES).await;
         let devices = get_cooling_state().await;
 
@@ -277,6 +287,8 @@ impl BmcApplication {
         let map: CoolingMap = HashMap::from_iter(set_devices);
         info!("loaded cooling devices: {:?}", map);
         self.app_db.set(COOLING_DEVICES, map).await;
+
+        spawn_override_ceiling();
 
         Ok(())
     }
@@ -547,6 +559,22 @@ impl BmcApplication {
         }
 
         res
+    }
+
+    /// Hold a fan at a step, or hand it back to the kernel's governor.
+    ///
+    /// Deliberately not persisted, which is the one way this differs from
+    /// [`Self::set_cooling_speed`]. A persisted speed is replayed into a
+    /// board whose governor immediately overrules it, so the worst it can do
+    /// is be briefly wrong. A persisted *hold* would come back after a reboot
+    /// with nothing regulating the fan and nobody present who remembers
+    /// asking for it, which is not a state to restore from a database.
+    pub async fn set_cooling_override(
+        &self,
+        device: &str,
+        speed: Option<c_ulong>,
+    ) -> anyhow::Result<()> {
+        set_cooling_override(device, speed).await
     }
 
     pub async fn get_cooling_devices() -> anyhow::Result<Vec<CoolingDevice>> {

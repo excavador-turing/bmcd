@@ -1019,10 +1019,33 @@ async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
     )
 }
 
+/// `opt=set&type=cooling&device=<name>&speed=<step>[&mode=auto|manual]`
+///
+/// `mode` decides whether the step is a request or a hold, and it is optional
+/// so that a client written before holds existed keeps its old meaning:
+///
+/// * **absent** -- write the step and leave the governor running. The kernel
+///   takes the fan back within a poll. This is what the control has always
+///   done, and it is why the fan slider had to be put behind a switch.
+/// * **`manual`** -- pause the zone's governor, then hold the step until
+///   something clears it. Requires `speed`.
+/// * **`auto`** -- hand the fan back to the governor. `speed` is not read,
+///   because the governor is about to choose one.
 async fn set_cooling_info(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
     let device = query
         .get("device")
         .ok_or(LegacyResponse::bad_request("Missing `device` parameter"))?;
+
+    let mode = query.get("mode").map(String::as_str);
+
+    if mode == Some("auto") {
+        return bmc
+            .set_cooling_override(device, None)
+            .await
+            .context("return fan to governor")
+            .map_err(Into::into);
+    }
+
     let speed_str = query
         .get("speed")
         .ok_or(LegacyResponse::bad_request("Missing `speed` parameter"))?;
@@ -1031,11 +1054,22 @@ async fn set_cooling_info(bmc: &BmcApplication, query: Query) -> LegacyResult<()
     let speed = c_ulong::from_str(speed_str)
         .map_err(|_| LegacyResponse::bad_request("`speed` parameter is not a number"))?;
 
-    // set the speed
-    bmc.set_cooling_speed(device, speed)
-        .await
-        .context("set Cooling state")
-        .map_err(Into::into)
+    match mode {
+        Some("manual") => bmc
+            .set_cooling_override(device, Some(speed))
+            .await
+            .context("hold fan at step"),
+        None => bmc
+            .set_cooling_speed(device, speed)
+            .await
+            .context("set Cooling state"),
+        Some(other) => {
+            return Err(LegacyResponse::bad_request(format!(
+                "`mode` is `{other}`; expected `auto` or `manual`"
+            )))
+        }
+    }
+    .map_err(Into::into)
 }
 
 async fn get_cooling_info() -> LegacyResult<serde_json::Value> {

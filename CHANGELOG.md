@@ -8,6 +8,58 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.21.0] — 2026-09-09
+
+### Added
+
+- **A fan can now be held at a step** (SQU-170). `opt=set&type=cooling` takes a
+  new optional `mode`: `manual` pauses the zone's governor and then writes the
+  step, `auto` hands the fan back. Omitted, the request means exactly what it
+  always did — write the step and leave the governor running — so a client
+  written before this keeps its behaviour.
+
+  Until now `set_cooling_speed` wrote `cur_state` into a zone whose policy is
+  `step_wise`, and the governor returned the fan to the trip the board was
+  above within a poll. The write succeeded and the setting did not survive,
+  which is the defect behind the fan slider that springs back.
+
+  The governor is paused *before* the step is written. A `step_wise` poll is
+  short enough to land between two writes done the other way round, which
+  would leave the governor off on a step nobody asked for. If the step then
+  fails to write, the governor is handed back rather than left paused.
+
+- **`type=cooling` reports `zone` and `overridden`**, so a client can tell
+  whether a step it writes will hold instead of leaving a person to watch a
+  slider and guess. `zone` is read from the zone's own `cdevN` symlinks rather
+  than assumed: the kernel records the binding on the zone's side only, and
+  `thermal_zone0` driving `cooling_device0` is true of this board, not of the
+  interface.
+
+- **`bmcd_cooling_overridden`**, 1 while a fan is held. A hold that outlives
+  the person who set it is the failure mode worth alerting on.
+
+### Changed
+
+- **A held fan is taken back above the zone's hottest `active` trip**, checked
+  every 15 seconds. This board declares no `critical` trip — the hottest thing
+  in its device tree is `hot` at 95 °C, which notifies and does not act — so
+  nothing else would intervene if a fan were left on a low step while the board
+  climbed. Somebody who paused the governor and walked away is not expressing a
+  preference about 80 °C.
+
+  The ceiling is the zone's own trip rather than a constant, for the same
+  reason the rest of the daemon reads its trips instead of carrying a table.
+
+- **Every paused governor is resumed at startup.** A hold lives in the kernel,
+  not in this process, so one left behind by a daemon that died is still in
+  force with nothing tracking it.
+
+- **A hold is deliberately not persisted**, which is the one way it differs
+  from a plain speed. A persisted speed is replayed into a board whose governor
+  overrules it immediately, so the worst it can do is be briefly wrong. A
+  persisted hold would come back after a reboot with nothing regulating the fan
+  and nobody present who remembers asking for it.
+
 ## [2.20.0] — 2026-09-09
 
 ### Added

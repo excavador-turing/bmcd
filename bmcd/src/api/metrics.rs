@@ -394,6 +394,23 @@ fn render_thermal(out: &mut String, snapshot: &Snapshot) {
             })
             .collect::<Vec<_>>(),
     );
+
+    family(
+        out,
+        "bmcd_cooling_overridden",
+        "gauge",
+        "1 when a cooling device is held at a step and its zone's governor is paused.",
+        &snapshot
+            .cooling
+            .iter()
+            .map(|device| {
+                Sample::new(
+                    labels(&[("device", device.device.as_str())]),
+                    if device.overridden { 1.0 } else { 0.0 },
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
 }
 
 fn render_switch(out: &mut String, snapshot: &Snapshot) {
@@ -880,6 +897,8 @@ mod tests {
                 device: "system fan".to_string(),
                 speed: 4,
                 max_speed: 6,
+                zone: Some("thermal_zone0".to_string()),
+                overridden: false,
             }],
             ports: vec![
                 port("node1", PortKind::Node, true),
@@ -1140,6 +1159,10 @@ mod tests {
                 "# HELP bmcd_cooling_state_max Highest step a cooling device accepts.\n",
                 "# TYPE bmcd_cooling_state_max gauge\n",
                 "bmcd_cooling_state_max{device=\"system fan\"} 6\n",
+                "\n",
+                "# HELP bmcd_cooling_overridden 1 when a cooling device is held at a step and its zone's governor is paused.\n",
+                "# TYPE bmcd_cooling_overridden gauge\n",
+                "bmcd_cooling_overridden{device=\"system fan\"} 0\n",
                 "\n",
                 "# HELP bmcd_switch_port_present Whether the kernel has a netdev for this switch port.\n",
                 "# TYPE bmcd_switch_port_present gauge\n",
