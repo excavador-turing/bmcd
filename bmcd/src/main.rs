@@ -81,6 +81,12 @@ async fn main() -> anyhow::Result<()> {
 
     run_event_listener(bmc.clone().into_inner())?;
 
+    // Ask the firmware sources what they offer before anyone asks us. The
+    // fan-out reaches GitHub and an HTTP mirror and takes seconds; whoever
+    // opens the firmware page first would otherwise pay for it, and that is
+    // the person watching a board come back from an update.
+    crate::app::firmware_catalog::prime();
+
     // The HTTPS listener is assembled by hand rather than with
     // `HttpServer::bind_openssl()`. That method takes an `SslAcceptorBuilder`
     // and then overwrites its ALPN configuration unconditionally -- see

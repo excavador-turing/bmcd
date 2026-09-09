@@ -10,6 +10,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.11.0] — 2026-09-09
+
+### Fixed
+
+- **The catalogue no longer blocks the page, or every other request with it**
+  (SQU-143, the cause behind SQU-132). Measured on the board first, because the
+  ticket held a hypothesis and not a diagnosis:
+
+  | request | before |
+  |---|---|
+  | `firmware_available&refresh=1`, four sources | **15.9 s** |
+  | the same, asking for one source | **15.7 s** |
+  | cached | 0.18 s |
+
+  Three faults, compounding. The fan-out ran the sources through a single
+  `spawn_blocking` and a `.map()`, so it cost their **sum** rather than the
+  slowest. The cache mutex was **held for the whole of it**, so a "check now"
+  froze every other reader too — including a page that wanted nothing but the
+  cached list, which is why the freeze looked like it happened on open. And
+  asking for one source refreshed all four, because the refresh was never per
+  source at all.
+
+  Now: one `spawn_blocking` per source through a `JoinSet`, answers reordered
+  to the configured order; the lock taken only to store the result; and a
+  caller gets the cached catalogue at once with `refreshing` set while the
+  refresh runs behind it. `refresh=1` starts that refresh instead of waiting
+  for the entry to age out, and returns immediately.
+
+### Added
+
+- `Catalog.refreshing` and `Catalog.age_seconds`, so a page can draw a spinner
+  on its own control and say how old the list is without parsing a timestamp
+  and trusting two clocks. `refreshing` is omitted when false, so a settled
+  catalogue serialises exactly as before.
+- The catalogue is primed at start-up. Otherwise the first caller after a boot
+  pays for the fan-out, and that is the person watching a board come back from
+  a firmware update.
+- A refresh already in flight is joined, not duplicated: four sources would
+  otherwise become twelve requests against a GitHub quota of sixty an hour.
+
 ## [2.10.1] — 2026-09-09
 
 ### Fixed
@@ -103,7 +143,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.10.1...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.11.0...hive
+[2.11.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.11.0
 [2.10.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.10.1
 [2.10.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.10.0
 [2.9.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.9.0

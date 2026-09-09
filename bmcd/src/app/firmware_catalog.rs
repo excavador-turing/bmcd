@@ -29,6 +29,7 @@
 use crate::app::firmware_sources::{Source, SourceKind};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -107,6 +108,16 @@ pub struct Catalog {
     pub checked_at: String,
     pub running: String,
     pub sources: Vec<SourceCatalog>,
+    /// These are the previous answers and a refresh is running behind them.
+    ///
+    /// The page draws a spinner on its "check now" control and leaves the
+    /// list underneath readable, rather than blanking or freezing. Skipped
+    /// when false so a settled catalogue serialises as it always did.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refreshing: bool,
+    /// How old these answers are. A caller that needs to say "as of a minute
+    /// ago" should not have to parse `checked_at` and trust two clocks.
+    pub age_seconds: u64,
 }
 
 /// What `tpi-selfupdate --list` emits.
@@ -280,23 +291,25 @@ fn cache() -> &'static Mutex<Option<Cached>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// Every enabled source's offering, cached.
+/// Whether a fan-out is already running.
 ///
-/// `force` skips the cache, which is what a "check now" control needs: a page
-/// that can only tell you what it thought half an hour ago cannot be used to
-/// confirm a release you just published.
-pub async fn get(force: bool) -> Catalog {
-    let mut guard = cache().lock().await;
+/// Without this, every press of "check now" and every page that opened while
+/// one was in flight would start another, and four sources would become
+/// twelve requests against a GitHub quota of sixty an hour.
+fn refreshing() -> &'static AtomicBool {
+    static REFRESHING: OnceLock<AtomicBool> = OnceLock::new();
+    REFRESHING.get_or_init(|| AtomicBool::new(false))
+}
 
-    if !force {
-        if let Some(cached) = guard.as_ref() {
-            let ttl = if cached.ok { FRESH } else { FRESH_AFTER_ERROR };
-            if cached.at.elapsed() < ttl {
-                return cached.value.clone();
-            }
-        }
-    }
-
+/// Asks every enabled source what it offers, all at once.
+///
+/// One `spawn_blocking` per source rather than one for the lot. Each runs
+/// `tpi-selfupdate --list`, which bounds itself with `curl --max-time 30`, so
+/// the whole fan-out costs the slowest source rather than the sum of them.
+/// Measured on the board before this change: four sources, 16 s; and asking
+/// for one source cost the same 16 s, because the refresh was never per
+/// source in the first place.
+async fn fan_out() -> Catalog {
     let sources = crate::app::firmware_sources::load().await;
     // The api layer already reads /etc/os-release for this; a second reader
     // here could drift from the one the About page uses.
@@ -306,30 +319,40 @@ pub async fn get(force: bool) -> Catalog {
 
     let enabled: Vec<Source> = sources.sources.into_iter().filter(|s| s.enabled).collect();
 
-    let hint = running_hint.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        enabled
-            .into_iter()
-            .map(|source| {
-                let (candidates, error, running) = resolve(&source, &hint);
-                (source, candidates, error, running)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, source) in enabled.into_iter().enumerate() {
+        let hint = running_hint.clone();
+        tasks.spawn_blocking(move || {
+            let (candidates, error, running) = resolve(&source, &hint);
+            (index, source, candidates, error, running)
+        });
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(one) => resolved.push(one),
+            // A panicking source must not take the others with it, and must
+            // not be reported as "nothing new" either -- but there is no
+            // source left to attach an error to, so say it in the log.
+            Err(e) => tracing::error!("a firmware source panicked while listing: {e}"),
+        }
+    }
+    // Answers arrive in whatever order they finish; the page's order is the
+    // configured one.
+    resolved.sort_by_key(|(index, ..)| *index);
 
     // The updater knows the running version too; prefer what it reported over
     // the local read, so both halves of the page agree.
     let running = resolved
         .iter()
-        .find_map(|(_, _, _, r)| r.clone())
+        .find_map(|(_, _, _, _, r)| r.clone())
         .unwrap_or(running_hint);
 
     let mut ok = true;
     let sources = resolved
         .into_iter()
-        .map(|(source, candidates, error, _)| {
+        .map(|(_, source, candidates, error, _)| {
             if error.is_some() {
                 ok = false;
             }
@@ -348,13 +371,71 @@ pub async fn get(force: bool) -> Catalog {
         checked_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         running,
         sources,
+        refreshing: false,
+        age_seconds: 0,
     };
 
-    *guard = Some(Cached {
+    *cache().lock().await = Some(Cached {
         at: Instant::now(),
         value: value.clone(),
         ok,
     });
+    value
+}
+
+/// Starts a fan-out behind the caller's back, unless one is already running.
+///
+/// The lock is taken only to store the result. Holding it across the fan-out
+/// -- which is what this used to do -- meant a "check now" blocked every other
+/// reader of the catalogue for as long as the slowest source took, so a page
+/// that wanted nothing but the cached list froze too.
+fn spawn_refresh() {
+    if refreshing().swap(true, AtomicOrdering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async {
+        fan_out().await;
+        refreshing().store(false, AtomicOrdering::Release);
+    });
+}
+
+/// Primes the catalogue at start-up, so the first page to ask has an answer.
+///
+/// Without it the first caller after a boot pays for the fan-out, which is
+/// precisely the person watching a board come back from a firmware update.
+pub fn prime() {
+    spawn_refresh();
+}
+
+/// Every enabled source's offering.
+///
+/// Answers from the cache and refreshes behind it. `force` -- what a "check
+/// now" control sends -- starts the refresh immediately rather than waiting
+/// for the entry to age out, and still returns at once with `refreshing` set,
+/// because a control that freezes the page it is on cannot be used to confirm
+/// a release you just published.
+///
+/// Only a cold cache waits, and only for one fan-out; `prime()` makes that
+/// rare.
+pub async fn get(force: bool) -> Catalog {
+    let snapshot = {
+        let guard = cache().lock().await;
+        guard
+            .as_ref()
+            .map(|c| (c.value.clone(), c.at.elapsed(), c.ok))
+    };
+
+    let Some((mut value, age, ok)) = snapshot else {
+        return fan_out().await;
+    };
+
+    let ttl = if ok { FRESH } else { FRESH_AFTER_ERROR };
+    if force || age >= ttl {
+        spawn_refresh();
+    }
+
+    value.age_seconds = age.as_secs();
+    value.refreshing = refreshing().load(AtomicOrdering::Acquire);
     value
 }
 
@@ -467,6 +548,53 @@ mod tests {
         let found = list_local(&source, "local").expect("lists");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relation, Relation::Unknown);
+    }
+
+    fn empty_catalog(refreshing: bool, age_seconds: u64) -> Catalog {
+        Catalog {
+            checked_at: "2026-09-09T00:00:00Z".to_string(),
+            running: "v2.8.1".to_string(),
+            sources: Vec::new(),
+            refreshing,
+            age_seconds,
+        }
+    }
+
+    /// The page tells "these are last half-hour's answers, a check is running"
+    /// from "this is what the sources say" by this field alone. A settled
+    /// catalogue must serialise as it always did, so an older consumer that
+    /// never knew the field is unaffected.
+    #[test]
+    fn refreshing_is_only_on_the_wire_when_it_is_true() {
+        let settled = serde_json::to_string(&empty_catalog(false, 12)).expect("serialises");
+        assert!(!settled.contains("refreshing"), "{settled}");
+        assert!(settled.contains("\"age_seconds\":12"), "{settled}");
+
+        let refreshing = serde_json::to_string(&empty_catalog(true, 1801)).expect("serialises");
+        assert!(refreshing.contains("\"refreshing\":true"), "{refreshing}");
+    }
+
+    /// Every press of "check now", and every page that opens while one is in
+    /// flight, must join the refresh already running rather than start
+    /// another. Four sources became twelve requests against a GitHub quota of
+    /// sixty an hour otherwise.
+    #[test]
+    fn only_one_refresh_runs_at_a_time() {
+        let flag = AtomicBool::new(false);
+
+        // What spawn_refresh does: claim the flag, and give up if it was
+        // already claimed.
+        let claim = || !flag.swap(true, AtomicOrdering::AcqRel);
+
+        assert!(claim(), "the first caller starts the refresh");
+        assert!(!claim(), "the second joins it rather than starting another");
+        assert!(!claim(), "and so does the third");
+
+        flag.store(false, AtomicOrdering::Release);
+        assert!(
+            claim(),
+            "once it has finished, the next caller starts a new one"
+        );
     }
 
     /// The shape the HTTP listing emits has a `url` key rather than `repo`,
