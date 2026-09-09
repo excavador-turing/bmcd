@@ -575,6 +575,12 @@ fn render_health(out: &mut String, health: &Health) {
             "Memory available to a new allocation on the BMC, reclaim included.",
             health.memory.available_bytes,
         ),
+        (
+            "bmcd_process_resident_bytes",
+            "This daemon's own resident set. Board memory says the board is being \
+             consumed; only this says by whom.",
+            health.memory.self_resident_bytes,
+        ),
     ] {
         family(out, name, "gauge", help, &optional_u64(value));
     }
@@ -910,6 +916,7 @@ mod tests {
                     total_bytes: Some(121634816),
                     free_bytes: Some(20971520),
                     available_bytes: Some(62914560),
+                    self_resident_bytes: Some(9_437_184),
                 },
                 nand: Nand {
                     present: true,
@@ -988,6 +995,7 @@ mod tests {
                     total_bytes: None,
                     free_bytes: None,
                     available_bytes: None,
+                    self_resident_bytes: None,
                 },
                 nand: Nand {
                     present: false,
@@ -1223,6 +1231,10 @@ mod tests {
                 "# HELP bmcd_memory_available_bytes Memory available to a new allocation on the BMC, reclaim included.\n",
                 "# TYPE bmcd_memory_available_bytes gauge\n",
                 "bmcd_memory_available_bytes 62914560\n",
+                "\n",
+                "# HELP bmcd_process_resident_bytes This daemon's own resident set. Board memory says the board is being consumed; only this says by whom.\n",
+                "# TYPE bmcd_process_resident_bytes gauge\n",
+                "bmcd_process_resident_bytes 9437184\n",
                 "\n",
                 "# HELP bmcd_nand_eraseblocks Eraseblocks of the BMC's NAND, by what UBI counts them as.\n",
                 "# TYPE bmcd_nand_eraseblocks gauge\n",

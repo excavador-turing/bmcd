@@ -42,6 +42,13 @@ const SELFUPDATE: &str = "/sbin/tpi-selfupdate";
 const FRESH: Duration = Duration::from_secs(1800);
 /// A failed source is retried sooner: the usual cause is a board with no route
 /// out, which can be fixed at any moment.
+///
+/// Two minutes, not less. One source of ours -- the HTTP mirror -- publishes
+/// no checksums and errors routinely, so this is the interval that actually
+/// governs, and every expiry spawns one shell and one `curl` per source. At
+/// 120 s a page left open costs the board four processes every two minutes
+/// for as long as it is open. Raising it further trades freshness for calm;
+/// lowering it is how a small board is worn down.
 const FRESH_AFTER_ERROR: Duration = Duration::from_secs(120);
 
 /// How a candidate relates to what is running.
@@ -394,8 +401,22 @@ fn spawn_refresh() {
         return;
     }
     tokio::spawn(async {
+        // The flag is cleared by a guard, not by a line after the await.
+        //
+        // Written the obvious way, a panic anywhere in the fan-out leaves the
+        // flag set for ever -- and a page polls every two seconds for as long
+        // as it is set, so one browser left open becomes a permanent 2-second
+        // poll of a board with 116 MB of RAM. That is a plausible contributor
+        // to the wedge on 2026-09-09 (SQU-172), and it is a bug whether or
+        // not it was the cause.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                refreshing().store(false, AtomicOrdering::Release);
+            }
+        }
+        let _clear = Clear;
         fan_out().await;
-        refreshing().store(false, AtomicOrdering::Release);
     });
 }
 

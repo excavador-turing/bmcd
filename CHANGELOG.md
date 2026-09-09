@@ -10,6 +10,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.18.0] — 2026-09-09
+
+The board wedged at 02:11 UTC after losing roughly a megabyte a minute under
+continuous polling (SQU-172). Its kernel still answered ICMP; nothing
+listened. The four compute modules were untouched. Recovering it needs a
+person at the rack, and the metrics could only show the *board's* memory
+falling — not what was consuming it. These three changes are so the next
+occurrence is diagnosable, and so one of the plausible causes cannot happen.
+
+### Added
+
+- **`bmcd_process_resident_bytes`**, this daemon's own resident set from
+  `/proc/self/statm`. Board memory says the board is being consumed; only this
+  says by whom. Its absence is why the diagnosis above had to be argued from
+  timing rather than read off a graph.
+
+### Fixed
+
+- **The catalogue's `refreshing` flag can no longer stick.** It was cleared by
+  a statement after `fan_out().await`, so a panic anywhere in the fan-out left
+  it set for ever — and the interface polls every two seconds for as long as
+  it is set. One browser tab left open then becomes a permanent 2-second poll
+  of a board with 116 MB of RAM. It is cleared by a drop guard now, which runs
+  on a panic as well as on success.
+
+### Changed
+
+- `FRESH_AFTER_ERROR` carries the arithmetic that makes it consequential: one
+  configured source publishes no checksums and therefore errors routinely, so
+  this two-minute value is the interval that actually governs, and each expiry
+  spawns a shell and a `curl` per source.
+
 ## [2.17.0] — 2026-09-09
 
 ### Added
@@ -350,7 +382,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.17.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.18.0...hive
+[2.18.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.18.0
 [2.17.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.17.0
 [2.16.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.16.0
 [2.15.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.1

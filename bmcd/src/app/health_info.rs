@@ -61,6 +61,14 @@ pub struct Memory {
     /// included. Absent on kernels older than 3.14, which is why it is not
     /// derived from the other two.
     pub available_bytes: Option<u64>,
+    /// This daemon's own resident set, from `/proc/self/statm`.
+    ///
+    /// Board-level memory says the board is being consumed; it cannot say by
+    /// what. On 2026-09-09 the board wedged after losing 1 MB a minute under
+    /// polling and the metrics could only show the total falling, so the
+    /// diagnosis had to be argued from timing rather than read off
+    /// (SQU-172). One number closes that gap.
+    pub self_resident_bytes: Option<u64>,
 }
 
 /// What is left of the NAND, as UBI counts it.
@@ -198,12 +206,15 @@ async fn read_load(proc: &Path) -> Load {
 }
 
 async fn read_memory(proc: &Path) -> Memory {
+    let self_resident_bytes = read_self_resident(proc).await;
+
     let Ok(meminfo) = tokio::fs::read_to_string(proc.join("meminfo")).await else {
         return Memory {
             present: false,
             total_bytes: None,
             free_bytes: None,
             available_bytes: None,
+            self_resident_bytes,
         };
     };
 
@@ -212,7 +223,25 @@ async fn read_memory(proc: &Path) -> Memory {
         total_bytes: meminfo_bytes(&meminfo, "MemTotal"),
         free_bytes: meminfo_bytes(&meminfo, "MemFree"),
         available_bytes: meminfo_bytes(&meminfo, "MemAvailable"),
+        self_resident_bytes,
     }
+}
+
+/// This process's resident set, from `/proc/self/statm`.
+///
+/// The file's second field is the resident set in pages. The page size is
+/// asked of the kernel rather than assumed: this board is 4 KiB, but the
+/// number is only useful if it is right everywhere it is read.
+async fn read_self_resident(proc: &Path) -> Option<u64> {
+    let statm = tokio::fs::read_to_string(proc.join("self/statm"))
+        .await
+        .ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = match nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE) {
+        Ok(Some(size)) if size > 0 => size as u64,
+        _ => return None,
+    };
+    Some(pages * page_size)
 }
 
 /// One `/proc/meminfo` entry in bytes. The file's numbers are kibibytes and
