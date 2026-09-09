@@ -10,6 +10,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.13.0] — 2026-09-09
+
+### Added
+
+- **The time sources are a setting** (SQU-167). `opt=get&type=ntp` returns the
+  configured servers, whether the running image can accept any, and the clock's
+  state; `opt=set&type=ntp&servers=a,b` replaces them and reloads chrony live.
+
+  The image ships `pool pool.ntp.org iburst`, so a board synchronises straight
+  to the public pool with no way to change that short of an SSH session. The
+  RTC covers boot, so this is not about correctness at power-on: it is about
+  the one time somebody is standing at the board — a WAN outage — when chrony
+  loses its only source and the clock quietly stops being disciplined.
+
+  Written as a chrony `sourcedir` file rather than by rewriting
+  `/etc/chrony.conf`: that config is in the read-only image, and
+  `chronyc reload sources` picks up the change without restarting chronyd or
+  losing the discipline it has built up. The first server is written with
+  chrony's `prefer`, and only the first — chrony treats several preferred
+  sources as equals, which is not what an ordered list means.
+
+  Server names are validated against an allow-list before they are written,
+  and that is not politeness: the lines are `server <value> iburst` in another
+  daemon's config file, so a value carrying a newline would append directives
+  of its own. `configurable` reports false on an image whose `chrony.conf`
+  predates the `sourcedir` line, because a setting that is saved and silently
+  never read is worse than one that is absent.
+
+- **The hostname is a control** (SQU-138). `opt=get&type=hostname` returns the
+  live name and the one that takes effect at the next boot — they differ when
+  someone has run `hostname` by hand — and `opt=set&type=hostname&name=…`
+  changes both and restarts `mdnsd` so the board stops advertising the name it
+  no longer has.
+
+  Validated as a single DNS label: letters, digits and hyphens, at most 63,
+  no leading or trailing hyphen, and **no dots**. The file format would accept
+  a qualified name and `mdnsd` would then advertise `a.b.local`, which is not
+  what anyone meant.
+
+  Renaming changes the `instance` label on every metrics series, so a
+  Prometheus history does not follow it. That is a decision, not a side
+  effect, and it belongs to whoever presses the button — the interface says so
+  before it happens.
+
 ## [2.12.0] — 2026-09-09
 
 ### Added
@@ -170,7 +214,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.12.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.13.0...hive
+[2.13.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.13.0
 [2.12.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.12.0
 [2.11.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.11.0
 [2.10.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.10.1

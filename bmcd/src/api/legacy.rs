@@ -215,6 +215,10 @@ async fn api_entry(
         ("firmware_available", false) => get_firmware_available(query).await.into(),
         ("firmware_install", true) => install_firmware(query).await,
         ("metrics_token", true) => rotate_metrics_token().await,
+        ("ntp", false) => get_ntp().await.into(),
+        ("ntp", true) => set_ntp(query).await,
+        ("hostname", false) => get_hostname().await.into(),
+        ("hostname", true) => set_hostname(query).await,
         _ => (
             StatusCode::BAD_REQUEST,
             format!("Invalid `type` parameter {}", ty),
@@ -233,6 +237,88 @@ fn reload_self() -> impl Into<LegacyResponse> {
     });
 
     ()
+}
+
+/// What the board calls itself, live and after the next reboot.
+///
+/// Both, because they differ when someone has run `hostname` by hand, and a
+/// page that shows only one of them cannot explain why the board answers to a
+/// name the settings do not show.
+async fn get_hostname() -> impl Into<LegacyResponse> {
+    let live = crate::app::hostname::current().await;
+    let persisted = tokio::fs::read_to_string("/etc/hostname")
+        .await
+        .ok()
+        .map(|s| s.trim().to_string());
+    json!({ "hostname": live, "on_next_boot": persisted })
+}
+
+/// Renames the board.
+///
+/// The name is not only a label: it is what `about` reports, what the
+/// interface puts in its header, what mdnsd advertises as `<name>.local`, and
+/// the `instance` label on every metrics series. The last of those breaks the
+/// continuity of a Prometheus series, which is why this is a deliberate act
+/// with a confirmation in front of it rather than an editable field.
+async fn set_hostname(query: Query) -> LegacyResponse {
+    let Some(name) = query.get("name") else {
+        return LegacyResponse::bad_request("Missing `name` parameter");
+    };
+
+    match crate::app::hostname::set(name).await {
+        Ok(()) => LegacyResponse::Success(None),
+        Err(e) => LegacyResponse::bad_request(e),
+    }
+}
+
+/// Which time sources the board uses, and how its clock is doing on them.
+///
+/// Both in one answer because they are read together: a server list with no
+/// sync state is a setting nobody can tell the effect of, and the effect is
+/// the only reason to change it.
+async fn get_ntp() -> impl Into<LegacyResponse> {
+    let config = crate::app::ntp::load().await;
+    let health = crate::app::health_info::get_health().await;
+    json!({
+        "servers": config.servers,
+        // False on an image whose chrony.conf predates the `sourcedir` line.
+        // Without it a saved list is written and silently never read, and the
+        // page should say so rather than show a setting that does nothing.
+        "configurable": crate::app::ntp::sourcedir_configured(),
+        "clock": health.clock,
+    })
+}
+
+/// Replaces the time sources and reloads chrony.
+///
+/// Validated before writing, like the firmware sources and for a sharper
+/// reason: these lines go into another daemon's config file, so a value
+/// carrying a newline would append directives of its own.
+async fn set_ntp(query: Query) -> LegacyResponse {
+    let Some(body) = query.get("servers") else {
+        return LegacyResponse::bad_request(
+            "Missing `servers` parameter: a comma-separated list, or empty for the image default",
+        );
+    };
+
+    let servers: Vec<String> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if let Err(e) = crate::app::ntp::validate_all(&servers) {
+        return LegacyResponse::bad_request(e);
+    }
+
+    match crate::app::ntp::store(&servers).await {
+        Ok(()) => LegacyResponse::Success(None),
+        // A reload that failed after a successful write is not a failed
+        // write, and reporting it as one invites the caller to try again
+        // against a board that is already correct.
+        Err(e) => LegacyResponse::Error(StatusCode::INTERNAL_SERVER_ERROR, e.into()),
+    }
 }
 
 /// The configured firmware sources.

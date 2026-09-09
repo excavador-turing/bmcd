@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     // opens the firmware page first would otherwise pay for it, and that is
     // the person watching a board come back from an update.
     crate::app::firmware_catalog::prime();
+    crate::app::ntp::ensure_source_dir().await;
 
     // The HTTPS listener is assembled by hand rather than with
     // `HttpServer::bind_openssl()`. That method takes an `SslAcceptorBuilder`
