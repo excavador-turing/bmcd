@@ -73,6 +73,9 @@ impl TryInto<TransferRequest> for InitializeTransfer {
 
 pub enum UpgradeCommand {
     OsUpgrade,
+    /// Write the image to the SD card and stop, so it appears in the
+    /// catalogue rather than installing itself.
+    OsPark,
     Module(NodeId, Arc<BmcApplication>),
 }
 
@@ -83,6 +86,7 @@ impl UpgradeCommand {
     ) -> BoxFuture<'static, Result<(), anyhow::Error>> {
         match self {
             UpgradeCommand::OsUpgrade => Box::pin(upgrade_worker.os_update()),
+            UpgradeCommand::OsPark => Box::pin(upgrade_worker.os_park()),
             UpgradeCommand::Module(bmc, node) => Box::pin(upgrade_worker.flash_node(node, bmc)),
         }
     }

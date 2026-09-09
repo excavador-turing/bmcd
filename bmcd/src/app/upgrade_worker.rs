@@ -49,6 +49,11 @@ use tokio_util::sync::CancellationToken;
 ///   killed halfway through the copy. It stays last in the list because it is
 ///   the only writable place left when nothing else is mounted.
 const UPGRADE_STAGING_DIRS: [&str; 3] = ["/mnt/sdcard", "/mnt/overlay", "/tmp"];
+
+/// Where a parked image goes, and where the catalogue's `local` source reads.
+/// The two must agree: an image parked anywhere else is invisible.
+const PARK_MOUNT: &str = "/mnt/sdcard";
+const PARK_DIR: &str = "/mnt/sdcard/firmware";
 /// Directory created under the chosen staging location, removed again when
 /// `osupdate` returns.
 const UPGRADE_DIR_NAME: &str = "os_upgrade";
@@ -168,6 +173,79 @@ impl UpgradeWorker {
             );
         }
 
+        Ok(())
+    }
+
+    /// Writes an image to the SD card and stops.
+    ///
+    /// `os_update` stages into a scratch directory, runs `osupdate` on it at
+    /// once, and deletes the directory -- so an uploaded image is never a
+    /// thing you have, only a thing that happened. That made the browser's
+    /// upload control a second way to install, bypassing the catalogue: an
+    /// operator could upload one image and install another with the interface
+    /// never showing which.
+    ///
+    /// Parking puts the file where the catalogue's `local` source reads, so
+    /// an upload ends in the same list as every other candidate and installing
+    /// is a separate, visible choice.
+    pub async fn os_park(mut self) -> anyhow::Result<()> {
+        let file_name = self.data_transfer.file_name()?.to_owned();
+        let image_size = self.data_transfer.size()?;
+        let source = self.data_transfer.reader().await?;
+        tracing::info!("parking firmware image {}", file_name.to_string_lossy());
+
+        let dir = std::path::Path::new(PARK_DIR);
+        // Only the card. The overlay is 138 MB and holds the settings, the
+        // metrics token and the promotion log; a 37 MB image parked there
+        // twice is how it fills, and the failure would land on the next
+        // update rather than here.
+        if !is_mount_point(std::path::Path::new(PARK_MOUNT)) {
+            bail!(
+                "{PARK_MOUNT} is not mounted, so there is no card to park an image on.                  Insert one, or upload without parking to install straight away."
+            );
+        }
+        match statvfs(std::path::Path::new(PARK_MOUNT)) {
+            Ok(stat) => {
+                let free = stat.blocks_available() * stat.fragment_size();
+                if free < image_size {
+                    bail!(
+                        "the card has {} free and the image is {}",
+                        format_size(free, DECIMAL),
+                        format_size(image_size, DECIMAL)
+                    );
+                }
+            }
+            Err(e) => bail!("cannot check the space on {PARK_MOUNT}: {e}"),
+        }
+
+        tokio::fs::create_dir_all(dir).await?;
+
+        // Write beside the target and rename, so a transfer that is cancelled
+        // or fails halfway cannot leave a truncated image in the directory the
+        // catalogue lists. A partial file there would be offered for install.
+        let final_path = dir.join(&file_name);
+        let partial_path = dir.join(format!("{}.partial", file_name.to_string_lossy()));
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&partial_path)
+            .await?;
+
+        let crc = Crc::<u64>::new(&CRC_64_REDIS);
+        let mut writer = WriteMonitor::new(&mut file, &mut self.written_sender, &crc);
+        if let Err(e) = copy_or_cancel(source, &mut writer, &self.cancel).await {
+            // A truncated image left in the directory the catalogue reads
+            // would be offered for install.
+            let _ = tokio::fs::remove_file(&partial_path).await;
+            return Err(e.into());
+        }
+        file.sync_all().await?;
+        drop(file);
+
+        tokio::fs::rename(&partial_path, &final_path).await?;
+        tracing::info!("parked {}", final_path.to_string_lossy());
         Ok(())
     }
 

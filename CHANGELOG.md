@@ -10,6 +10,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.12.0] — 2026-09-09
+
+### Added
+
+- **Park an uploaded image instead of installing it** (SQU-134).
+  `opt=set&type=firmware&park=1` writes the image to `/mnt/sdcard/firmware/`
+  and stops: nothing is staged, nothing is armed, and the catalogue's `local`
+  source lists it on the next read like any other candidate.
+
+  Until now an upload was never a thing you *had*, only a thing that
+  *happened* — `os_update` stages into a scratch directory, runs `osupdate` on
+  it at once, and deletes the directory. That made the browser's upload
+  control a second way to install, bypassing the catalogue, so an operator
+  could upload one image and install another with the interface never showing
+  which.
+
+  Three refusals, each for a measured reason. The card must be mounted:
+  `/mnt/sdcard` is an empty directory when no card is in the slot, and writing
+  there fills the root filesystem instead. It must have room. And the write
+  goes to a `.partial` file that is renamed only once it is complete and
+  synced, because a truncated image in the directory the catalogue reads would
+  be offered for install.
+
+  Parking does **not** make the already-staged refusal, and that is
+  deliberate: nothing is being armed, so a board with an image already staged
+  can still be given another to choose from later.
+
 ## [2.11.0] — 2026-09-09
 
 ### Fixed
@@ -143,7 +170,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.11.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.12.0...hive
+[2.12.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.12.0
 [2.11.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.11.0
 [2.10.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.10.1
 [2.10.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.10.0

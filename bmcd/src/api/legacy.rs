@@ -916,6 +916,13 @@ async fn handle_transfer_request(
     query: Query,
 ) -> LegacyResult<String> {
     let (process_name, upgrade_command) = match query.get("type").map(|c| c.as_str()) {
+        // Park the image instead of installing it: write it to the card and
+        // stop. Nothing is staged, so none of the refusals below apply -- a
+        // board with an image already armed can still be given another to
+        // choose from later.
+        Some("firmware") if query.contains_key("park") => {
+            ("firmware park service".to_string(), UpgradeCommand::OsPark)
+        }
         Some("firmware") => {
             // Refuse to stage a second image over one that is already armed.
             //
