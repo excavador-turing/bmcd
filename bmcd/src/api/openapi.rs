@@ -518,6 +518,171 @@ mod tests {
         }
     }
 
+    /// The document's schemas, resolvable as one JSON Schema.
+    ///
+    /// `$ref`s point at `#/components/schemas/…`, so the whole `components`
+    /// object is handed to the validator as the document root and the schema
+    /// under test is referenced into it.
+    fn validator_for(component: &str) -> (Value, jsonschema::Validator) {
+        let doc = document();
+        let root = json!({
+            "$ref": format!("#/components/schemas/{component}"),
+            "components": doc["components"].clone(),
+        });
+        let validator = jsonschema::validator_for(&root)
+            .unwrap_or_else(|e| panic!("the published schema for {component} is not valid: {e}"));
+        (root, validator)
+    }
+
+    fn assert_valid(component: &str, instance: &Value) {
+        let (_, validator) = validator_for(component);
+        let errors: Vec<String> = validator
+            .iter_errors(instance)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "what the daemon serialises does not match the {component} schema it publishes:\n  {}\ninstance: {}",
+            errors.join("\n  "),
+            serde_json::to_string_pretty(instance).unwrap()
+        );
+    }
+
+    /// The check this whole ticket is for.
+    ///
+    /// A schema is derived from a type; a response is serialised from the
+    /// same type. Those two agree only as far as `schemars` and `serde` agree,
+    /// and they part company over exactly the attributes this daemon uses:
+    /// `skip_serializing_if`, `rename_all`, and serde `default`s. Where they
+    /// part, the published document describes a shape the board never sends —
+    /// which is the failure `tpi`'s three dead formatters were made of.
+    ///
+    /// So: build what the board would send, and hold it against what the
+    /// document promises.
+    #[test]
+    fn a_board_with_no_promotion_log_still_matches_the_firmware_slots_schema() {
+        // `promotion_history` carries skip_serializing_if, so this instance
+        // omits the field entirely. A schema that lists it as required is
+        // wrong about every board that has never taken an OTA update.
+        let slots = crate::app::firmware_info::FirmwareSlots {
+            present: true,
+            running: Some(crate::app::firmware_info::Slot {
+                volume: "rootfs".to_string(),
+                volume_id: 0,
+                size_bytes: Some(37019648),
+                version: Some("v2.14.0".to_string()),
+            }),
+            rollback: Some(crate::app::firmware_info::Slot {
+                volume: "rootfs_prev".to_string(),
+                volume_id: 1,
+                size_bytes: Some(37011456),
+                version: None,
+            }),
+            update_staged: Some(false),
+            nextboot: None,
+            last_promotion: None,
+            promotion_history: None,
+            staged: None,
+        };
+
+        let sent = serde_json::to_value(&slots).unwrap();
+        assert!(
+            sent.get("promotion_history").is_none(),
+            "the fixture no longer exercises the omitted field this test exists for"
+        );
+        assert_valid("FirmwareSlots", &sent);
+    }
+
+    /// The same type with everything present, so the schema is not merely
+    /// permissive about absence.
+    #[test]
+    fn a_board_mid_update_matches_the_firmware_slots_schema() {
+        let slots = crate::app::firmware_info::FirmwareSlots {
+            present: true,
+            running: None,
+            rollback: None,
+            update_staged: Some(true),
+            nextboot: Some("ubi0:rootfs_new".to_string()),
+            last_promotion: Some(crate::app::firmware_info::Promotion {
+                timestamp: "23:29:57".to_string(),
+                message: "promoted".to_string(),
+            }),
+            promotion_history: Some(crate::app::firmware_info::PromotionHistory {
+                attempts: 15,
+                rolled_back: 1,
+                promoted: 14,
+            }),
+            staged: Some(crate::app::firmware_info::StagedImage {
+                version: Some("v2.14.0".to_string()),
+                sha256: Some("551f68b0".to_string()),
+                staged_at: Some("2026-09-09T15:04:57Z".to_string()),
+                source: Some("upload".to_string()),
+                file: None,
+            }),
+        };
+        assert_valid("FirmwareSlots", &serde_json::to_value(&slots).unwrap());
+    }
+
+    /// `PortKind` is `rename_all = "lowercase"`. A schema that spells the
+    /// variants `Node`/`Uplink` describes a board that does not exist.
+    #[test]
+    fn a_switch_port_matches_its_schema_including_the_renamed_enum() {
+        let port = crate::app::switch_info::SwitchPort {
+            name: "node1".to_string(),
+            kind: crate::app::switch_info::PortKind::Node,
+            present: true,
+            link: Some(true),
+            operstate: Some("up".to_string()),
+            speed_mbps: Some(1000),
+            duplex: Some("full".to_string()),
+            rx_bytes: Some(1234),
+            tx_bytes: Some(5678),
+            rx_errors: Some(0),
+            tx_errors: Some(0),
+        };
+
+        let sent = serde_json::to_value(&port).unwrap();
+        assert_eq!(
+            sent["kind"], "node",
+            "the fixture no longer exercises the rename"
+        );
+        assert_valid("SwitchPort", &sent);
+    }
+
+    /// A port the driver never probed: every optional field absent at once.
+    #[test]
+    fn an_unprobed_switch_port_matches_its_schema() {
+        let port = crate::app::switch_info::SwitchPort {
+            name: "node4".to_string(),
+            kind: crate::app::switch_info::PortKind::Uplink,
+            present: false,
+            link: None,
+            operstate: None,
+            speed_mbps: None,
+            duplex: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            rx_errors: None,
+            tx_errors: None,
+        };
+        assert_valid("SwitchPort", &serde_json::to_value(&port).unwrap());
+    }
+
+    /// A held fan and a governed one, against the schema `/cooling` publishes.
+    #[test]
+    fn a_cooling_device_matches_its_schema_held_or_not() {
+        for overridden in [false, true] {
+            let device = crate::app::cooling_device::CoolingDevice {
+                device: "system fan".to_string(),
+                speed: 4,
+                max_speed: 6,
+                zone: Some("thermal_zone0".to_string()),
+                overridden,
+            };
+            assert_valid("CoolingDevice", &serde_json::to_value(&device).unwrap());
+        }
+    }
+
     /// The schemas are derived, so this checks the derivation reached the
     /// board's own fields rather than producing an empty object.
     #[test]

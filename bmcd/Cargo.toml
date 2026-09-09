@@ -1,6 +1,6 @@
 [package]
 name = "bmcd"
-version = "2.24.0"
+version = "2.25.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.98.1"
@@ -74,6 +74,9 @@ tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
+# Validates the published schemas against what the daemon actually
+# serialises. A dev-dependency on purpose: it never reaches the board.
+jsonschema = "0.30"
 tempdir = "0.3.7"
 
 [features]

@@ -8,6 +8,38 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.25.0] — 2026-09-09
+
+### Added
+
+- **The published schemas are now checked against what the daemon actually
+  sends** (SQU-149, step 3). A schema is derived from a type and a response is
+  serialised from the same type, so the two agree only as far as `schemars`
+  and `serde` agree — and they part company over exactly the attributes this
+  daemon uses: `skip_serializing_if`, `rename_all`, and serde `default`s.
+  Where they part, the document describes a shape the board never sends, which
+  is what `tpi`'s three dead formatters were made of.
+
+  Six tests build what a board would send and hold it against what the
+  document promises. Proven by making the two disagree on purpose: adding
+  `#[schemars(rename_all = "PascalCase")]` beside `PortKind`'s
+  `#[serde(rename_all = "lowercase")]` fails both switch-port tests, naming the
+  schema. Removing it returns 13 passed.
+
+  The cases chosen are the ones with something to get wrong: a board with no
+  promotion log, where `promotion_history` is omitted entirely rather than sent
+  as null; the same board mid-update with every field present; a switch port
+  whose `kind` is a renamed enum; a port the driver never probed, with every
+  optional absent at once; and a fan both held and governed.
+
+  `jsonschema` is a **dev-dependency**, so none of this reaches the board.
+
+### Fixed
+
+- Nothing was wrong: `schemars` handles `skip_serializing_if` and
+  `rename_all` correctly today. These tests record that and stop it drifting,
+  which is a different and smaller claim than fixing something.
+
 ## [2.24.0] — 2026-09-09
 
 ### Added
