@@ -10,6 +10,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.19.0] — 2026-09-09
+
+### Added
+
+- **A rollback can be named** (SQU-158). The interface said *"Rollback: version
+  not readable"* — honest, because that volume is never mounted, and useless to
+  somebody deciding whether to press Reboot.
+
+  Only the stager ever knows: by the time the gate runs it is the *new* image
+  reading `/etc/os-release`. So both stagers now write `REPLACES=` into the
+  staged note, `S99postupdate` copies it to `/mnt/overlay/rollback-version` at
+  the instant it promotes, and `firmware_slots` reports it as the rollback
+  slot's version.
+
+  A board with no such file still renders "not readable". The version is
+  reported when it was recorded and never guessed — the same rule the rest of
+  this endpoint follows.
+
 ## [2.18.0] — 2026-09-09
 
 The board wedged at 02:11 UTC after losing roughly a megabyte a minute under
@@ -382,7 +400,8 @@ occurrence is diagnosable, and so one of the plausible causes cannot happen.
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.18.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.19.0...hive
+[2.19.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.19.0
 [2.18.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.18.0
 [2.17.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.17.0
 [2.16.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.16.0

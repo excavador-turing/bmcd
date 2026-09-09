@@ -46,6 +46,10 @@ const NEXTBOOT_VARIABLE: &str = "nextboot";
 const FW_PRINTENV: &str = "fw_printenv";
 /// Where the promotion script writes what it did.
 const PROMOTION_LOG: &str = "/mnt/overlay/postupdate.log";
+
+/// Where `S99postupdate` records what the image it just replaced was, at the
+/// moment it promotes. See `read_rollback_version`.
+const ROLLBACK_VERSION: &str = "/mnt/overlay/rollback-version";
 /// How much of the tail of that log to read. The file grows by a few lines
 /// per upgrade and lives on the overlay, but this daemon runs on a board with
 /// 116 MB of RAM in total, so it is read from the end with a bound rather
@@ -182,10 +186,21 @@ pub async fn get_firmware_slots(running_version: Option<String>) -> FirmwareSlot
     )
     .await;
 
-    let (running, rollback) = volumes
+    let (running, mut rollback) = volumes
         .as_deref()
         .map(|volumes| pick_slots(volumes, running_version))
         .unwrap_or((None, None));
+
+    // The rollback volume is never mounted, so nothing on a running board can
+    // read its version. The gate wrote it down at the moment it promoted --
+    // the one instant anything knew -- and this is where that becomes an
+    // answer instead of "version not readable", which is what somebody sees
+    // when deciding whether to press Reboot.
+    if let Some(slot) = rollback.as_mut() {
+        if slot.version.is_none() {
+            slot.version = read_rollback_version(Path::new(ROLLBACK_VERSION)).await;
+        }
+    }
 
     let (update_staged, nextboot) = read_nextboot().await;
 
@@ -398,6 +413,17 @@ pub async fn read_promotion_history(path: &Path) -> Option<PromotionHistory> {
     Some(history)
 }
 
+/// What the gate recorded the rollback volume as holding.
+///
+/// Absent on a board that has never promoted an image with a stager that
+/// records it, which is every board before this feature: `None` then, and the
+/// caller renders "not readable" as it always did. Never guessed.
+async fn read_rollback_version(path: &Path) -> Option<String> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let version = text.lines().next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
 /// Reads the last thing the promotion script said, from the tail of its log.
 async fn read_promotion(path: &Path) -> Option<Promotion> {
     let mut file = tokio::fs::File::open(path).await.ok()?;
@@ -495,6 +521,28 @@ async fn read_attribute<T: std::str::FromStr>(dir: &Path, attribute: &str) -> Op
 mod tests {
     use super::*;
     use tempdir::TempDir;
+
+    /// The rollback volume is never mounted, so its version can only come
+    /// from what the gate wrote down when it promoted. A board that has never
+    /// promoted under a stager that records it has no file, and must still
+    /// render "not readable" rather than a guess.
+    #[tokio::test]
+    async fn the_rollback_version_is_read_or_honestly_absent() {
+        let dir = TempDir::new("rollback").expect("tempdir");
+        let path = dir.path().join("rollback-version");
+
+        assert_eq!(read_rollback_version(&path).await, None, "no file");
+
+        tokio::fs::write(&path, "v2.9.2\n").await.expect("write");
+        assert_eq!(
+            read_rollback_version(&path).await.as_deref(),
+            Some("v2.9.2")
+        );
+
+        // A file the gate created but could not fill is not a version.
+        tokio::fs::write(&path, "\n").await.expect("write");
+        assert_eq!(read_rollback_version(&path).await, None, "empty");
+    }
 
     /// The board's own log on 2026-09-09: fifteen boots ran the gate and one
     /// was refused. Worth pinning as a test, because the hand-counted number

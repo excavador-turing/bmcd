@@ -356,6 +356,17 @@ async fn write_staged_note(file_name: &str) -> std::io::Result<()> {
         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
     ));
     note.push_str("SOURCE=upload\n");
+    // What this image is about to replace.
+    //
+    // Only the stager knows it: by the time the gate runs it is the *new*
+    // image reading `/etc/os-release`, and the volume the old one sits in is
+    // not mounted, so its version cannot be read from a running board. That
+    // is why the interface said "Rollback: version not readable" -- honest,
+    // and useless to somebody deciding whether to press Reboot. Recording it
+    // here lets the gate carry it forward on promotion.
+    if let Some(running) = crate::api::legacy::firmware_version().await {
+        note.push_str(&format!("REPLACES={running}\n"));
+    }
     tokio::fs::write(STAGED_NOTE, note).await
 }
 
