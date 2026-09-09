@@ -141,6 +141,35 @@ pub async fn rotate() -> io::Result<MetricsToken> {
     Ok(fresh)
 }
 
+/// The stored token's secret, without generating one.
+///
+/// Distinct from `ensure()` on purpose: a config export must record what the
+/// board has, not mint a credential as a side effect of being backed up.
+pub async fn peek() -> Option<String> {
+    load().await.map(|t| t.token)
+}
+
+/// Takes on a token from a config import, so a restored board scrapes with
+/// the credential the scrape config already holds.
+///
+/// Validated rather than trusted: the token is written into a `KEY=VALUE`
+/// file that `parse()` reads back line by line, so a value with a newline in
+/// it would forge a `CREATED_AT` -- and it is a Basic-auth password, where a
+/// colon would split the credential somewhere else.
+pub async fn adopt(token: &str) -> io::Result<()> {
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a metrics token is a non-empty hexadecimal string",
+        ));
+    }
+    store(&MetricsToken {
+        token: token.to_string(),
+        created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    })
+    .await
+}
+
 /// Whether the token directory exists at all. A board with no overlay
 /// mounted cannot store a token, and saying so beats writing one somewhere
 /// that will not survive a reboot.

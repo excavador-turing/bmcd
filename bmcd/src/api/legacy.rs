@@ -219,6 +219,8 @@ async fn api_entry(
         ("ntp", true) => set_ntp(query).await,
         ("hostname", false) => get_hostname().await.into(),
         ("hostname", true) => set_hostname(query).await,
+        ("config", false) => get_config(bmc, query).await.into(),
+        ("config", true) => set_config(bmc, query).await,
         _ => (
             StatusCode::BAD_REQUEST,
             format!("Invalid `type` parameter {}", ty),
@@ -237,6 +239,38 @@ fn reload_self() -> impl Into<LegacyResponse> {
     });
 
     ()
+}
+
+/// Everything a person has configured, as one document.
+///
+/// `secrets=1` includes the metrics token, and that is what makes an export a
+/// credential: applied to another board it can scrape it. The document says
+/// `contains_secrets` on its face so the difference is visible in the file
+/// rather than remembered from the request that produced it.
+async fn get_config(bmc: &BmcApplication, query: Query) -> impl Into<LegacyResponse> {
+    let with_secrets = query.contains_key("secrets");
+    json!(crate::app::config_export::export(bmc, with_secrets).await)
+}
+
+/// Applies an exported document.
+///
+/// Reports per field rather than as one verdict. There is no way to roll a
+/// hostname and a set of firmware sources back together, so a partial apply
+/// reported as a failure would leave an operator unsure which half took.
+async fn set_config(bmc: &BmcApplication, query: Query) -> LegacyResponse {
+    let Some(body) = query.get("config") else {
+        return LegacyResponse::bad_request("Missing `config` parameter");
+    };
+
+    let document: crate::app::config_export::ConfigExport = match serde_json::from_str(body) {
+        Ok(parsed) => parsed,
+        Err(e) => return LegacyResponse::bad_request(format!("`config` is not valid: {e}")),
+    };
+
+    match crate::app::config_export::import(bmc, &document).await {
+        Ok(report) => LegacyResponse::Success(Some(json!(report))),
+        Err(e) => LegacyResponse::bad_request(e),
+    }
 }
 
 /// What the board calls itself, live and after the next reboot.
@@ -760,7 +794,7 @@ async fn read_hostname() -> io::Result<String> {
 /// 24c02 EEPROM at i2c 0x50. `board_info` already reads and lays out that
 /// EEPROM for the first two; the serial is the next field along in the same
 /// 50-byte header, so this is one more `value_of` and not a second reader.
-async fn read_board_info() -> io::Result<(String, String, Option<String>)> {
+pub(crate) async fn read_board_info() -> io::Result<(String, String, Option<String>)> {
     let info = ::board_info::BoardInfo::load()?;
     let board_model = info.value_of(&BoardInfoAttribute::ProductName);
     let board_revision = info.value_of(&BoardInfoAttribute::HwVersion);

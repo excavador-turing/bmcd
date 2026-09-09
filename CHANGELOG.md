@@ -10,6 +10,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.14.0] — 2026-09-09
+
+### Added
+
+- **Config export and import** (SQU-142). `opt=get&type=config` returns
+  everything a person has configured as one JSON document — hostname, time
+  servers, firmware sources, node names — and `opt=set&type=config` applies
+  one. Board B is a named milestone, and the first thing anyone will want is
+  "make it like board A"; today that is five settings re-entered by hand plus a
+  metrics token re-pasted into a scrape config.
+
+  **An allow-list, never "everything on the overlay."** The overlay also
+  carries `htoprc` and a zero-byte `crond.reboot`, residue of tools that were
+  removed, and a wholesale copy would clone that junk to a board that never had
+  them.
+
+  **The token is what makes an export sensitive.** `secrets=1` includes the
+  metrics token; without it the key is absent from the document entirely rather
+  than present and empty. `contains_secrets` is on the document's face, because
+  the difference decides how the file has to be handled and nobody will
+  remember which request produced it. A token being imported is validated as
+  hexadecimal — it is written into a `KEY=VALUE` file and used as a Basic-auth
+  password, so a newline or a colon in it would forge a field or split a
+  credential.
+
+  **Import is deliberately not transactional.** A hostname and a set of
+  firmware sources cannot be rolled back together, and reporting a partial
+  apply as a failure would leave an operator unsure which half took. Every
+  field reports its own outcome as applied, skipped or failed.
+
+  **`power_on_time` is never imported.** It is when *this* board last powered a
+  node on; carried to another board it would report an uptime that never
+  happened.
+
+  The network configuration is not included and will not be: it is per-board by
+  definition and already has its own reset path.
+- `metrics_token::peek()` reads the stored token without minting one. A backup
+  must record what a board has, not create a credential as a side effect of
+  being backed up — which `ensure()` would have done.
+
 ## [2.13.0] — 2026-09-09
 
 ### Added
@@ -214,7 +254,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.13.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.14.0...hive
+[2.14.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.14.0
 [2.13.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.13.0
 [2.12.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.12.0
 [2.11.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.11.0
