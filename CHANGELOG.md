@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The hardware-less build starts** (SQU-117). `run_event_listener` opens
+  `/dev/input/event0`, which exists only on the board, and returned an error
+  `main` propagated -- so `--features stubbed`, the build whose entire purpose
+  is running without a board, could not start on one. It now warns and carries
+  on under that feature only. The default build, which is what the firmware
+  compiles, still treats a missing input device as fatal.
+
+  This does not make the daemon properly hardware-less. `/sys/class/thermal`
+  is not stubbed at all: on a workstation it enumerates the host's cooling
+  devices and reports them as the board's. See SQU-117 for the rest.
+
+
 ### Added
 
 - **CI compiles for the board** (SQU-171). 2.15.0 multiplied two `statvfs`

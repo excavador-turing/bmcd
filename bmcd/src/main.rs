@@ -80,6 +80,17 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
 
+    // The front-panel keys are read from /dev/input/event0, which exists only
+    // on the board. Under `stubbed` -- the hardware-less build, which the
+    // firmware never enables -- there is no such device and opening it is a
+    // hard error, so the daemon cannot start at all on a workstation. Log it
+    // and carry on rather than skipping silently: a build that quietly has no
+    // power button would be worse than one that says so.
+    #[cfg(feature = "stubbed")]
+    if let Err(e) = run_event_listener(bmc.clone().into_inner()) {
+        tracing::warn!("stubbed build: no front-panel input device ({e})");
+    }
+    #[cfg(not(feature = "stubbed"))]
     run_event_listener(bmc.clone().into_inner())?;
 
     // Ask the firmware sources what they offer before anyone asks us. The
