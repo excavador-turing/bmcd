@@ -1398,6 +1398,7 @@ mod test {
                 free_bytes: Some(20971520),
                 available_bytes: Some(62914560),
                 self_resident_bytes: Some(9_437_184),
+                self_threads: Some(9),
             },
             nand: Nand {
                 present: true,
@@ -1441,7 +1442,7 @@ mod test {
                 r#""rtc":[{"device":"rtc0","name":"sun6i-rtc"},{"device":"rtc1","name":"pcf8563"}],"#,
                 r#""source":"192.168.77.1","stratum":3,"synchronised":true},"#,
                 r#""load":{"fifteen_minutes":0.01,"five_minutes":0.03,"one_minute":0.08,"present":true},"#,
-                r#""memory":{"available_bytes":62914560,"free_bytes":20971520,"present":true,"self_resident_bytes":9437184,"total_bytes":121634816},"#,
+                r#""memory":{"available_bytes":62914560,"free_bytes":20971520,"present":true,"self_resident_bytes":9437184,"self_threads":9,"total_bytes":121634816},"#,
                 r#""nand":{"available_bytes":634880,"available_eraseblocks":5,"bad_eraseblocks":0,"#,
                 r#""eraseblock_size_bytes":126976,"present":true,"reserved_eraseblocks":40,"total_eraseblocks":2040},"#,
                 r#""uptime_seconds":172.43"#,
@@ -1469,6 +1470,7 @@ mod test {
                 free_bytes: None,
                 available_bytes: None,
                 self_resident_bytes: None,
+                self_threads: Some(9),
             },
             nand: Nand {
                 present: false,
@@ -1501,7 +1503,7 @@ mod test {
                 r#"{"response":[{"result":{"clock":{"measured_by":null,"offset_seconds":null,"rtc":[],"#,
                 r#""source":null,"stratum":null,"synchronised":null},"#,
                 r#""load":{"fifteen_minutes":null,"five_minutes":null,"one_minute":null,"present":false},"#,
-                r#""memory":{"available_bytes":null,"free_bytes":null,"present":false,"self_resident_bytes":null,"total_bytes":null},"#,
+                r#""memory":{"available_bytes":null,"free_bytes":null,"present":false,"self_resident_bytes":null,"self_threads":9,"total_bytes":null},"#,
                 r#""nand":{"available_bytes":null,"available_eraseblocks":null,"bad_eraseblocks":null,"#,
                 r#""eraseblock_size_bytes":null,"present":false,"reserved_eraseblocks":null,"total_eraseblocks":null},"#,
                 r#""uptime_seconds":null}}]}"#,

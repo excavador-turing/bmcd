@@ -69,6 +69,17 @@ pub struct Memory {
     /// diagnosis had to be argued from timing rather than read off
     /// (SQU-172). One number closes that gap.
     pub self_resident_bytes: Option<u64>,
+    /// How many threads this daemon has, from `/proc/self/status`.
+    ///
+    /// The companion to the resident set, and the one that says *which kind*
+    /// of growth is happening. A heap leak grows the resident set with a flat
+    /// thread count; a leaked task or an unreaped blocking thread grows both
+    /// together, because every thread carries a stack.
+    ///
+    /// Without it the two are indistinguishable from the outside, which is
+    /// the position SQU-172 left us in: memory falling about a megabyte a
+    /// minute with no way to say whether it was allocations or threads.
+    pub self_threads: Option<u64>,
 }
 
 /// What is left of the NAND, as UBI counts it.
@@ -207,6 +218,7 @@ async fn read_load(proc: &Path) -> Load {
 
 async fn read_memory(proc: &Path) -> Memory {
     let self_resident_bytes = read_self_resident(proc).await;
+    let self_threads = read_self_threads(proc).await;
 
     let Ok(meminfo) = tokio::fs::read_to_string(proc.join("meminfo")).await else {
         return Memory {
@@ -215,6 +227,7 @@ async fn read_memory(proc: &Path) -> Memory {
             free_bytes: None,
             available_bytes: None,
             self_resident_bytes,
+            self_threads,
         };
     };
 
@@ -224,6 +237,7 @@ async fn read_memory(proc: &Path) -> Memory {
         free_bytes: meminfo_bytes(&meminfo, "MemFree"),
         available_bytes: meminfo_bytes(&meminfo, "MemAvailable"),
         self_resident_bytes,
+        self_threads,
     }
 }
 
@@ -232,6 +246,23 @@ async fn read_memory(proc: &Path) -> Memory {
 /// The file's second field is the resident set in pages. The page size is
 /// asked of the kernel rather than assumed: this board is 4 KiB, but the
 /// number is only useful if it is right everywhere it is read.
+/// `/proc/self/status`'s `Threads:` line.
+///
+/// From `status` rather than by counting `/proc/self/task`, which would be a
+/// directory read per scrape on a board with 116 MB of RAM and a scrape every
+/// fifteen seconds.
+async fn read_self_threads(proc: &Path) -> Option<u64> {
+    let status = tokio::fs::read_to_string(proc.join("self/status"))
+        .await
+        .ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 async fn read_self_resident(proc: &Path) -> Option<u64> {
     let statm = tokio::fs::read_to_string(proc.join("self/statm"))
         .await

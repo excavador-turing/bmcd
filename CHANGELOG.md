@@ -8,7 +8,25 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2.20.0] — 2026-09-09
+
+### Added
+
+- **`bmcd_process_threads`** (SQU-172). The companion to
+  `bmcd_process_resident_bytes`, and the number that says *which kind* of
+  growth is happening: a heap leak grows the resident set with the thread count
+  flat, while a leaked task or an unreaped blocking thread grows both, because
+  every thread carries a stack.
+
+  Added because the 2026-09-09 outage could not be attributed. The board's
+  memory series was queried afterwards and settles one thing: available memory
+  fell about 0.95 MB a minute from 01:15 and **recovered at each daemon
+  restart** (+3.4 MB, then +10.7 MB), so the memory was held by this process
+  and freed when it exited. What it does not settle is whether that was the
+  heap or threads. This metric answers that at a glance next time.
+
+  Read from `/proc/self/status`, not by counting `/proc/self/task`, which would
+  be a directory read per scrape on a 116 MB board.
 
 ### Changed
 
