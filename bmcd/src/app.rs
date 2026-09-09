@@ -27,3 +27,4 @@ pub mod transfer_action;
 pub mod update_check;
 pub mod upgrade_worker;
 pub mod usb_gadget;
+pub mod version;

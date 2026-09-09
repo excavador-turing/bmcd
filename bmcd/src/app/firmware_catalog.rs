@@ -199,24 +199,36 @@ fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> 
         let version = crate::app::upgrade_worker::tag_from_ota_name(&name)
             .map(str::to_string)
             .unwrap_or_else(|| name.clone());
-        let relation = if version == running {
-            Relation::Current
-        } else {
-            // Deliberately not ordered. A file on a card carries no promise
-            // that its name reflects its contents, and an unversioned build
-            // has no place in an ordering at all.
-            Relation::Unknown
+        // A file on a card carries no promise that its name reflects its
+        // contents -- but that is what `trust` says, and it already says
+        // Unverified for every one of these. Refusing to order them as well
+        // hides a newer image under "older or unrelated": a v2.8.1-rc1 parked
+        // on the card while v2.8.0 ran showed as `?` and `firmware check`
+        // never mentioned it. Order what is version-shaped, decline the rest.
+        let relation = match crate::app::version::compare(&version, running) {
+            Some(std::cmp::Ordering::Equal) => Relation::Current,
+            Some(std::cmp::Ordering::Greater) => Relation::Newer,
+            Some(std::cmp::Ordering::Less) => Relation::Older,
+            None if version == running => Relation::Current,
+            None => Relation::Unknown,
         };
+        let prerelease = crate::app::version::is_prerelease(&version);
         candidates.push(Candidate {
             version,
             relation,
-            prerelease: false,
+            prerelease,
             trust: Trust::Unverified,
             file: Some(path.to_string_lossy().to_string()),
             size_bytes: entry.metadata().ok().map(|m| m.len()),
         });
     }
-    candidates.sort_by(|a, b| b.version.cmp(&a.version));
+    // Newest first, by the same ordering the relation used -- a lexical sort
+    // here would put v2.9.0 above v2.10.0 in a list whose relations say the
+    // opposite.
+    candidates.sort_by(|a, b| {
+        crate::app::version::compare(&b.version, &a.version)
+            .unwrap_or_else(|| b.version.cmp(&a.version))
+    });
     Ok(candidates)
 }
 
@@ -349,6 +361,7 @@ pub async fn get(force: bool) -> Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::TempDir;
 
     #[test]
     fn a_missing_relation_is_unknown_not_newer() {
@@ -371,6 +384,89 @@ mod tests {
             relation_from(l.releases[0].relation.as_deref()),
             Relation::Current
         );
+    }
+
+    /// A parked image whose name carries a version must be ordered against
+    /// what is running, not hidden under "unknown".
+    ///
+    /// This is the case that was found on the board: v2.8.1-rc1 sitting on the
+    /// SD card while v2.8.0 ran showed as `?`, so it sorted under "older or
+    /// unrelated" and `firmware check` never mentioned it. `trust` already
+    /// says Unverified for every local file -- that is the column which
+    /// carries "a name is not a promise", and refusing to order as well told
+    /// the user nothing twice.
+    #[test]
+    fn a_parked_image_is_ordered_against_the_running_version() {
+        let dir = TempDir::new("catalog").expect("tempdir");
+        for name in [
+            "tp2-bmc-firmware-ota-v2.8.1-rc1.tpu",
+            "tp2-bmc-firmware-ota-v2.7.0.tpu",
+            "tp2-bmc-firmware-ota-v2.10.0.tpu",
+            "tp2-bmc-firmware-ota-v2.9.0.tpu",
+            "tp2-bmc-firmware-ota-local.tpu",
+            "not-an-image.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").expect("write");
+        }
+
+        let source = Source {
+            id: "local".into(),
+            label: "SD card".into(),
+            kind: SourceKind::Local,
+            location: dir.path().to_string_lossy().to_string(),
+            enabled: true,
+        };
+        let found = list_local(&source, "v2.8.0").expect("lists");
+
+        let by_version = |v: &str| {
+            found
+                .iter()
+                .find(|c| c.version == v)
+                .unwrap_or_else(|| panic!("{v} missing from {found:?}"))
+                .clone()
+        };
+
+        assert_eq!(found.len(), 5, "the .txt is not an image: {found:?}");
+        assert_eq!(by_version("v2.8.1-rc1").relation, Relation::Newer);
+        assert!(by_version("v2.8.1-rc1").prerelease);
+        assert_eq!(by_version("v2.7.0").relation, Relation::Older);
+        assert!(!by_version("v2.7.0").prerelease);
+
+        // An unversioned build still orders against nothing, and is not a
+        // prerelease -- it is simply not a release.
+        assert_eq!(by_version("local").relation, Relation::Unknown);
+        assert!(!by_version("local").prerelease);
+
+        // Every local file is unverified regardless of its name.
+        assert!(found.iter().all(|c| c.trust == Trust::Unverified));
+
+        // Newest first, numerically: v2.10.0 above v2.9.0, which a lexical
+        // sort reverses.
+        let order: Vec<&str> = found.iter().map(|c| c.version.as_str()).collect();
+        let ten = order.iter().position(|v| *v == "v2.10.0").expect("2.10.0");
+        let nine = order.iter().position(|v| *v == "v2.9.0").expect("2.9.0");
+        assert!(ten < nine, "v2.10.0 must sort above v2.9.0: {order:?}");
+    }
+
+    /// A running version that cannot be ordered leaves everything unknown
+    /// rather than inventing a direction. `just build` stamps VERSION=local,
+    /// and ordering real tags against it once offered v2.3.0 as an upgrade to
+    /// a board running newer code.
+    #[test]
+    fn nothing_is_ordered_against_an_unversioned_running_build() {
+        let dir = TempDir::new("catalog").expect("tempdir");
+        std::fs::write(dir.path().join("tp2-bmc-firmware-ota-v2.3.0.tpu"), b"x").expect("write");
+
+        let source = Source {
+            id: "local".into(),
+            label: "SD card".into(),
+            kind: SourceKind::Local,
+            location: dir.path().to_string_lossy().to_string(),
+            enabled: true,
+        };
+        let found = list_local(&source, "local").expect("lists");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].relation, Relation::Unknown);
     }
 
     /// The shape the HTTP listing emits has a `url` key rather than `repo`,
