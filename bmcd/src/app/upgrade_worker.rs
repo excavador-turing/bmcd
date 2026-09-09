@@ -50,6 +50,21 @@ use tokio_util::sync::CancellationToken;
 ///   the only writable place left when nothing else is mounted.
 const UPGRADE_STAGING_DIRS: [&str; 3] = ["/mnt/sdcard", "/mnt/overlay", "/tmp"];
 
+/// Widens a `statvfs` count to `u64`.
+///
+/// These counts are `u64` on x86-64 and **`u32` on this board's 32-bit ARM**.
+/// Multiplying two of them directly builds on a workstation, fails to
+/// cross-compile for the board, and would overflow at 4 GB if it did.
+///
+/// Spelling the widening at the call site does not work either: `u64::from`
+/// and `as u64` are both correct for the target and both trip clippy on the
+/// host, where the types already match. A generic conversion is right on both
+/// platforms and carries the reason with it, which a lint suppression would
+/// not.
+fn widen<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
 /// Where a parked image goes, and where the catalogue's `local` source reads.
 /// The two must agree: an image parked anywhere else is invisible.
 const PARK_MOUNT: &str = "/mnt/sdcard";
@@ -206,7 +221,7 @@ impl UpgradeWorker {
         }
         match statvfs(std::path::Path::new(PARK_MOUNT)) {
             Ok(stat) => {
-                let free = stat.blocks_available() * stat.fragment_size();
+                let free = widen(stat.blocks_available()) * widen(stat.fragment_size());
                 if free < image_size {
                     bail!(
                         "the card has {} free and the image is {}",

@@ -10,6 +10,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.15.1] — 2026-09-09
+
+### Fixed
+
+- **Park mode did not compile for the board.** `statvfs`'s block counts are
+  `u64` on x86-64 and **`u32` on this board's 32-bit ARM**, so
+  `blocks_available() * fragment_size()` built on a workstation and failed to
+  cross-compile — and would have overflowed at 4 GB if it had. Cast to `u64`
+  before multiplying, which is what `select_staging_dir` two hundred lines
+  below already does.
+
+  Caught by the firmware build, not by `just check`. That is the point worth
+  recording: **a green workstation check is not evidence the daemon builds for
+  the board.** Nothing in this repository's CI cross-compiles; the firmware
+  build is the only thing that does, and it is two hours long.
+
+  The widening is a small generic rather than a cast at the call site, because
+  neither `as u64` nor `u64::from` works on both: both are required for the
+  target and both trip clippy on the host, where the types already match. A
+  generic conversion is correct on both platforms and carries the reason with
+  it, which a lint suppression would not.
+
 ## [2.15.0] — 2026-09-09
 
 ### Added
@@ -271,7 +293,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.15.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.15.1...hive
+[2.15.1]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.1
 [2.15.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.0
 [2.14.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.14.0
 [2.13.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.13.0
