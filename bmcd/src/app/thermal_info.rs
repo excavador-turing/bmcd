@@ -53,6 +53,28 @@ pub struct ThermalSensor {
     /// zero, and not the same as the zone not existing -- a zone that does not
     /// exist is not in the list at all.
     pub present: bool,
+    /// The zone's trip points, in the order the kernel numbers them.
+    ///
+    /// This is what makes the fan's step explicable rather than mysterious.
+    /// The governor is `step_wise`, so the step is a consequence of which
+    /// trips the board has crossed -- and "the fan is on step 4" with no
+    /// reason attached is the question this fork was asked to investigate.
+    /// Read from sysfs for the same reason as the cooling levels: it is a
+    /// fact about this board, not a table copied into a client.
+    pub trips: Vec<Trip>,
+}
+
+/// One trip point: a temperature and what crossing it means.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Trip {
+    /// The kernel's index for it, which is also its order.
+    pub index: u32,
+    /// `active` drives a cooling device; `hot` and `critical` are the
+    /// kernel's own escalations. Passed through as the kernel spells it
+    /// rather than mapped, because a client that meets an unfamiliar type
+    /// should show it, not swallow it.
+    pub kind: Option<String>,
+    pub temperature_c: Option<f64>,
 }
 
 /// One cooling device: something the thermal framework can turn up, in whole
@@ -174,7 +196,37 @@ async fn read_zone(dir: &Path) -> ThermalSensor {
         name,
         temperature_c,
         present: temperature_c.is_some(),
+        trips: read_trips(dir).await,
     }
+}
+
+/// Reads `trip_point_N_temp` and `trip_point_N_type` until they run out.
+///
+/// Counting up rather than listing the directory: the files are numbered from
+/// zero with no gaps, and a readdir would have to be sorted numerically to
+/// avoid putting `trip_point_10_temp` before `trip_point_2_temp` -- the same
+/// trap the zone list already documents.
+async fn read_trips(dir: &Path) -> Vec<Trip> {
+    let mut trips = Vec::new();
+    for index in 0u32.. {
+        let temp = read_attribute::<i64>(dir, &format!("trip_point_{index}_temp")).await;
+        let kind = read_attribute_string(dir, &format!("trip_point_{index}_type")).await;
+        // Neither file: there is no such trip and there will be no more.
+        if temp.is_none() && kind.is_none() {
+            break;
+        }
+        trips.push(Trip {
+            index,
+            kind,
+            temperature_c: temp.map(millidegrees_to_celsius),
+        });
+        // A zone with an implausible number of trips means the loop condition
+        // is wrong, and an unbounded read of sysfs is not worth risking.
+        if trips.len() >= 32 {
+            break;
+        }
+    }
+    trips
 }
 
 async fn read_cooler(sysfs: &Path, dir: &Path) -> Cooler {
@@ -447,6 +499,7 @@ mod tests {
                     name: "bmc-thermal".to_string(),
                     temperature_c: Some(52.5),
                     present: true,
+                    trips: Vec::new(),
                 }],
                 cooling: vec![Cooler {
                     name: "pwm-fan".to_string(),

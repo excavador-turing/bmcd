@@ -10,6 +10,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.15.0] — 2026-09-09
+
+### Added
+
+- **`type=thermal` reports each zone's trip points** (SQU-135). The governor is
+  `step_wise`, so the fan's step is a *consequence* of which trips the board
+  has crossed — and "the fan is on step 4" with no reason attached is the
+  question this fork was asked to investigate. Measured on the board:
+  `fan_min` 20 °C, `fan_low` 45 °C, `fan_mid` 60 °C, `fan_high` 70 °C, all
+  `active`, plus `hot` at 95 °C; the board reads 50.6 °C, which is above
+  `fan_low`, which is step 4. Nothing mysterious, and now nothing hidden.
+
+  Read from sysfs rather than written into a client, for the same reason the
+  cooling levels are: it is a fact about *this* board. The trip type is passed
+  through as the kernel spells it rather than mapped, so a client that meets an
+  unfamiliar one shows it instead of swallowing it.
+
 ## [2.14.0] — 2026-09-09
 
 ### Added
@@ -254,7 +271,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A ban answers with 429 and a `Retry-After` rather than "wrong password".
 - Only `http/1.1` is offered over ALPN, so h2 framing is unreachable (SQU-126).
 
-[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.14.0...hive
+[Unreleased]: https://github.com/excavador-turing/bmcd/compare/v2.15.0...hive
+[2.15.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.15.0
 [2.14.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.14.0
 [2.13.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.13.0
 [2.12.0]: https://github.com/excavador-turing/bmcd/releases/tag/v2.12.0

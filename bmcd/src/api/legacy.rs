@@ -1205,7 +1205,7 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
-    use crate::app::thermal_info::{Cooler, Thermal, ThermalSensor};
+    use crate::app::thermal_info::{Cooler, Thermal, ThermalSensor, Trip};
 
     #[test]
     fn buildroot_release_prefers_the_buildroot_key() {
@@ -1524,6 +1524,11 @@ mod test {
                 name: "bmc-thermal".to_string(),
                 temperature_c: Some(52.5),
                 present: true,
+                trips: vec![Trip {
+                    index: 1,
+                    kind: Some("active".to_string()),
+                    temperature_c: Some(45.0),
+                }],
             }],
             cooling: vec![Cooler {
                 name: "pwm-fan".to_string(),
@@ -1547,7 +1552,8 @@ mod test {
                 r#"{"response":[{"result":{"#,
                 r#""cooling":[{"cur_state":4,"levels":[0,16,32,64,102,170,254],"#,
                 r#""max_level":254,"max_state":6,"name":"pwm-fan","present":true}],"#,
-                r#""sensors":[{"name":"bmc-thermal","present":true,"temperature_c":52.5}]"#,
+                r#""sensors":[{"name":"bmc-thermal","present":true,"temperature_c":52.5,"#,
+                r#""trips":[{"index":1,"kind":"active","temperature_c":45.0}]}]"#,
                 r#"}}]}"#,
             )
         );
