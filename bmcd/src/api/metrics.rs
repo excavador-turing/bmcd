@@ -657,6 +657,30 @@ fn render_health(out: &mut String, health: &Health) {
     );
 }
 
+/// The gate's timestamp as Unix seconds, when it can be trusted.
+///
+/// `S99postupdate` writes whatever busybox `date` printed, e.g.
+/// `Wed Sep  9 23:57:00 UTC 2026`. Two things make this worth being careful
+/// about rather than parsing optimistically:
+///
+/// * **It is the board's own clock.** A BMC that has just come up may not have
+///   reached chrony yet, so the instant can be well before the real one. That
+///   is why `Promotion::timestamp` keeps the string verbatim, and why the
+///   metric below says so in its HELP rather than pretending otherwise.
+/// * **Only UTC is accepted.** The board runs UTC and the log says so, but
+///   `%Z` is not an offset — chrono parses the token and cannot apply it. A
+///   string carrying any other zone would silently be read as UTC and publish
+///   a confidently wrong instant, which is worse than publishing nothing.
+fn promotion_epoch(timestamp: &str) -> Option<i64> {
+    let cleaned = timestamp.replace(" UTC ", " ");
+    if cleaned == timestamp {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(cleaned.trim(), "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
 fn render_firmware(out: &mut String, firmware: &FirmwareSlots) {
     // The gate's history. Without this, "nineteen consecutive clean
     // promotions" is a number counted by hand and written on a website, where
@@ -678,6 +702,27 @@ fn render_firmware(out: &mut String, firmware: &FirmwareSlots) {
                     history.rolled_back as f64,
                 ),
             ],
+        );
+    }
+
+    // When the gate last reached a verdict. The counter above says how often;
+    // this says how long ago, which is what an alert on "no promotion since"
+    // and a Grafana annotation beside a memory graph both need.
+    //
+    // Absent rather than zero when the timestamp cannot be trusted -- see
+    // promotion_epoch. A gauge that is sometimes missing is a nuisance; one
+    // that is sometimes wrong about when something happened is a trap.
+    if let Some(epoch) = firmware
+        .last_promotion
+        .as_ref()
+        .and_then(|p| promotion_epoch(&p.timestamp))
+    {
+        family(
+            out,
+            "bmcd_firmware_last_promotion_timestamp_seconds",
+            "gauge",
+            "When the health gate last reached a verdict, in Unix seconds. Taken from the board's own clock at that moment, which on a BMC that had just come up may be behind true time; absent when the recorded timestamp cannot be read as UTC.",
+            &[Sample::bare(epoch as f64)],
         );
     }
 
@@ -1290,6 +1335,42 @@ mod tests {
     /// A `# HELP` line is published to every scraper and shown in dashboard
     /// tooltips, so it is prose with an audience.
     ///
+    /// The gate's own line, as busybox `date` writes it and the board reported
+    /// it on 2026-09-09. Parsing this is the whole feature; if it stops
+    /// parsing the metric silently disappears, so the format is pinned here.
+    #[test]
+    fn the_gates_timestamp_becomes_an_instant() {
+        // 2026-09-09T23:57:00Z. Written as the arithmetic rather than a bare
+        // constant: the first version of this test carried a hand-computed
+        // epoch that was two days out, and the parser -- which was correct --
+        // is what looked broken.
+        assert_eq!(
+            promotion_epoch("Wed Sep  9 23:57:00 UTC 2026"),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+                .and_then(|d| d.and_hms_opt(23, 57, 0))
+                .map(|dt| dt.and_utc().timestamp()),
+        );
+    }
+
+    /// Any zone but UTC is refused rather than assumed. chrono parses `%Z` as
+    /// a token and cannot apply an offset, so reading `CEST` as UTC would
+    /// publish an instant two hours wrong and look perfectly healthy.
+    #[test]
+    fn a_zone_that_is_not_utc_is_refused() {
+        assert_eq!(promotion_epoch("Wed Sep  9 23:57:00 CEST 2026"), None);
+        assert_eq!(promotion_epoch("Wed Sep  9 23:57:00 2026"), None);
+    }
+
+    /// Nothing about the gate's log is guaranteed, so garbage must be absent
+    /// rather than zero -- a 1970 timestamp on a dashboard reads as a real
+    /// event that never happened.
+    #[test]
+    fn unreadable_stays_absent() {
+        assert_eq!(promotion_epoch(""), None);
+        assert_eq!(promotion_epoch("not a date at all"), None);
+        assert_eq!(promotion_epoch("UTC"), None);
+    }
+
     /// Wrapping one across source lines and letting rustfmt join it produces a
     /// literal run of indentation in the middle of the sentence. Nothing
     /// complains: it compiles, it renders, and the exposition is still valid.
