@@ -8,6 +8,36 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.29.0] — 2026-09-10
+
+### Added
+
+- **`bmcd_firmware_last_promotion_timestamp_seconds`** (SQU-141). The counter
+  beside it says how often the health gate reached a verdict; this says when
+  the last one was, which is what an alert on "no promotion since" and a
+  Grafana annotation beside a memory graph both need. The ticket asked for
+  both families and only the counter had shipped.
+
+  **It is absent rather than wrong when it cannot be trusted.** The gate writes
+  whatever busybox `date` printed, and that is the board's own clock — a BMC
+  that has just come up may not have reached chrony, so the instant can be well
+  before the real one. The HELP text says so. And only `UTC` is accepted:
+  chrono parses `%Z` as a token and cannot apply an offset, so reading any
+  other zone as UTC would publish an instant that is confidently wrong and
+  looks perfectly healthy. A missing gauge is a nuisance; a plausible wrong one
+  is a trap.
+
+  Three tests. One pins the exact format the gate produces, since parsing it is
+  the whole feature. One refuses a non-UTC zone. One keeps garbage absent
+  rather than letting it become a 1970 timestamp that reads as a real event.
+
+### Changed
+
+- The fan-out doc comment said 16 s; measured twice on the board on 2026-09-09
+  at **74 s and 78 s**, and once at 140 s the following day. Both figures are
+  now recorded with which one no longer holds. It is not cosmetic: `tpi` 1.5.0
+  was written believing a re-poll was quick.
+
 ## [2.28.0] — 2026-09-09
 
 ### Added
