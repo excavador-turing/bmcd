@@ -576,6 +576,7 @@ dependencies = [
  "actix-http",
  "actix-multipart",
  "actix-service",
+ "actix-tls",
  "actix-web",
  "actix-ws",
  "anyhow",

@@ -43,6 +43,10 @@ pub struct LinuxAuthenticator {
     context: Arc<Mutex<LinuxContext>>,
     authentication_path: &'static str,
     realm: &'static str,
+    /// Which header names the human, when a verified client certificate
+    /// makes it worth believing. Configured, because the proxy in front
+    /// decides what it sets and that is not ours to hard-code.
+    identity_header: std::sync::Arc<str>,
 }
 
 impl LinuxAuthenticator {
@@ -51,6 +55,7 @@ impl LinuxAuthenticator {
         realm: &'static str,
         authentication_token_duration: Duration,
         authentication_attemps: usize,
+        identity_header: impl AsRef<str>,
     ) -> io::Result<Self> {
         let password_entries = Self::parse_shadow_file().await?;
 
@@ -62,6 +67,7 @@ impl LinuxAuthenticator {
             ))),
             authentication_path,
             realm,
+            identity_header: identity_header.as_ref().into(),
         };
 
         if let Err(e) = instance.auto_reload().await {
@@ -156,6 +162,7 @@ where
             self.context.clone(),
             self.authentication_path,
             self.realm,
+            self.identity_header.clone(),
         )))
     }
 }

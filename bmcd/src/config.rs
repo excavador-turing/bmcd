@@ -60,6 +60,36 @@ pub struct Authentication {
 pub struct Tls {
     pub private_key: PathBuf,
     pub certificate: PathBuf,
+
+    /// PEM bundle of certificate authorities whose CLIENT certificates this
+    /// daemon will accept as proof that a request came from a trusted proxy.
+    ///
+    /// Absent -- the default, and what a board ships with -- means no client
+    /// certificate is requested and [`Tls::identity_header`] is never
+    /// believed. A board on a bench behaves exactly as it did before this
+    /// existed.
+    ///
+    /// Set, it enables the one path by which a request can be authorised
+    /// without a password or a session token: a proxy that holds a
+    /// certificate from this CA, telling us which human it already
+    /// authenticated. That is the whole of SQU-136's daemon half, and the
+    /// reason the fleet interface can be exposed when a board cannot.
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
+
+    /// Header naming the human the proxy authenticated.
+    ///
+    /// Believed ONLY on a connection that presented a certificate this
+    /// daemon verified against [`Tls::client_ca`]. Without that, the header
+    /// is ordinary attacker-controlled input -- anyone on the management LAN
+    /// can set it -- so the certificate is what makes it mean anything, and
+    /// the two are useless apart.
+    #[serde(default = "default_identity_header")]
+    pub identity_header: String,
+}
+
+fn default_identity_header() -> String {
+    "x-forwarded-email".to_string()
 }
 
 #[derive(Debug, Deserialize)]
