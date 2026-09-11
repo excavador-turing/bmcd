@@ -8,6 +8,43 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.32.0] — 2026-09-11
+
+### Added
+
+- **`/metrics` reports when the certificate the listener is serving expires**,
+  as `bmcd_tls_certificate_expiry_timestamp_seconds`, alongside
+  `bmcd_tls_certificate_info{key="ecdsa-p384"}` naming the key it is built on.
+
+  This exists because of SQU-115: a board served a certificate that had
+  expired more than a year earlier and nothing anywhere said so. A number a
+  scrape can alert on is the difference between that and a calendar reminder
+  somebody stops reading. The key label is the first thing anyone reaches for
+  when a client refuses to negotiate.
+
+  Both are read from the certificate the daemon actually loaded, at start, so
+  `/metrics` cannot disagree with the listener about which certificate is in
+  use — replacing the file without restarting is exactly when a fresh read
+  would describe something that is not being served.
+
+  A daemon that cannot make sense of the date reports **no series at all**
+  rather than a zero, because a zero reads as 1970 and would fire every
+  expiry rule ever written against it.
+
+  Nothing here is secret: every byte of it is sent to each client during the
+  handshake.
+
+### Confirmed
+
+- **Every key an operator might install is served**, over TLS 1.3 and 1.2
+  alike: RSA, EC P-256, P-384 and P-521, and Ed25519. This was already true
+  and is now a test that performs a real handshake per key type against the
+  real acceptor, so it covers the cipher list and the signature algorithms
+  rather than only PEM parsing. The estate rule is P-384, cert-manager will
+  mint Ed25519 on request, and a certificate from a public CA is usually
+  still RSA — a daemon quietly serving only some of those fails at renewal
+  time, which is the worst moment to find out.
+
 ## [2.31.0] — 2026-09-11
 
 ### Changed

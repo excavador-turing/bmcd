@@ -49,7 +49,9 @@ use clap::{command, value_parser, Arg, ArgAction};
 use config::Log;
 use futures::future::join_all;
 use openssl::{
-    pkey::{PKey, Private},
+    asn1::Asn1Time,
+    nid::Nid,
+    pkey::{Id, PKey, Private},
     ssl::{select_next_proto, AlpnError, SslAcceptor, SslMethod, SslVerifyMode},
     x509::{X509VerifyResult, X509},
 };
@@ -89,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(&config_path).context("Error parsing config file")?;
     let _logger_lifetime = init_logger(&config.log);
 
-    let tls = load_tls_config(&config.tls)?;
+    let (tls, certificate) = load_tls_config(&config.tls)?;
+    let certificate = Data::new(certificate);
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
     let serial_service = Data::new(SerialConnections::new());
     let streaming_data_service = Data::new(StreamingDataService::new());
@@ -233,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_server = HttpServer::new(move || {
         App::new()
             .app_data(metrics_bmc.clone())
+            .app_data(certificate.clone())
             .service(web::scope("/metrics").configure(metrics::config))
     })
     .workers(1)
@@ -453,7 +457,59 @@ fn load_keys_from_pem<P: AsRef<Path>>(
 /// length-prefixed wire form.
 const ALPN_HTTP11: &[u8] = b"\x08http/1.1";
 
-fn load_tls_config(tls_config: &config::Tls) -> anyhow::Result<SslAcceptor> {
+/// What to say about the certificate this listener serves, for `/metrics`.
+///
+/// Derived from the certificate the daemon actually loaded, not from a fresh
+/// read: replacing the file without restarting is precisely when a re-read
+/// would describe something the listener is not serving.
+///
+/// Everything here is already public -- it is sent to every client during the
+/// handshake -- so there is nothing to withhold from an unauthenticated
+/// scrape.
+fn certificate_facts(cert: &X509) -> metrics::Certificate {
+    metrics::Certificate {
+        expires_unix: certificate_expiry_unix(cert),
+        key: cert.public_key().ok().as_ref().map(describe_key),
+    }
+}
+
+/// ASN.1 times are not unix times. OpenSSL will not hand one over directly,
+/// so the distance from the epoch is measured and added up; a certificate
+/// whose date cannot be read reports nothing rather than 1970, which would
+/// fire every expiry alert ever written.
+fn certificate_expiry_unix(cert: &X509) -> Option<i64> {
+    let epoch = Asn1Time::from_unix(0).ok()?;
+    let diff = epoch.diff(cert.not_after()).ok()?;
+    Some(i64::from(diff.days) * 86_400 + i64::from(diff.secs))
+}
+
+/// `ecdsa-p384`, `ed25519`, `rsa-4096`. The first question anyone asks when a
+/// client will not negotiate, and a label rather than prose so a dashboard can
+/// group by it.
+fn describe_key(key: &PKey<openssl::pkey::Public>) -> String {
+    match key.id() {
+        Id::RSA => format!("rsa-{}", key.bits()),
+        Id::ED25519 => "ed25519".to_string(),
+        Id::ED448 => "ed448".to_string(),
+        Id::EC => match key.ec_key().ok().and_then(|ec| ec.group().curve_name()) {
+            Some(Nid::X9_62_PRIME256V1) => "ecdsa-p256".to_string(),
+            Some(Nid::SECP384R1) => "ecdsa-p384".to_string(),
+            Some(Nid::SECP521R1) => "ecdsa-p521".to_string(),
+            // A curve this build has no name for is still worth reporting:
+            // "some EC key" beats an absent series when someone is working
+            // out why a handshake fails.
+            _ => "ecdsa".to_string(),
+        },
+        _ => "other".to_string(),
+    }
+}
+
+/// Returns the acceptor and a description of what it will serve. Both come
+/// from one read of the certificate, so `/metrics` cannot disagree with the
+/// listener about which certificate is in use.
+fn load_tls_config(
+    tls_config: &config::Tls,
+) -> anyhow::Result<(SslAcceptor, metrics::Certificate)> {
     let (private_key, cert) = load_keys_from_pem(&tls_config.private_key, &tls_config.certificate)?;
     // `_v5`, and the suffix is the whole point: `mozilla_intermediate` is
     // Mozilla's version 4 profile, which pins the maximum protocol version to
@@ -518,7 +574,11 @@ fn load_tls_config(tls_config: &config::Tls) -> anyhow::Result<SslAcceptor> {
         tracing::info!("client certificates from {} will be trusted", ca.display());
     }
 
-    Ok(tls.build())
+    let facts = certificate_facts(&cert);
+    if let Some(key) = facts.key.as_deref() {
+        tracing::info!("serving a {key} certificate");
+    }
+    Ok((tls.build(), facts))
 }
 
 /// Pick a protocol from the client's ALPN list. `client_protocols` is
@@ -530,10 +590,9 @@ fn select_alpn(client_protocols: &[u8]) -> Result<&[u8], AlpnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openssl::asn1::Asn1Time;
     use openssl::ec::{EcGroup, EcKey};
     use openssl::hash::MessageDigest;
-    use openssl::nid::Nid;
+    use openssl::rsa::Rsa;
     use openssl::ssl::{SslConnector, SslVerifyMode, SslVersion};
     use openssl::x509::X509Builder;
     use std::io::Write;
@@ -642,13 +701,88 @@ mod tests {
         );
     }
 
+    /// Whatever certificate an operator installs, the daemon has to serve it.
+    ///
+    /// The estate rule is EC P-384, cert-manager will mint Ed25519 on request,
+    /// a certificate from a public CA is usually still RSA, and P-256 is what
+    /// most of the world defaults to. A daemon that quietly serves only some
+    /// of these is a daemon that fails at certificate-renewal time, which is
+    /// the worst moment to find out.
+    ///
+    /// Each case is a real handshake against the real acceptor, so it covers
+    /// the cipher list and the signature algorithms as well as loading the
+    /// PEM.
+    #[test]
+    fn the_acceptor_serves_every_key_an_operator_might_install() {
+        for kind in [
+            KeyKind::Rsa2048,
+            KeyKind::P256,
+            KeyKind::P384,
+            KeyKind::P521,
+            KeyKind::Ed25519,
+        ] {
+            let (_dir, tls) = throwaway_tls_config_of(kind, "bmcd-keykind");
+            assert_eq!(
+                handshake_version(&tls, None, None),
+                Some("TLSv1.3".to_string()),
+                "a {kind:?} certificate should be served over TLS 1.3"
+            );
+            assert_eq!(
+                handshake_version(&tls, Some(SslVersion::TLS1_2), None),
+                Some("TLSv1.2".to_string()),
+                "a {kind:?} certificate should also work for a TLS 1.2 client"
+            );
+        }
+    }
+
+    /// What `/metrics` will say about each kind of certificate. The expiry is
+    /// what SQU-115 needed and did not have; the key label is what anyone
+    /// debugging a refused handshake reaches for first.
+    #[test]
+    fn the_daemon_can_describe_the_certificate_it_serves() {
+        let cases = [
+            (KeyKind::Rsa2048, "rsa-2048"),
+            (KeyKind::P256, "ecdsa-p256"),
+            (KeyKind::P384, "ecdsa-p384"),
+            (KeyKind::P521, "ecdsa-p521"),
+            (KeyKind::Ed25519, "ed25519"),
+        ];
+
+        for (kind, expected) in cases {
+            let (_dir, tls) = throwaway_tls_config_of(kind, "bmcd-describe");
+            let (_acceptor, facts) = load_tls_config(&tls).expect("acceptor");
+
+            assert_eq!(facts.key.as_deref(), Some(expected));
+
+            // The helper writes a certificate valid for one day, so the expiry
+            // must land in the next 24 hours. Asserted as a window rather than
+            // a value: the point is that an ASN.1 date became a usable unix
+            // time at all, which is the step that silently produces 1970 when
+            // it goes wrong.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs() as i64;
+            let expires = facts.expires_unix.expect("an expiry");
+            assert!(
+                expires > now && expires <= now + 86_400 + 60,
+                "{kind:?}: expiry {expires} is not within the next day of {now}"
+            );
+        }
+    }
+
     /// A temp dir plus the `config::Tls` pointing into it. The dir is returned
     /// because dropping it deletes the files the acceptor needs.
     fn throwaway_tls_config(name: &str) -> (tempdir::TempDir, config::Tls) {
+        throwaway_tls_config_of(KeyKind::P384, name)
+    }
+
+    /// The same, on a chosen key type.
+    fn throwaway_tls_config_of(kind: KeyKind, name: &str) -> (tempdir::TempDir, config::Tls) {
         let dir = tempdir::TempDir::new(name).expect("temp dir");
         let key_path = dir.path().join("key.pem");
         let cert_path = dir.path().join("cert.pem");
-        write_self_signed_pair(&key_path, &cert_path);
+        write_self_signed_pair_of(kind, &key_path, &cert_path);
         let tls = config::Tls {
             private_key: key_path,
             certificate: cert_path,
@@ -666,7 +800,7 @@ mod tests {
         client_max: Option<SslVersion>,
         client_groups: Option<&str>,
     ) -> Option<String> {
-        let acceptor = load_tls_config(tls).expect("acceptor");
+        let (acceptor, _) = load_tls_config(tls).expect("acceptor");
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("local addr");
 
@@ -712,7 +846,7 @@ mod tests {
     /// with the client offering `client_alpn`, and returns what the client
     /// sees as the negotiated protocol.
     fn handshake_and_report_alpn(tls: &config::Tls, client_alpn: &[u8]) -> Option<Vec<u8>> {
-        let acceptor = load_tls_config(tls).expect("acceptor");
+        let (acceptor, _) = load_tls_config(tls).expect("acceptor");
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("local addr");
 
@@ -747,12 +881,56 @@ mod tests {
         client_view
     }
 
-    /// A throwaway self-signed EC P-384 certificate, written out as the PEM
+    /// Which kind of key a throwaway certificate is built on. An operator can
+    /// install any of these -- the estate rule is P-384, cert-manager will
+    /// happily mint Ed25519, and a certificate bought from a public CA is
+    /// still usually RSA -- so all of them have to work.
+    #[derive(Clone, Copy, Debug)]
+    enum KeyKind {
+        Rsa2048,
+        P256,
+        P384,
+        P521,
+        Ed25519,
+    }
+
+    impl KeyKind {
+        fn generate(self) -> PKey<Private> {
+            match self {
+                // 2048 rather than 4096: this runs in a unit test on every
+                // developer's machine and in CI, and the bit count is not what
+                // is under test.
+                KeyKind::Rsa2048 => {
+                    PKey::from_rsa(Rsa::generate(2048).expect("rsa key")).expect("pkey")
+                }
+                KeyKind::P256 => Self::ec(Nid::X9_62_PRIME256V1),
+                KeyKind::P384 => Self::ec(Nid::SECP384R1),
+                KeyKind::P521 => Self::ec(Nid::SECP521R1),
+                KeyKind::Ed25519 => PKey::generate_ed25519().expect("ed25519 key"),
+            }
+        }
+
+        fn ec(nid: Nid) -> PKey<Private> {
+            let group = EcGroup::from_curve_name(nid).expect("curve");
+            PKey::from_ec_key(EcKey::generate(&group).expect("key")).expect("pkey")
+        }
+
+        /// Ed25519 carries its own hash and REFUSES a digest: passing one to
+        /// `X509Builder::sign` fails. Everything else needs one named.
+        fn digest(self) -> MessageDigest {
+            match self {
+                KeyKind::Ed25519 => MessageDigest::null(),
+                KeyKind::P521 => MessageDigest::sha512(),
+                KeyKind::P384 => MessageDigest::sha384(),
+                _ => MessageDigest::sha256(),
+            }
+        }
+    }
+
+    /// A throwaway self-signed certificate on `kind`, written out as the PEM
     /// pair `load_keys_from_pem` expects.
-    fn write_self_signed_pair(key_path: &Path, cert_path: &Path) {
-        let group = EcGroup::from_curve_name(Nid::SECP384R1).expect("P-384");
-        let ec_key = EcKey::generate(&group).expect("key");
-        let pkey = PKey::from_ec_key(ec_key).expect("pkey");
+    fn write_self_signed_pair_of(kind: KeyKind, key_path: &Path, cert_path: &Path) {
+        let pkey = kind.generate();
 
         let mut builder = X509Builder::new().expect("x509 builder");
         builder.set_version(2).expect("version");
@@ -763,9 +941,7 @@ mod tests {
             .set_not_after(&Asn1Time::days_from_now(1).expect("not after"))
             .expect("not after");
         builder.set_pubkey(&pkey).expect("pubkey");
-        builder
-            .sign(&pkey, MessageDigest::sha384())
-            .expect("self-sign");
+        builder.sign(&pkey, kind.digest()).expect("self-sign");
         let cert = builder.build();
 
         std::fs::File::create(key_path)
@@ -776,5 +952,10 @@ mod tests {
             .expect("cert file")
             .write_all(&cert.to_pem().expect("cert pem"))
             .expect("write cert");
+    }
+
+    /// The estate's own key type, for the tests that do not care which.
+    fn write_self_signed_pair(key_path: &Path, cert_path: &Path) {
+        write_self_signed_pair_of(KeyKind::P384, key_path, cert_path);
     }
 }

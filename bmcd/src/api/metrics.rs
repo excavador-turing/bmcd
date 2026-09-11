@@ -72,6 +72,30 @@ pub struct NodePower {
     pub power_on_seconds: Option<u64>,
 }
 
+/// What the daemon knows about the certificate it is serving.
+///
+/// Read once, at start, because that is when the certificate is read -- this
+/// is a description of the running listener, not of whatever happens to be on
+/// disk now. Replacing the file and not restarting is exactly the situation
+/// where a fresh read would lie.
+///
+/// It exists because of SQU-115: a board served a certificate that had expired
+/// more than a year earlier and nothing anywhere said so. A number a scrape
+/// can alert on is the difference between that and a calendar reminder
+/// somebody stops reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Certificate {
+    /// Seconds since the epoch at which it stops being valid. `None` when the
+    /// daemon could not make sense of the date, which is reported as an absent
+    /// series rather than a zero -- a zero here reads as 1970 and would fire
+    /// every alert ever written.
+    pub expires_unix: Option<i64>,
+    /// How the key is described in the exposition: `ecdsa-p384`, `ed25519`,
+    /// `rsa-4096`. Not secret, and the first question asked when a client
+    /// cannot negotiate.
+    pub key: Option<String>,
+}
+
 /// Everything one scrape reports, gathered before any of it is formatted.
 /// Collection touches the board; rendering is a pure function of this, which
 /// is what makes the exposition testable against numbers read off hardware.
@@ -84,6 +108,7 @@ pub struct Snapshot {
     pub nodes: Vec<NodePower>,
     pub health: Health,
     pub firmware: FirmwareSlots,
+    pub certificate: Certificate,
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
@@ -92,8 +117,16 @@ pub fn config(cfg: &mut web::ServiceConfig) {
 
 /// No credential is asked for. This handler is only ever mounted on the
 /// metrics listener, which serves nothing else; see the note in `main`.
-async fn handle_metrics(bmc: web::Data<BmcApplication>) -> impl Responder {
-    let snapshot = collect(bmc.as_ref()).await;
+async fn handle_metrics(
+    bmc: web::Data<BmcApplication>,
+    // Optional so a listener assembled without it still serves every other
+    // family, rather than answering 500 for want of one gauge.
+    certificate: Option<web::Data<Certificate>>,
+) -> impl Responder {
+    let certificate = certificate
+        .map(|data| data.as_ref().clone())
+        .unwrap_or_default();
+    let snapshot = collect(bmc.as_ref(), certificate).await;
     HttpResponse::Ok()
         .content_type(CONTENT_TYPE)
         .body(render(&snapshot))
@@ -102,7 +135,7 @@ async fn handle_metrics(bmc: web::Data<BmcApplication>) -> impl Responder {
 /// Reads everything a scrape reports. Every source here already answers with
 /// its own absences, so a board missing any of them produces a shorter
 /// document rather than a failed scrape.
-async fn collect(bmc: &BmcApplication) -> Snapshot {
+async fn collect(bmc: &BmcApplication, certificate: Certificate) -> Snapshot {
     let node_infos = bmc.get_node_infos().await.unwrap_or_default();
     let mut nodes = Vec::with_capacity(node_infos.len());
     for (index, node) in [NodeId::Node1, NodeId::Node2, NodeId::Node3, NodeId::Node4]
@@ -133,6 +166,7 @@ async fn collect(bmc: &BmcApplication) -> Snapshot {
         nodes,
         health: get_health().await,
         firmware: get_firmware_slots(super::legacy::firmware_version().await).await,
+        certificate,
     }
 }
 
@@ -293,6 +327,7 @@ fn render(snapshot: &Snapshot) -> String {
         )],
     );
 
+    render_certificate(&mut out, &snapshot.certificate);
     render_thermal(&mut out, snapshot);
     render_switch(&mut out, snapshot);
     render_nodes(&mut out, snapshot);
@@ -300,6 +335,36 @@ fn render(snapshot: &Snapshot) -> String {
     render_firmware(&mut out, &snapshot.firmware);
 
     out
+}
+
+/// Two families, both absent when the daemon could not read the certificate:
+/// an expiry a rule can alert on, and the key type, which is the first thing
+/// asked when a client cannot negotiate.
+fn render_certificate(out: &mut String, certificate: &Certificate) {
+    family(
+        out,
+        "bmcd_tls_certificate_expiry_timestamp_seconds",
+        "gauge",
+        "When the certificate this listener serves stops being valid.",
+        &certificate
+            .expires_unix
+            .map(|at| Sample::new(Vec::new(), at as f64))
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+
+    family(
+        out,
+        "bmcd_tls_certificate_info",
+        "gauge",
+        "The key the certificate this listener serves is built on.",
+        &certificate
+            .key
+            .as_deref()
+            .map(|key| Sample::new(labels(&[("key", key)]), 1.0))
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
 }
 
 fn render_thermal(out: &mut String, snapshot: &Snapshot) {
@@ -817,8 +882,43 @@ mod tests {
     /// the six switch ports, the NAND counts, the memory total, node 1's
     /// power-on time and both firmware volumes are numbers read off the
     /// board; the rest is shaped like it.
+    /// The two certificate families, pinned. Absent ones render nothing at
+    /// all rather than a zero: `bmcd_tls_certificate_expiry_timestamp_seconds 0`
+    /// reads as "expired in 1970" and would fire every alert written against
+    /// it, which is worse than silence.
+    #[test]
+    fn the_certificate_families_render_or_stay_away() {
+        let mut snapshot = a_healthy_board();
+        snapshot.certificate = Certificate {
+            expires_unix: Some(1_789_000_000),
+            key: Some("ecdsa-p384".to_string()),
+        };
+        let rendered = render(&snapshot);
+        assert!(rendered.contains(concat!(
+            "# HELP bmcd_tls_certificate_expiry_timestamp_seconds When the certificate this listener serves stops being valid.\n",
+            "# TYPE bmcd_tls_certificate_expiry_timestamp_seconds gauge\n",
+            "bmcd_tls_certificate_expiry_timestamp_seconds 1789000000\n",
+        )), "expiry family missing from:\n{rendered}");
+        assert!(
+            rendered.contains(concat!(
+                "# TYPE bmcd_tls_certificate_info gauge\n",
+                "bmcd_tls_certificate_info{key=\"ecdsa-p384\"} 1\n",
+            )),
+            "info family missing from:\n{rendered}"
+        );
+
+        let quiet = render(&a_healthy_board());
+        assert!(
+            !quiet.contains("bmcd_tls_certificate"),
+            "a daemon that could not read its certificate must say nothing"
+        );
+    }
+
     fn a_healthy_board() -> Snapshot {
         Snapshot {
+            // The listener is not part of these fixtures; the
+            // certificate families are pinned in their own test.
+            certificate: Certificate::default(),
             daemon_version: "2.3.7".to_string(),
             sensors: vec![Sensor {
                 name: "bmc-thermal".to_string(),
@@ -932,6 +1032,9 @@ mod tests {
     /// always true -- which daemon answered, and that there is no RTC.
     fn a_silent_board() -> Snapshot {
         Snapshot {
+            // The listener is not part of these fixtures; the
+            // certificate families are pinned in their own test.
+            certificate: Certificate::default(),
             daemon_version: "2.3.7".to_string(),
             sensors: Vec::new(),
             cooling: Vec::new(),
