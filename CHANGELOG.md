@@ -8,6 +8,34 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.31.0] — 2026-09-11
+
+### Changed
+
+- **The daemon offers TLS 1.3, with 1.2 as the fallback.** The acceptor was
+  built from Mozilla's version 4 intermediate profile, which pins the maximum
+  protocol version to TLS 1.2; the board's OpenSSL is 3.5.7 and was capable of
+  1.3 all along. The v5 profile is 1.2 and 1.3 together, so no client loses
+  anything.
+
+  This is not a modernisation. A TLS-1.2-only server changes what a client has
+  to send: under 1.2 the client's `supported_groups` extension constrains the
+  curve of the SERVER's certificate as well as the key exchange (RFC 4492
+  §5.1). A client whose curve list stops at P-256 — which is Envoy's default —
+  cannot use a P-384 certificate and gets `handshake_failure`. Every
+  certificate in the estate this daemon runs in is P-384.
+
+  What that looked like: a proxy holding a valid client certificate, failing
+  every handshake, while the page in front of it drew perfectly and every board
+  card said the board did not answer. The only trace was the proxy's own
+  `ssl.connection_error` counter.
+
+  Two tests cover it, and both were confirmed to fail without the change:
+  `the_acceptor_offers_tls13_and_still_falls_back_to_tls12`, and
+  `a_client_with_envoys_default_curves_can_reach_a_p384_certificate`, which
+  also asserts that the same client pinned to TLS 1.2 still cannot get in — so
+  the test cannot quietly stop proving anything.
+
 ## [2.30.0] — 2026-09-11
 
 ### Added

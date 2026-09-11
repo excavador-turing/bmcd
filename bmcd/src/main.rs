@@ -455,7 +455,27 @@ const ALPN_HTTP11: &[u8] = b"\x08http/1.1";
 
 fn load_tls_config(tls_config: &config::Tls) -> anyhow::Result<SslAcceptor> {
     let (private_key, cert) = load_keys_from_pem(&tls_config.private_key, &tls_config.certificate)?;
-    let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    // `_v5`, and the suffix is the whole point: `mozilla_intermediate` is
+    // Mozilla's version 4 profile, which pins the maximum protocol version to
+    // TLS 1.2. The board's OpenSSL is 3.5.7 and offers TLS 1.3 perfectly well;
+    // this call was the only thing refusing it.
+    //
+    // A TLS-1.2-only server is not merely dated, it changes what a client has
+    // to send. Under 1.2 the client's `supported_groups` extension constrains
+    // the curve of the SERVER's certificate as well as the key exchange
+    // (RFC 4492 section 5.1), so a client whose curve list stops at P-256 --
+    // which is Envoy's default -- cannot use a P-384 certificate and gets
+    // handshake_failure. Under TLS 1.3 the certificate's curve is governed by
+    // `signature_algorithms` instead, and the problem does not arise.
+    //
+    // That cost a day: a proxy in front of this daemon, holding a valid
+    // certificate, failing every handshake while the page in front of IT
+    // looked healthy.
+    //
+    // v5 is 1.2 and 1.3, not 1.3 alone. TLS 1.3 is what any current client
+    // negotiates; 1.2 stays as the fallback, because a BMC is the thing you
+    // reach for with whatever client you have.
+    let mut tls = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
     tls.set_private_key(&private_key)?;
     tls.set_certificate(&cert)?;
 
@@ -514,7 +534,7 @@ mod tests {
     use openssl::ec::{EcGroup, EcKey};
     use openssl::hash::MessageDigest;
     use openssl::nid::Nid;
-    use openssl::ssl::{SslConnector, SslVerifyMode};
+    use openssl::ssl::{SslConnector, SslVerifyMode, SslVersion};
     use openssl::x509::X509Builder;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
@@ -569,6 +589,123 @@ mod tests {
         // completes -- the same fallback a client offering something unknown
         // would have got from actix-web.
         assert_eq!(handshake_and_report_alpn(&tls, b"\x02h2"), None);
+    }
+
+    /// TLS 1.3 is what this daemon should be negotiating, and 1.2 has to keep
+    /// working -- a BMC is reached with whatever client is to hand. A
+    /// regression here is silent from the daemon's side: everything still
+    /// connects, and only a client with a narrow curve list finds out.
+    #[test]
+    fn the_acceptor_offers_tls13_and_still_falls_back_to_tls12() {
+        let (_dir, tls) = throwaway_tls_config("bmcd-version");
+
+        assert_eq!(
+            handshake_version(&tls, None, None),
+            Some("TLSv1.3".to_string()),
+            "a client with no constraints should get TLS 1.3"
+        );
+        assert_eq!(
+            handshake_version(&tls, Some(SslVersion::TLS1_2), None),
+            Some("TLSv1.2".to_string()),
+            "a client that cannot do 1.3 must still be served"
+        );
+    }
+
+    /// The regression this is here to prevent, in one assertion.
+    ///
+    /// The certificate is P-384, because every certificate in this estate is.
+    /// Under TLS 1.2 the client's `supported_groups` also constrains the curve
+    /// of the server's certificate, so a client offering only X25519 and P-256
+    /// -- Envoy's default list -- cannot use it and the handshake fails. Under
+    /// TLS 1.3 that list governs the key exchange alone and the connection
+    /// succeeds.
+    ///
+    /// So this test passes only while 1.3 is on offer, and it is exactly the
+    /// failure that made two boards look dead behind a working login.
+    #[test]
+    fn a_client_with_envoys_default_curves_can_reach_a_p384_certificate() {
+        let (_dir, tls) = throwaway_tls_config("bmcd-curves");
+
+        assert_eq!(
+            handshake_version(&tls, None, Some("X25519:P-256")),
+            Some("TLSv1.3".to_string()),
+            "a narrow curve list must still reach a P-384 certificate, over 1.3"
+        );
+
+        // And the proof that the narrowness is real: pin the same client to
+        // TLS 1.2 and it cannot get in at all. If this ever starts passing,
+        // the premise above is wrong and the test above proves nothing.
+        assert_eq!(
+            handshake_version(&tls, Some(SslVersion::TLS1_2), Some("X25519:P-256")),
+            None,
+            "under TLS 1.2 a P-256-only client cannot use a P-384 certificate"
+        );
+    }
+
+    /// A temp dir plus the `config::Tls` pointing into it. The dir is returned
+    /// because dropping it deletes the files the acceptor needs.
+    fn throwaway_tls_config(name: &str) -> (tempdir::TempDir, config::Tls) {
+        let dir = tempdir::TempDir::new(name).expect("temp dir");
+        let key_path = dir.path().join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        write_self_signed_pair(&key_path, &cert_path);
+        let tls = config::Tls {
+            private_key: key_path,
+            certificate: cert_path,
+            client_ca: None,
+            identity_header: "x-forwarded-email".to_string(),
+        };
+        (dir, tls)
+    }
+
+    /// One handshake against the real acceptor, with the client optionally
+    /// capped to a protocol version and optionally restricted to a curve list.
+    /// `None` means the handshake did not complete.
+    fn handshake_version(
+        tls: &config::Tls,
+        client_max: Option<SslVersion>,
+        client_groups: Option<&str>,
+    ) -> Option<String> {
+        let acceptor = load_tls_config(tls).expect("acceptor");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // The server end is allowed to fail: half of what this measures is a
+        // handshake that does not happen.
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            acceptor
+                .accept(socket)
+                .ok()
+                .map(|stream| stream.ssl().version_str().to_string())
+        });
+
+        let mut connector = SslConnector::builder(SslMethod::tls()).expect("connector");
+        connector.set_verify(SslVerifyMode::NONE);
+        connector
+            .set_max_proto_version(client_max)
+            .expect("client max version");
+        if let Some(groups) = client_groups {
+            connector.set_groups_list(groups).expect("client groups");
+        }
+
+        let socket = TcpStream::connect(addr).expect("connect");
+        let client_view = connector
+            .build()
+            .configure()
+            .expect("configure")
+            .verify_hostname(false)
+            .use_server_name_indication(false)
+            .connect("localhost", socket)
+            .ok()
+            .map(|stream| stream.ssl().version_str().to_string());
+
+        let server_view = server.join().expect("server thread");
+        assert_eq!(
+            client_view, server_view,
+            "the two ends disagree about what happened"
+        );
+        client_view
     }
 
     /// Runs one TLS handshake against the acceptor `load_tls_config` builds,
