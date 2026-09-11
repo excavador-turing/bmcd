@@ -82,21 +82,26 @@ pub enum Trust {
     Unverified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// Deserialize as well as Serialize: the same shape is written to
+/// /mnt/overlay/firmware-catalog.json and read back at the next boot, so the
+/// wire format and the stored format are one format by construction. Every
+/// field that is skipped when serialising takes `default`, or a settled
+/// catalogue would fail to load the moment it omitted one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Candidate {
     pub version: String,
     pub relation: Relation,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prerelease: bool,
     pub trust: Trust,
     /// For a local candidate, the file it came from.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceCatalog {
     pub id: String,
     pub label: String,
@@ -107,11 +112,11 @@ pub struct SourceCatalog {
     /// reason. An empty list with no error means the source genuinely offers
     /// nothing; an empty list WITH an error means it could not be read. The
     /// page must not collapse those two into "up to date".
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Catalog {
     pub checked_at: String,
     pub running: String,
@@ -121,7 +126,7 @@ pub struct Catalog {
     /// The page draws a spinner on its "check now" control and leaves the
     /// list underneath readable, rather than blanking or freezing. Skipped
     /// when false so a settled catalogue serialises as it always did.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refreshing: bool,
     /// How old these answers are. A caller that needs to say "as of a minute
     /// ago" should not have to parse `checked_at` and trust two clocks.
@@ -285,6 +290,100 @@ fn resolve(
             }
             Err(e) => (Vec::new(), Some(e), None),
         },
+    }
+}
+
+/// Where the last good listing is kept between boots.
+///
+/// Beside `firmware-sources.json`, and on the overlay for the same reason:
+/// both firmware images mount it, so the cache survives an A/B promotion --
+/// which is exactly the moment someone opens this page.
+pub const CATALOG_PATH: &str = "/mnt/overlay/firmware-catalog.json";
+
+/// The longest a cache read off disk is allowed to claim as its age.
+///
+/// A board whose clock was wrong when it wrote, or which has been off for a
+/// month, would otherwise report an age measured in weeks or a negative one.
+/// Either is nonsense to show; both mean the same thing, which is "old enough
+/// that it is being refreshed right now".
+const MAX_RESTORED_AGE: Duration = Duration::from_secs(86_400);
+
+/// Read the listing left by the last run, if there is one.
+///
+/// Every failure here is a miss, not an error: an absent file is the normal
+/// state of a board that has never refreshed, and a corrupt one is not worth
+/// refusing to boot over. The fan-out that follows will replace it.
+async fn restore() -> Option<Cached> {
+    let body = tokio::fs::read_to_string(CATALOG_PATH).await.ok()?;
+    let value: Catalog = serde_json::from_str(&body)
+        .map_err(|e| tracing::warn!("ignoring an unreadable {CATALOG_PATH}: {e}"))
+        .ok()?;
+
+    // Age comes from the stored timestamp, not from the file's mtime: what a
+    // reader needs to know is when the SOURCES were asked, and the two differ
+    // whenever the file was copied, restored from a backup, or written by the
+    // other firmware image.
+    let age = chrono::DateTime::parse_from_rfc3339(&value.checked_at)
+        .ok()
+        .and_then(|when| {
+            (chrono::Utc::now() - when.with_timezone(&chrono::Utc))
+                .to_std()
+                .ok()
+        })
+        .unwrap_or(MAX_RESTORED_AGE)
+        .min(MAX_RESTORED_AGE);
+
+    Some(Cached {
+        at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+        value,
+        // Restored, therefore stale by definition: `get` compares the age
+        // against FRESH and starts a refresh behind the answer it serves.
+        ok: true,
+    })
+}
+
+/// Do two catalogues say the same thing about what is on offer?
+///
+/// `checked_at` and `age_seconds` move on every refresh and say nothing about
+/// the sources, so they are not part of the answer. Comparing the whole struct
+/// would make every refresh a change, which is exactly the write this is here
+/// to avoid.
+fn same_offering(a: &Catalog, b: &Catalog) -> bool {
+    a.running == b.running && a.sources == b.sources
+}
+
+/// Write the listing, but only if it says something different.
+///
+/// THE COMPARISON IS THE POINT. This is NAND, and on the reference board UBI
+/// reports five free eraseblocks of 2040. A catalogue rewritten on every
+/// refresh would be thousands of writes a year to a flash that is already
+/// fully allocated, for bytes that change when somebody publishes a release --
+/// a few times a week at most.
+///
+/// Failures are logged and swallowed. A board that cannot write its cache
+/// still works; it just pays for a fan-out after each boot, which is what it
+/// did before this existed.
+async fn persist(value: &Catalog) {
+    if !crate::app::firmware_sources::storage_available() {
+        return;
+    }
+    if let Ok(existing) = tokio::fs::read_to_string(CATALOG_PATH).await {
+        if let Ok(old) = serde_json::from_str::<Catalog>(&existing) {
+            if same_offering(&old, value) {
+                return;
+            }
+        }
+    }
+
+    let body = match serde_json::to_string(value) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!("cannot serialise the firmware catalogue: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tokio::fs::write(CATALOG_PATH, body).await {
+        tracing::warn!("cannot write {CATALOG_PATH}: {e}");
     }
 }
 
@@ -460,6 +559,15 @@ async fn fan_out() -> Catalog {
         value: value.clone(),
         ok,
     });
+
+    // Only a complete answer is kept. A fan-out where one source errored is
+    // good enough to show -- the page renders the error beside the others --
+    // and not good enough to leave on disk, where a transient failure would
+    // become the listing a board boots with for as long as it keeps failing.
+    if ok {
+        persist(&value).await;
+    }
+
     value
 }
 
@@ -508,10 +616,29 @@ fn spawn_refresh() {
 
 /// Primes the catalogue at start-up, so the first page to ask has an answer.
 ///
-/// Without it the first caller after a boot pays for the fan-out, which is
-/// precisely the person watching a board come back from a firmware update.
+/// Two halves. The listing the last run wrote is loaded FIRST and
+/// synchronously enough that the next caller gets it, which is what makes a
+/// board answer immediately after a reboot instead of making the person who
+/// just flashed it wait through a fan-out. Then the refresh starts behind it,
+/// exactly as it always did, and the answer is replaced when it arrives.
+///
+/// Restored or not, the age is real: `get` reports it, and a page that says
+/// "checked four hours ago" while it refreshes is telling the truth about
+/// both.
 pub fn prime() {
-    spawn_refresh();
+    tokio::spawn(async {
+        if let Some(restored) = restore().await {
+            let mut guard = cache().lock().await;
+            if guard.is_none() {
+                tracing::info!(
+                    "restored the firmware catalogue from {CATALOG_PATH}, checked {}",
+                    restored.value.checked_at
+                );
+                *guard = Some(restored);
+            }
+        }
+        spawn_refresh();
+    });
 }
 
 /// Every enabled source's offering.
@@ -738,6 +865,69 @@ mod tests {
     #[test]
     fn the_clock_never_collides_with_unclaimed() {
         assert!(now_secs() > 0);
+    }
+
+    fn one_source(version: &str) -> SourceCatalog {
+        SourceCatalog {
+            id: "fork".into(),
+            label: "this fork".into(),
+            kind: SourceKind::Github,
+            location: "excavador-turing/BMC-Firmware".into(),
+            candidates: vec![Candidate {
+                version: version.into(),
+                relation: Relation::Current,
+                prerelease: false,
+                trust: Trust::Verified,
+                file: None,
+                size_bytes: None,
+            }],
+            error: None,
+        }
+    }
+
+    fn catalog_at(when: &str, version: &str, age: u64) -> Catalog {
+        Catalog {
+            checked_at: when.into(),
+            running: "v2.26.0".into(),
+            sources: vec![one_source(version)],
+            refreshing: false,
+            age_seconds: age,
+        }
+    }
+
+    /// The stored catalogue is the wire catalogue, and the wire catalogue
+    /// omits every field that is false or absent. Without `default` on those
+    /// fields a settled listing would write cleanly and fail to load, and the
+    /// board would silently go back to paying for a fan-out every boot.
+    #[test]
+    fn a_stored_catalogue_reads_back_as_itself() {
+        let before = catalog_at("2026-09-12T00:00:00Z", "v2.26.0", 0);
+        let body = serde_json::to_string(&before).expect("serialises");
+        assert!(!body.contains("refreshing"), "{body}");
+        assert!(!body.contains("prerelease"), "{body}");
+
+        let after: Catalog = serde_json::from_str(&body).expect("reads back");
+        assert_eq!(before, after);
+    }
+
+    /// The write-on-change rule, which exists because this is NAND: the
+    /// reference board has five free eraseblocks of 2040, and a catalogue
+    /// rewritten on every refresh would be thousands of writes a year for
+    /// bytes that change when somebody publishes a release.
+    #[test]
+    fn only_a_changed_offering_is_worth_a_write() {
+        let earlier = catalog_at("2026-09-12T00:00:00Z", "v2.26.0", 0);
+        let later = catalog_at("2026-09-12T00:30:00Z", "v2.26.0", 1800);
+        assert!(
+            same_offering(&earlier, &later),
+            "a later check of the same releases is not a change"
+        );
+
+        let published = catalog_at("2026-09-12T01:00:00Z", "v2.27.0", 0);
+        assert!(
+            !same_offering(&earlier, &published),
+            "a new release is a change and must reach the disk"
+        );
     }
 
     /// The shape the HTTP listing emits has a `url` key rather than `repo`,
