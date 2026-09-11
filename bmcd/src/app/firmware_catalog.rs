@@ -30,7 +30,7 @@ use crate::app::firmware_sources::{Source, SourceKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -82,21 +82,26 @@ pub enum Trust {
     Unverified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// Deserialize as well as Serialize: the same shape is written to
+/// /mnt/overlay/firmware-catalog.json and read back at the next boot, so the
+/// wire format and the stored format are one format by construction. Every
+/// field that is skipped when serialising takes `default`, or a settled
+/// catalogue would fail to load the moment it omitted one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Candidate {
     pub version: String,
     pub relation: Relation,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prerelease: bool,
     pub trust: Trust,
     /// For a local candidate, the file it came from.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceCatalog {
     pub id: String,
     pub label: String,
@@ -107,11 +112,11 @@ pub struct SourceCatalog {
     /// reason. An empty list with no error means the source genuinely offers
     /// nothing; an empty list WITH an error means it could not be read. The
     /// page must not collapse those two into "up to date".
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Catalog {
     pub checked_at: String,
     pub running: String,
@@ -121,7 +126,7 @@ pub struct Catalog {
     /// The page draws a spinner on its "check now" control and leaves the
     /// list underneath readable, rather than blanking or freezing. Skipped
     /// when false so a settled catalogue serialises as it always did.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refreshing: bool,
     /// How old these answers are. A caller that needs to say "as of a minute
     /// ago" should not have to parse `checked_at` and trust two clocks.
@@ -288,6 +293,100 @@ fn resolve(
     }
 }
 
+/// Where the last good listing is kept between boots.
+///
+/// Beside `firmware-sources.json`, and on the overlay for the same reason:
+/// both firmware images mount it, so the cache survives an A/B promotion --
+/// which is exactly the moment someone opens this page.
+pub const CATALOG_PATH: &str = "/mnt/overlay/firmware-catalog.json";
+
+/// The longest a cache read off disk is allowed to claim as its age.
+///
+/// A board whose clock was wrong when it wrote, or which has been off for a
+/// month, would otherwise report an age measured in weeks or a negative one.
+/// Either is nonsense to show; both mean the same thing, which is "old enough
+/// that it is being refreshed right now".
+const MAX_RESTORED_AGE: Duration = Duration::from_secs(86_400);
+
+/// Read the listing left by the last run, if there is one.
+///
+/// Every failure here is a miss, not an error: an absent file is the normal
+/// state of a board that has never refreshed, and a corrupt one is not worth
+/// refusing to boot over. The fan-out that follows will replace it.
+async fn restore() -> Option<Cached> {
+    let body = tokio::fs::read_to_string(CATALOG_PATH).await.ok()?;
+    let value: Catalog = serde_json::from_str(&body)
+        .map_err(|e| tracing::warn!("ignoring an unreadable {CATALOG_PATH}: {e}"))
+        .ok()?;
+
+    // Age comes from the stored timestamp, not from the file's mtime: what a
+    // reader needs to know is when the SOURCES were asked, and the two differ
+    // whenever the file was copied, restored from a backup, or written by the
+    // other firmware image.
+    let age = chrono::DateTime::parse_from_rfc3339(&value.checked_at)
+        .ok()
+        .and_then(|when| {
+            (chrono::Utc::now() - when.with_timezone(&chrono::Utc))
+                .to_std()
+                .ok()
+        })
+        .unwrap_or(MAX_RESTORED_AGE)
+        .min(MAX_RESTORED_AGE);
+
+    Some(Cached {
+        at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+        value,
+        // Restored, therefore stale by definition: `get` compares the age
+        // against FRESH and starts a refresh behind the answer it serves.
+        ok: true,
+    })
+}
+
+/// Do two catalogues say the same thing about what is on offer?
+///
+/// `checked_at` and `age_seconds` move on every refresh and say nothing about
+/// the sources, so they are not part of the answer. Comparing the whole struct
+/// would make every refresh a change, which is exactly the write this is here
+/// to avoid.
+fn same_offering(a: &Catalog, b: &Catalog) -> bool {
+    a.running == b.running && a.sources == b.sources
+}
+
+/// Write the listing, but only if it says something different.
+///
+/// THE COMPARISON IS THE POINT. This is NAND, and on the reference board UBI
+/// reports five free eraseblocks of 2040. A catalogue rewritten on every
+/// refresh would be thousands of writes a year to a flash that is already
+/// fully allocated, for bytes that change when somebody publishes a release --
+/// a few times a week at most.
+///
+/// Failures are logged and swallowed. A board that cannot write its cache
+/// still works; it just pays for a fan-out after each boot, which is what it
+/// did before this existed.
+async fn persist(value: &Catalog) {
+    if !crate::app::firmware_sources::storage_available() {
+        return;
+    }
+    if let Ok(existing) = tokio::fs::read_to_string(CATALOG_PATH).await {
+        if let Ok(old) = serde_json::from_str::<Catalog>(&existing) {
+            if same_offering(&old, value) {
+                return;
+            }
+        }
+    }
+
+    let body = match serde_json::to_string(value) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!("cannot serialise the firmware catalogue: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tokio::fs::write(CATALOG_PATH, body).await {
+        tracing::warn!("cannot write {CATALOG_PATH}: {e}");
+    }
+}
+
 struct Cached {
     at: Instant,
     value: Catalog,
@@ -299,14 +398,79 @@ fn cache() -> &'static Mutex<Option<Cached>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// Whether a fan-out is already running.
+/// The longest a fan-out may hold the claim before another may take it.
 ///
-/// Without this, every press of "check now" and every page that opened while
-/// one was in flight would start another, and four sources would become
-/// twelve requests against a GitHub quota of sixty an hour.
-fn refreshing() -> &'static AtomicBool {
-    static REFRESHING: OnceLock<AtomicBool> = OnceLock::new();
-    REFRESHING.get_or_init(|| AtomicBool::new(false))
+/// Not a guess at how long the work takes -- it is how long a LOST refresh is
+/// allowed to block every future one. The fan-out was 74-78 s when it was
+/// first measured; on 2026-09-12 bmc-1 took 75-100 s and bmc-2 took about
+/// 230 s for the same four sources. Ten minutes is comfortably past the
+/// slowest real one and still short enough that a person who walks away and
+/// comes back finds a board that works.
+const REFRESH_CLAIM: Duration = Duration::from_secs(600);
+
+/// When the running fan-out claimed the right to run, as seconds since this
+/// process started. Zero means nobody holds it.
+///
+/// A bool here was a deadlock. `swap(true)` claims and `Drop` releases, which
+/// is correct for a panic and wrong for everything else: a task dropped before
+/// its first poll never constructs the guard, and a blocking join that never
+/// returns never drops it. Either way the flag stayed set, `spawn_refresh`
+/// returned early for ever after, and the board could not check for firmware
+/// again until `bmcd` restarted. bmc-2 sat like that for three and a half
+/// hours on 2026-09-11 with no fan-out process running at all (SQU-201).
+///
+/// A deadline cannot deadlock. The claim expires whether or not anything is
+/// there to release it.
+fn refresh_claim() -> &'static AtomicU64 {
+    static CLAIMED_AT: OnceLock<AtomicU64> = OnceLock::new();
+    CLAIMED_AT.get_or_init(|| AtomicU64::new(0))
+}
+
+/// Seconds since the process started, never zero, so zero can mean "unclaimed".
+fn now_secs() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs() + 1
+}
+
+/// May a caller take the claim, given who holds it and what time it is?
+///
+/// Pure, and the only place the rule is written. `refreshing()` is its
+/// negation and `claim_refresh()` is it plus a compare-exchange, so a test of
+/// this is a test of both rather than of a copy of them.
+fn may_claim(held: u64, now: u64) -> bool {
+    held == 0 || now.saturating_sub(held) >= REFRESH_CLAIM.as_secs()
+}
+
+/// Is a fan-out running, as far as anyone can tell from here?
+fn refreshing() -> bool {
+    !may_claim(refresh_claim().load(AtomicOrdering::Acquire), now_secs())
+}
+
+/// Take the right to run a fan-out, unless someone holds it and has not run
+/// out of time.
+///
+/// The compare-exchange is what keeps the dedup the old bool provided: without
+/// it, every "check now" and every page opened during a refresh would start
+/// another, and four sources would become twelve requests against a GitHub
+/// quota of sixty an hour.
+fn claim_refresh() -> bool {
+    let now = now_secs();
+    loop {
+        let held = refresh_claim().load(AtomicOrdering::Acquire);
+        if !may_claim(held, now) {
+            return false;
+        }
+        if refresh_claim()
+            .compare_exchange(held, now, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn release_refresh() {
+    refresh_claim().store(0, AtomicOrdering::Release);
 }
 
 /// Asks every enabled source what it offers, all at once.
@@ -395,6 +559,15 @@ async fn fan_out() -> Catalog {
         value: value.clone(),
         ok,
     });
+
+    // Only a complete answer is kept. A fan-out where one source errored is
+    // good enough to show -- the page renders the error beside the others --
+    // and not good enough to leave on disk, where a transient failure would
+    // become the listing a board boots with for as long as it keeps failing.
+    if ok {
+        persist(&value).await;
+    }
+
     value
 }
 
@@ -405,35 +578,67 @@ async fn fan_out() -> Catalog {
 /// reader of the catalogue for as long as the slowest source took, so a page
 /// that wanted nothing but the cached list froze too.
 fn spawn_refresh() {
-    if refreshing().swap(true, AtomicOrdering::AcqRel) {
+    if !claim_refresh() {
         return;
     }
     tokio::spawn(async {
-        // The flag is cleared by a guard, not by a line after the await.
+        // Three things release the claim, and it takes all three.
         //
-        // Written the obvious way, a panic anywhere in the fan-out leaves the
-        // flag set for ever -- and a page polls every two seconds for as long
-        // as it is set, so one browser left open becomes a permanent 2-second
-        // poll of a board with 116 MB of RAM. That is a plausible contributor
-        // to the wedge on 2026-09-09 (SQU-172), and it is a bug whether or
-        // not it was the cause.
+        // The guard covers a panic. The timeout covers a fan-out that never
+        // finishes -- one `spawn_blocking` per source, and a blocking join
+        // that never returns would otherwise hold the guard for the life of
+        // the process. And the claim's own deadline covers this task never
+        // being polled at all, which constructs no guard and reaches no
+        // timeout.
+        //
+        // Only the first two are visible here. The third is the reason the
+        // claim is a deadline rather than a flag: a release that depends on
+        // this code running cannot rescue the case where it does not.
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
-                refreshing().store(false, AtomicOrdering::Release);
+                release_refresh();
             }
         }
         let _clear = Clear;
-        fan_out().await;
+        if tokio::time::timeout(REFRESH_CLAIM, fan_out())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "the firmware catalogue refresh did not finish within {}s; \
+                 leaving the cached listing in place",
+                REFRESH_CLAIM.as_secs()
+            );
+        }
     });
 }
 
 /// Primes the catalogue at start-up, so the first page to ask has an answer.
 ///
-/// Without it the first caller after a boot pays for the fan-out, which is
-/// precisely the person watching a board come back from a firmware update.
+/// Two halves. The listing the last run wrote is loaded FIRST and
+/// synchronously enough that the next caller gets it, which is what makes a
+/// board answer immediately after a reboot instead of making the person who
+/// just flashed it wait through a fan-out. Then the refresh starts behind it,
+/// exactly as it always did, and the answer is replaced when it arrives.
+///
+/// Restored or not, the age is real: `get` reports it, and a page that says
+/// "checked four hours ago" while it refreshes is telling the truth about
+/// both.
 pub fn prime() {
-    spawn_refresh();
+    tokio::spawn(async {
+        if let Some(restored) = restore().await {
+            let mut guard = cache().lock().await;
+            if guard.is_none() {
+                tracing::info!(
+                    "restored the firmware catalogue from {CATALOG_PATH}, checked {}",
+                    restored.value.checked_at
+                );
+                *guard = Some(restored);
+            }
+        }
+        spawn_refresh();
+    });
 }
 
 /// Every enabled source's offering.
@@ -464,7 +669,7 @@ pub async fn get(force: bool) -> Catalog {
     }
 
     value.age_seconds = age.as_secs();
-    value.refreshing = refreshing().load(AtomicOrdering::Acquire);
+    value.refreshing = refreshing();
     value
 }
 
@@ -607,22 +812,121 @@ mod tests {
     /// flight, must join the refresh already running rather than start
     /// another. Four sources became twelve requests against a GitHub quota of
     /// sixty an hour otherwise.
+    ///
+    /// This calls the shipped rule. The version before it rebuilt the claim
+    /// out of a local `AtomicBool` and asserted against that, which passed
+    /// whatever the daemon did.
     #[test]
     fn only_one_refresh_runs_at_a_time() {
-        let flag = AtomicBool::new(false);
-
-        // What spawn_refresh does: claim the flag, and give up if it was
-        // already claimed.
-        let claim = || !flag.swap(true, AtomicOrdering::AcqRel);
-
-        assert!(claim(), "the first caller starts the refresh");
-        assert!(!claim(), "the second joins it rather than starting another");
-        assert!(!claim(), "and so does the third");
-
-        flag.store(false, AtomicOrdering::Release);
+        let bound = REFRESH_CLAIM.as_secs();
+        assert!(may_claim(0, 100), "nobody holds it, so anyone may");
+        assert!(!may_claim(100, 100), "a refresh that just started holds it");
         assert!(
-            claim(),
-            "once it has finished, the next caller starts a new one"
+            !may_claim(100, 100 + bound - 1),
+            "and still holds it one second inside the bound"
+        );
+    }
+
+    /// The wedge this replaced a bool to fix.
+    ///
+    /// A task dropped before its first poll constructs no guard; a blocking
+    /// join that never returns drops none. With a bool the claim was then held
+    /// for the life of the process and the board could never check for
+    /// firmware again -- bmc-2 sat that way for three and a half hours on
+    /// 2026-09-11 with no fan-out process running at all (SQU-201).
+    ///
+    /// A deadline cannot be lost, so the next caller takes it.
+    #[test]
+    fn a_lost_refresh_stops_blocking_the_next_one() {
+        let bound = REFRESH_CLAIM.as_secs();
+        assert!(
+            may_claim(100, 100 + bound),
+            "at the bound the claim has expired and the next caller takes it"
+        );
+        assert!(
+            may_claim(100, 100 + bound * 40),
+            "and three and a half hours later it is certainly free"
+        );
+    }
+
+    /// A claim released normally is free at once, not at the deadline: the
+    /// common case must not wait ten minutes for the next "check now".
+    #[test]
+    fn a_finished_refresh_frees_the_claim_immediately() {
+        assert!(
+            may_claim(0, 100),
+            "release stores zero, and zero is claimable now"
+        );
+    }
+
+    /// `now_secs` must never return zero, because zero is how the claim says
+    /// "nobody holds it". A clock that starts at zero would make the first
+    /// refresh of a process look unclaimed to everyone.
+    #[test]
+    fn the_clock_never_collides_with_unclaimed() {
+        assert!(now_secs() > 0);
+    }
+
+    fn one_source(version: &str) -> SourceCatalog {
+        SourceCatalog {
+            id: "fork".into(),
+            label: "this fork".into(),
+            kind: SourceKind::Github,
+            location: "excavador-turing/BMC-Firmware".into(),
+            candidates: vec![Candidate {
+                version: version.into(),
+                relation: Relation::Current,
+                prerelease: false,
+                trust: Trust::Verified,
+                file: None,
+                size_bytes: None,
+            }],
+            error: None,
+        }
+    }
+
+    fn catalog_at(when: &str, version: &str, age: u64) -> Catalog {
+        Catalog {
+            checked_at: when.into(),
+            running: "v2.26.0".into(),
+            sources: vec![one_source(version)],
+            refreshing: false,
+            age_seconds: age,
+        }
+    }
+
+    /// The stored catalogue is the wire catalogue, and the wire catalogue
+    /// omits every field that is false or absent. Without `default` on those
+    /// fields a settled listing would write cleanly and fail to load, and the
+    /// board would silently go back to paying for a fan-out every boot.
+    #[test]
+    fn a_stored_catalogue_reads_back_as_itself() {
+        let before = catalog_at("2026-09-12T00:00:00Z", "v2.26.0", 0);
+        let body = serde_json::to_string(&before).expect("serialises");
+        assert!(!body.contains("refreshing"), "{body}");
+        assert!(!body.contains("prerelease"), "{body}");
+
+        let after: Catalog = serde_json::from_str(&body).expect("reads back");
+        assert_eq!(before, after);
+    }
+
+    /// The write-on-change rule, which exists because this is NAND: the
+    /// reference board has five free eraseblocks of 2040, and a catalogue
+    /// rewritten on every refresh would be thousands of writes a year for
+    /// bytes that change when somebody publishes a release.
+    #[test]
+    fn only_a_changed_offering_is_worth_a_write() {
+        let earlier = catalog_at("2026-09-12T00:00:00Z", "v2.26.0", 0);
+        let later = catalog_at("2026-09-12T00:30:00Z", "v2.26.0", 1800);
+        assert!(
+            same_offering(&earlier, &later),
+            "a later check of the same releases is not a change"
+        );
+
+        let published = catalog_at("2026-09-12T01:00:00Z", "v2.27.0", 0);
+        assert!(
+            !same_offering(&earlier, &published),
+            "a new release is a change and must reach the disk"
         );
     }
 
