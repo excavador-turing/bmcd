@@ -98,7 +98,7 @@ impl NodeDrivers {
         node: NodeId,
     ) -> Result<(rusb::Device<GlobalContext>, &dyn UsbBoot), UsbBootError> {
         tracing::info!("Checking for presence of a USB device...");
-        let expected = self.expected_port(node);
+        let expected = self.expected_ports(node);
         let devices = rusb::devices()?;
 
         // Devices a backend understands that are on the wrong port. Kept so a
@@ -127,21 +127,31 @@ impl NodeDrivers {
                     return Ok((dev, backend.as_ref()));
                 };
 
-                let here = UsbPortPath {
-                    bus: dev.bus_number(),
-                    ports: dev.port_numbers().unwrap_or_default(),
-                };
+                let here = Self::actual_path(&dev);
 
-                if &here == expected {
+                // PORTS, not the bus. The bus a device lands on is decided by
+                // its SPEED, not by where it is plugged in: this board pairs
+                // an OHCI and an EHCI controller as companions for the same
+                // physical ports, so a full-speed device appears on bus 1 and
+                // a high-speed one on bus 2 -- at the same port, on the same
+                // hub. A Rockchip in maskrom is high-speed, so pinning the bus
+                // to 1 refused every node it was asked to flash:
+                //
+                //   node 2 requested on 1-1.2; found Rockusb on 2-1.2 instead
+                //
+                // Measured on bmc-2, 2026-09-11, with a module that was
+                // perfectly healthy. The port chain is the part that says
+                // which module this is; the bus says nothing about identity.
+                if here.ports == *expected {
                     return Ok((dev, backend.as_ref()));
                 }
 
                 warn!(
-                    "ignoring {} on {}: node {} is on {}",
+                    "ignoring {} on {}: node {} is on port {}",
                     backend,
                     here,
                     node.number(),
-                    expected
+                    UsbPortPath::describe_ports(expected)
                 );
                 seen_elsewhere.push(format!("{} on {}", backend, here));
             }
@@ -150,41 +160,53 @@ impl NodeDrivers {
         Err(match expected {
             Some(expected) if !seen_elsewhere.is_empty() => UsbBootError::WrongPort {
                 node: node.number(),
-                port: expected.to_string(),
+                port: UsbPortPath::describe_ports(&expected),
                 found: seen_elsewhere.join(", "),
             },
             Some(expected) => UsbBootError::NotOnPort {
                 node: node.number(),
-                port: expected.to_string(),
+                port: UsbPortPath::describe_ports(&expected),
             },
             None => UsbBootError::NotSupported,
         })
     }
 
-    /// Where a node's device must appear, or `None` on a board that describes
+    /// Which hub port a node hangs off, or `None` on a board that describes
     /// no hub.
-    fn expected_port(&self, node: NodeId) -> Option<UsbPortPath> {
-        // Bus 1 is the controller the fanout hub hangs off; a device the hub
-        // is not on cannot be one of these nodes anyway, and `find_for_node`
-        // compares the whole path including the bus.
-        self.topology.as_ref()?.port_path(1, node.number())
+    ///
+    /// The chain of PORTS only. Deliberately not a bus number: see
+    /// `UsbPortPath::same_port`.
+    fn expected_ports(&self, node: NodeId) -> Option<Vec<u8>> {
+        self.topology.as_ref()?.node_ports(node.number())
+    }
+
+    /// Where the device that answered actually is. Built from the device
+    /// rather than from a constant, so anything downstream matching a sysfs
+    /// path gets the bus the kernel really used.
+    fn actual_path(device: &rusb::Device<GlobalContext>) -> UsbPortPath {
+        UsbPortPath {
+            bus: device.bus_number(),
+            ports: device.port_numbers().unwrap_or_default(),
+        }
     }
 
     pub async fn load_as_block_device(&self, node: NodeId) -> Result<PathBuf, UsbBootError> {
-        let expected = self.expected_port(node);
         let (device, driver) = self.find_for_node(node)?;
-        driver
-            .load_as_block_device(&device, expected.as_ref())
-            .await
+        let here = self
+            .expected_ports(node)
+            .map(|_| Self::actual_path(&device));
+        driver.load_as_block_device(&device, here.as_ref()).await
     }
 
     pub async fn load_as_stream(
         &self,
         node: NodeId,
     ) -> Result<Box<dyn DataTransport>, UsbBootError> {
-        let expected = self.expected_port(node);
         let (device, driver) = self.find_for_node(node)?;
-        driver.load_as_stream(&device, expected.as_ref()).await
+        let here = self
+            .expected_ports(node)
+            .map(|_| Self::actual_path(&device));
+        driver.load_as_stream(&device, here.as_ref()).await
     }
 }
 

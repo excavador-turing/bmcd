@@ -83,6 +83,18 @@ impl UsbPortPath {
     }
 }
 
+impl UsbPortPath {
+    /// A port chain with no bus, for messages: `1.2`. Used where naming a bus
+    /// would assert something the chain does not say.
+    pub fn describe_ports(ports: &[u8]) -> String {
+        ports
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
 impl std::fmt::Display for UsbPortPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.sysfs_name())
@@ -105,16 +117,32 @@ impl HubTopology {
         Self::read_from(Path::new(DEVICE_TREE))
     }
 
-    /// The port path a device on `node` (1-based) must appear at.
+    /// The full path INCLUDING a bus, for a bus you already know.
     ///
-    /// `None` for a node this hub does not describe, which is not the same as
-    /// a node that is absent: it means the board says nothing about where that
-    /// module would show up, and guessing is the thing being removed.
+    /// Test-only, and that is the point of the `cfg`: production code must not
+    /// reach for this, because knowing which bus a node is on means having
+    /// seen the device, and at that point the device's own bus number is the
+    /// answer. The tests use it to show that the same hub port yields two
+    /// different paths on the two companion controllers.
+    #[cfg(test)]
     pub fn port_path(&self, bus: u8, node: u8) -> Option<UsbPortPath> {
         self.node_ports.get(&node).map(|port| UsbPortPath {
             bus,
             ports: vec![self.hub_port, *port],
         })
+    }
+
+    /// The chain of ports a node hangs off, with no bus.
+    ///
+    /// This, not `port_path`, is what says which module a device is: the bus
+    /// a device lands on is chosen by its SPEED, because this board pairs an
+    /// OHCI and an EHCI controller as companions for the same physical ports.
+    /// The same hub port is `1-1.2` for a full-speed device and `2-1.2` for a
+    /// high-speed one.
+    pub fn node_ports(&self, node: u8) -> Option<Vec<u8>> {
+        self.node_ports
+            .get(&node)
+            .map(|port| vec![self.hub_port, *port])
     }
 
     /// Every node this hub describes, in order. For error messages that say
@@ -256,6 +284,62 @@ mod tests {
             topology.port_path(1, 4).map(|p| p.sysfs_name()),
             Some("1-1.1".to_string())
         );
+    }
+
+    /// The bus number is not part of a node's identity, and pinning it to 1
+    /// refused every flash this board was asked for.
+    ///
+    /// This board pairs an OHCI and an EHCI controller as companions for the
+    /// same physical ports, so the bus a device lands on is decided by its
+    /// SPEED. A Rockchip in maskrom is high-speed and appears on bus 2; the
+    /// old code expected `1-1.2` and reported
+    ///
+    ///   node 2 requested on 1-1.2; found Rockusb on 2-1.2 instead
+    ///
+    /// about a module that was entirely healthy. Measured on bmc-2 on
+    /// 2026-09-11.
+    #[test]
+    fn the_same_hub_port_is_the_same_node_on_either_bus() {
+        let dir = tempdir("companion");
+        v25_tree(&dir);
+        let topology = HubTopology::read_from(&dir).expect("a v2.5 tree");
+
+        let ports = topology.node_ports(2).expect("node 2");
+
+        // What the kernel called it on each controller, for the same module
+        // on the same hub port.
+        let full_speed = topology.port_path(1, 2).expect("node 2 on bus 1");
+        let high_speed = topology.port_path(2, 2).expect("node 2 on bus 2");
+
+        assert_eq!(full_speed.ports, ports);
+        assert_eq!(high_speed.ports, ports);
+        assert_ne!(
+            full_speed, high_speed,
+            "the two differ, which is exactly why identity cannot include the bus"
+        );
+        assert_eq!(full_speed.sysfs_name(), "1-1.2");
+        assert_eq!(high_speed.sysfs_name(), "2-1.2");
+    }
+
+    /// Two different modules must not collide once the bus is out of the
+    /// comparison -- the port chain has to carry the whole distinction.
+    #[test]
+    fn two_nodes_never_share_a_port_chain() {
+        let dir = tempdir("distinct");
+        v25_tree(&dir);
+        let topology = HubTopology::read_from(&dir).expect("a v2.5 tree");
+
+        let chains: Vec<Vec<u8>> = (1..=4)
+            .map(|node| topology.node_ports(node).expect("a node"))
+            .collect();
+
+        for (i, left) in chains.iter().enumerate() {
+            for (j, right) in chains.iter().enumerate() {
+                if i != j {
+                    assert_ne!(left, right, "nodes {} and {} share a port", i + 1, j + 1);
+                }
+            }
+        }
     }
 
     /// v2.4: a single mux, no hub in the tree. The caller must fall back to

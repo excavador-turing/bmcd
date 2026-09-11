@@ -8,6 +8,37 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.33.0] — 2026-09-11
+
+### Fixed
+
+- **A node's USB bus number is not part of its identity, and pinning it
+  refused every flash.** The port check added to stop a flash of node 2
+  writing node 1 compared the whole path — bus included — against a bus
+  hardcoded to 1. It is not a constant. This board pairs an OHCI and an EHCI
+  controller as companions for the same physical ports, so the bus a device
+  lands on is decided by its **speed**: the same hub port is `1-1.2` for a
+  full-speed device and `2-1.2` for a high-speed one.
+
+  A Rockchip in maskrom is high-speed. So every RK1 the daemon was asked to
+  flash or expose as mass storage was refused with
+
+  ```
+  node 2 requested on 1-1.2; found Rockusb on 2-1.2 instead
+  ```
+
+  about a module that was entirely healthy. Found on bmc-2 on 2026-09-11 while
+  trying to recover a node that would not boot.
+
+  The comparison is now on the port chain alone, which is the part that says
+  which module this is. Anything downstream that has to match a sysfs path —
+  finding the block device behind a module — is handed the path of the device
+  that actually answered, so it carries the bus the kernel really used rather
+  than a guess.
+
+  Two tests pin it: the same hub port resolves to the same node on either bus,
+  and no two nodes share a port chain once the bus is out of the comparison.
+
 ## [2.32.0] — 2026-09-11
 
 ### Added
