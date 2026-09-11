@@ -33,6 +33,9 @@ use crate::{
 use actix_files::{Files, NamedFile};
 use actix_http::HttpService;
 use actix_service::map_config;
+use actix_tls::accept::openssl::TlsStream;
+use actix_web::dev::Extensions;
+use actix_web::rt::net::TcpStream;
 use actix_web::{
     dev::{AppConfig, Server},
     http::{self, KeepAlive},
@@ -41,13 +44,14 @@ use actix_web::{
 };
 use anyhow::Context;
 use app::{bmc_application::BmcApplication, event_application::run_event_listener};
+use authentication::verified_proxy::VerifiedProxy;
 use clap::{command, value_parser, Arg, ArgAction};
 use config::Log;
 use futures::future::join_all;
 use openssl::{
     pkey::{PKey, Private},
-    ssl::{select_next_proto, AlpnError, SslAcceptor, SslMethod},
-    x509::X509,
+    ssl::{select_next_proto, AlpnError, SslAcceptor, SslMethod, SslVerifyMode},
+    x509::{X509VerifyResult, X509},
 };
 use std::{
     fs::OpenOptions,
@@ -95,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             "Access to Baseboard Management Controller",
             config.authentication.token_expires,
             config.authentication.authentication_attempts,
+            &config.tls.identity_header,
         )
         .await?,
     );
@@ -178,6 +183,31 @@ async fn main() -> anyhow::Result<()> {
             HttpService::build()
                 .keep_alive(KeepAlive::Os)
                 .client_disconnect_timeout(Duration::from_secs(1))
+                // Carry the TLS handshake's verdict on the client certificate
+                // into the request, where the authentication service can read
+                // it. This runs once per CONNECTION, which is the point: a
+                // request cannot acquire a certificate by claiming one, and
+                // no header can reach this data.
+                //
+                // `verify_result` is OK on a connection that presented
+                // nothing at all -- there was nothing to fail -- so the peer
+                // certificate has to be checked for as well. Trusting the
+                // verdict alone would admit every anonymous client on the
+                // management LAN as a trusted proxy, which is the whole of
+                // the authentication bypass this must not have.
+                .on_connect_ext(|stream: &TlsStream<TcpStream>, ext: &mut Extensions| {
+                    let ssl = stream.ssl();
+                    if ssl.verify_result() != X509VerifyResult::OK {
+                        return;
+                    }
+                    let Some(certificate) = ssl.peer_certificate() else {
+                        return;
+                    };
+                    ext.insert(VerifiedProxy::new(format!(
+                        "{:?}",
+                        certificate.subject_name()
+                    )));
+                })
                 .h1(map_config(app, |_| AppConfig::default()))
                 .openssl(tls.clone())
         })?
@@ -449,6 +479,25 @@ fn load_tls_config(tls_config: &config::Tls) -> anyhow::Result<SslAcceptor> {
     // a client offering something it does not recognise.
     tls.set_alpn_select_callback(|_ssl, client_protocols| select_alpn(client_protocols));
 
+    // Client certificates, when a CA to judge them by is configured.
+    //
+    // `PEER` without `FAIL_IF_NO_PEER_CERT` on purpose: this asks every client
+    // for a certificate and refuses the handshake if one is offered and does
+    // not verify, while letting a client that offers none through to the login
+    // page. A browser on the management LAN has no certificate and must still
+    // be able to log in -- that is the break-glass path, and it is the whole
+    // reason the board keeps its own interface.
+    //
+    // So a verified certificate is a statement ("a proxy holding our CA's
+    // certificate is calling") and its absence is not a denial. What the
+    // statement BUYS is decided in the authentication service, not here.
+    if let Some(ca) = tls_config.client_ca.as_ref() {
+        tls.set_ca_file(ca)
+            .with_context(|| format!("loading client CA from {}", ca.display()))?;
+        tls.set_verify(SslVerifyMode::PEER);
+        tracing::info!("client certificates from {} will be trusted", ca.display());
+    }
+
     Ok(tls.build())
 }
 
@@ -506,6 +555,8 @@ mod tests {
         let tls = config::Tls {
             private_key: key_path,
             certificate: cert_path,
+            client_ca: None,
+            identity_header: "x-forwarded-email".to_string(),
         };
 
         // A browser's list: the acceptor must come back with http/1.1.

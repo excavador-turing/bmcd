@@ -15,6 +15,7 @@ use super::{
     authentication_context::{Actor, AuthenticationContext},
     authentication_errors::{AuthenticationError, SchemedAuthError},
     passwd_validator::UnixValidator,
+    verified_proxy::VerifiedProxy,
     websocket_subprotocol::{bearer_token, is_websocket_handshake},
 };
 use actix_web::{
@@ -39,6 +40,9 @@ pub struct AuthenticationService<S> {
     context: Arc<Mutex<AuthenticationContext<UnixValidator>>>,
     authentication_path: &'static str,
     realm: &'static str,
+    /// Header naming the human, believed only behind a verified client
+    /// certificate. See [`crate::authentication::verified_proxy`].
+    identity_header: Arc<str>,
 }
 
 impl<S> AuthenticationService<S> {
@@ -47,14 +51,48 @@ impl<S> AuthenticationService<S> {
         context: Arc<Mutex<AuthenticationContext<UnixValidator>>>,
         authentication_path: &'static str,
         realm: &'static str,
+        identity_header: Arc<str>,
     ) -> Self {
         AuthenticationService {
             service,
             context,
             authentication_path,
             realm,
+            identity_header,
         }
     }
+}
+
+/// The human a trusted proxy says it authenticated, if this connection has
+/// earned the right to say so.
+///
+/// Returns `None` unless BOTH hold: the connection presented a client
+/// certificate this daemon verified against its configured CA, and the
+/// request carries a non-empty identity header. Either alone is nothing --
+/// a certificate with no header names nobody, and a header with no
+/// certificate is a string an attacker on the management LAN can set.
+fn proxied_identity(request: &ServiceRequest, header: &str) -> Option<(String, String)> {
+    let proxy = request.request().conn_data::<VerifiedProxy>();
+    let claimed = request
+        .headers()
+        .get(header)
+        .and_then(|value| value.to_str().ok());
+    decide_proxied_identity(proxy, claimed)
+}
+
+/// The decision itself, with both inputs handed to it.
+///
+/// Split out from the request so it can be tested: actix offers no way to put
+/// connection data on a `TestRequest`, and this is the one piece of logic in
+/// the daemon where being wrong means an authentication bypass. Testing it
+/// through a live TLS handshake would test OpenSSL; this tests the rule.
+fn decide_proxied_identity(
+    proxy: Option<&VerifiedProxy>,
+    claimed: Option<&str>,
+) -> Option<(String, String)> {
+    let proxy = proxy?;
+    let name = claimed.map(str::trim).filter(|name| !name.is_empty())?;
+    Some((name.to_string(), proxy.subject.clone()))
 }
 
 impl<S, B> Service<ServiceRequest> for AuthenticationService<S>
@@ -82,6 +120,29 @@ where
             // back to say how it was authorised, and "it wasn't" is the
             // answer worth being able to search for.
             request.extensions_mut().insert(Actor::Loopback);
+            return Box::pin(async move {
+                service
+                    .call(request)
+                    .await
+                    .map(ServiceResponse::map_into_left_body)
+            });
+        }
+
+        // A proxy holding a certificate from our CA, naming the human it
+        // already authenticated. This is the only way in that is neither a
+        // password nor a session token, and it is what lets the fleet
+        // interface be exposed while a board is not (SQU-136).
+        //
+        // Note what is NOT happening: the certificate does not authorise
+        // anything by itself, and a trusted proxy that names nobody falls
+        // through to ordinary token authentication below. The certificate
+        // only makes the header worth reading.
+        if let Some((name, subject)) = proxied_identity(&request, &self.identity_header) {
+            tracing::debug!("request authorised by {subject} on behalf of {name}");
+            request.extensions_mut().insert(Actor::User {
+                name,
+                scheme: "mtls",
+            });
             return Box::pin(async move {
                 service
                     .call(request)
@@ -321,6 +382,7 @@ mod tests {
             Arc::new(Mutex::new(context)),
             "/api/bmc/authenticate",
             "test realm",
+            IDENTITY_HEADER.into(),
         )
     }
 
@@ -681,5 +743,81 @@ mod tests {
             .expect("a 401 always carries a challenge")
             .to_str()
             .expect("the challenge is text")
+    }
+
+    // ---- the proxy identity path (SQU-136) --------------------------------
+    //
+    // These four are the security contract of the whole feature, and the
+    // first is the one that matters: an identity header on its own must buy
+    // nothing at all. Anyone who can reach the board on the management LAN
+    // can set a header; only the client certificate makes it mean something,
+    // and only the TLS handshake can produce one.
+
+    const IDENTITY_HEADER: &str = "x-forwarded-email";
+
+    /// A connection that presented a certificate our CA signed.
+    fn verified() -> VerifiedProxy {
+        VerifiedProxy::new("CN=envoy.hive")
+    }
+
+    #[actix_web::test]
+    async fn identity_header_alone_authorises_nothing() {
+        // No certificate on the connection: the header is a string a stranger
+        // typed. If this ever passes, every board on the LAN is wide open to
+        // anyone who can spell a header name.
+        let request = rest_call()
+            .insert_header((IDENTITY_HEADER, "attacker@example.com"))
+            .to_srv_request();
+
+        let response = call(request).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verified_proxy_naming_a_user_is_a_user() {
+        let who = decide_proxied_identity(Some(&verified()), Some("oleg@tsarev.id"));
+
+        assert_eq!(
+            who,
+            Some(("oleg@tsarev.id".to_string(), "CN=envoy.hive".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_name_without_a_certificate_is_nobody() {
+        // The same header that works above, on a connection that proved
+        // nothing. This is the bypass the feature must not have.
+        assert_eq!(
+            decide_proxied_identity(None, Some("attacker@example.com")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_certificate_naming_nobody_is_nobody() {
+        // A certificate authorises nothing by itself: it only makes the
+        // header worth reading. With no header the request falls through to
+        // ordinary token authentication.
+        assert_eq!(decide_proxied_identity(Some(&verified()), None), None);
+    }
+
+    #[test]
+    fn a_blank_name_is_a_misconfiguration_not_an_anonymous_login() {
+        assert_eq!(
+            decide_proxied_identity(Some(&verified()), Some("   ")),
+            None
+        );
+        assert_eq!(decide_proxied_identity(Some(&verified()), Some("")), None);
+    }
+
+    #[test]
+    fn the_name_is_trimmed_not_rejected() {
+        let who = decide_proxied_identity(Some(&verified()), Some("  oleg@tsarev.id  "));
+
+        assert_eq!(
+            who.map(|(name, _)| name),
+            Some("oleg@tsarev.id".to_string())
+        );
     }
 }

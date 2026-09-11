@@ -8,6 +8,33 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **A proxy holding a certificate from a trusted CA can name the human it
+  authenticated.** `tls.client_ca` turns it on; absent, which is what a board
+  ships with, nothing changes and the header below is never read. This is the
+  daemon half of SQU-136 and the reason a fleet interface can be exposed while
+  a board cannot.
+- `tls.identity_header`, default `x-forwarded-email`: which header names that
+  human. Believed **only** on a connection that presented a certificate this
+  daemon verified. Without one it is ordinary attacker-controlled input —
+  anybody on the management LAN can set a header — so the certificate is what
+  makes it mean anything, and the two are useless apart.
+
+### Notes
+
+- A certificate authorises nothing by itself. It only makes the header worth
+  reading; a trusted proxy that names nobody falls through to ordinary token
+  authentication, and a blank name is treated as a misconfiguration rather
+  than an anonymous login.
+- Client certificates are requested but not required, so a browser on the
+  management LAN still reaches the login page. That is the break-glass path
+  and it is deliberately untouched.
+- Audited as `<user> (mtls)`, so a fleet-initiated action names the operator
+  rather than the proxy.
+
 ## [2.29.0] — 2026-09-10
 
 ### Added
