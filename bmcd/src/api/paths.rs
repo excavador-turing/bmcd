@@ -273,7 +273,7 @@ pub(crate) static ALIASES: &[Alias] = &[
         path: "/hostname",
         ty: "hostname",
         document_param: None,
-        summary: "Rename the board; the metrics instance label changes with it",
+        summary: "Rename the board; its metrics carry no name, so none of them move",
     },
     Alias {
         method: Method::Post,
