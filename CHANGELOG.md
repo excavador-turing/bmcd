@@ -8,6 +8,60 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.35.0] — 2026-09-12
+
+### Fixed
+
+- **The board could stop checking for firmware, for ever** (SQU-201). The
+  Firmware page said *checking the sources now* and never stopped, with
+  **Check now** disabled beside it, and no later refresh could start. Only
+  restarting the daemon cleared it. Opening the Firmware tab on a board whose
+  cached listing had aged out was enough to trigger it; bmc-2 sat that way for
+  three and a half hours on 2026-09-11 with `refreshing: true`, the timestamp
+  frozen, and no fan-out process running at all.
+
+  The claim that says "a refresh is running" was an `AtomicBool`, taken before
+  the work and released by a `Drop` guard. That is correct for a panic and
+  wrong for everything else: a task dropped before its first poll constructs
+  no guard, and a blocking join that never returns never drops one.
+
+  It is a deadline now, and a deadline cannot be lost — the claim expires
+  whether or not anything is left to release it. Three things release it and
+  it takes all three: the guard for a panic, a `tokio::time::timeout` around
+  the fan-out for a blocking join that never returns, and the deadline for the
+  case where neither of the other two exists. The dedup that stops "check now"
+  turning four sources into twelve requests is kept as a compare-exchange.
+
+  The bound is ten minutes. Not a guess at the work: the fan-out was 74–78 s
+  when first measured, and on 2026-09-12 took 75–100 s on bmc-1 and about
+  230 s on bmc-2. It is how long a *lost* refresh may block every future one.
+
+### Added
+
+- **The firmware listing survives a reboot**, at
+  `/mnt/overlay/firmware-catalog.json`. Asking four sources takes between 75
+  and 230 seconds and spends GitHub's unauthenticated quota of sixty an hour
+  four at a time, and all of it used to be thrown away by every reboot — so
+  the first person to open the Firmware page after an upgrade, the person most
+  likely to be looking, paid for the lot.
+
+  It sits beside `firmware-sources.json` and on the overlay for the same
+  reason: both firmware images mount it, so it survives an A/B promotion. The
+  board answers from it at once and refreshes behind that answer. The age it
+  reports comes from the timestamp inside the file rather than the file's
+  mtime, because what a reader needs is when the *sources* were asked, and an
+  age that parses to something absurd is clamped to a day.
+
+  **It is written only when the offering changes.** The overlay is NAND and
+  UBI reports five free eraseblocks of 2040 on the reference board; a listing
+  rewritten every half hour would be thousands of writes a year for bytes that
+  change when somebody publishes a release. The comparison is on what the
+  sources offer, not the whole record, because the timestamp moves every time.
+
+  Only a complete answer is stored: a fan-out where one source errored is good
+  enough to show, because the page renders the error, and not good enough to
+  become the listing a board boots with.
+
 ## [2.34.0] — 2026-09-11
 
 ### Added
