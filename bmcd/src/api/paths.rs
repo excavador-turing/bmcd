@@ -136,6 +136,13 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         method: Method::Get,
+        path: "/sdcard/files",
+        ty: "sdcard_files",
+        document_param: None,
+        summary: "What is on the SD card, and which of it can be flashed to a node",
+    },
+    Alias {
+        method: Method::Get,
         path: "/info",
         ty: "info",
         document_param: None,

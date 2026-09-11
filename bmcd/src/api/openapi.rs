@@ -121,6 +121,12 @@ fn response_schemas() -> Vec<(&'static str, Value)> {
         ("/power", one_of_array("NodePower")),
         ("/usb", one_of_array("UsbState")),
         ("/sdcard", one_of_array("SdCard")),
+        // A real list, not upstream's one-element array: this one is as long
+        // as the card's contents.
+        (
+            "/sdcard/files",
+            json!({ "type": "array", "items": component_ref("SdCardEntry") }),
+        ),
     ]
 }
 
@@ -197,6 +203,10 @@ fn components() -> serde_json::Map<String, Value> {
         (
             "Catalog",
             serde_json::to_value(schemars::schema_for!(crate::app::firmware_catalog::Catalog)),
+        ),
+        (
+            "SdCardEntry",
+            serde_json::to_value(schemars::schema_for!(crate::app::sdcard_files::Entry)),
         ),
         (
             "ConfigExport",
