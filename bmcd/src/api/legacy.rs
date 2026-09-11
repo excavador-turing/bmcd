@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::ffi::c_ulong;
 use std::io;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
@@ -280,6 +280,7 @@ async fn dispatch_inner(
         ("reset", true) => reset_node(bmc, query).await.into(),
         ("sdcard", true) => format_sdcard().into(),
         ("sdcard", false) => get_sdcard_info(),
+        ("sdcard_files", false) => list_sdcard_files(query).await,
         ("uart", false) => legacy_serial_get_handler(serial, query).await.into(),
         ("uart", true) => legacy_serial_set_handler(serial, query).await.into(),
         ("usb", true) => set_usb_mode(bmc, query).await.into(),
@@ -918,6 +919,32 @@ async fn get_node_power_status(bmc: &BmcApplication, node: NodeId) -> String {
     };
 
     u8::from(status).to_string()
+}
+
+/// `opt=get&type=sdcard_files[&path=<relative>]` -- what is on the card.
+///
+/// `path` is relative to the card and confined to it; see
+/// [`crate::app::sdcard_files`] for why that is one function with its own
+/// tests rather than a check written at each call site.
+async fn list_sdcard_files(query: Query) -> LegacyResponse {
+    use crate::app::sdcard_files::{self, SdCardError};
+
+    let relative = query.get("path").map(String::as_str).unwrap_or("");
+    match sdcard_files::list(Path::new(sdcard_files::SDCARD_ROOT), relative).await {
+        Ok(entries) => LegacyResponse::ok(json!(entries)),
+        // A refusal says only that the path is not on the card. It does not
+        // say whether the thing asked for exists, because that would answer a
+        // question about the filesystem that the request had no business
+        // asking.
+        Err(err @ SdCardError::OutsideRoot) => (StatusCode::FORBIDDEN, err.to_string()).into(),
+        Err(err @ (SdCardError::NotFound | SdCardError::NotADirectory)) => {
+            (StatusCode::NOT_FOUND, err.to_string()).into()
+        }
+        Err(err @ SdCardError::NotMounted) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into()
+        }
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into(),
+    }
 }
 
 fn format_sdcard() -> impl Into<LegacyResponse> {

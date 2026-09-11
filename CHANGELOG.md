@@ -8,6 +8,44 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.34.0] — 2026-09-11
+
+### Added
+
+- **`opt=get&type=sdcard_files`, also `GET /api/bmc/sdcard/files`: what is on
+  the microSD card** (SQU-198). Name, size, modified time, and whether each
+  entry could be written to a compute module.
+
+  `tpi flash --local` already reads an image off this card, and it is the only
+  sane way to write a multi-gigabyte image to a module: the browser is not in
+  the path, the bytes do not cross the network twice, and an interrupted
+  upload does not mean starting over. What was missing was any way to see what
+  is there — so an operator had to know the path and type it, for the most
+  destructive thing this board does.
+
+  A non-candidate is **listed, not hidden**, with the reason: a 10-byte
+  `.img` says it is most likely a truncated download, and a `.tpu` says it is
+  BMC firmware and belongs on the firmware page. Hiding them makes an operator
+  who cannot find the file they just copied conclude the page is broken.
+
+  The verdict is from the name and the size only. Nothing opens a file:
+  deciding by content means reading the head of every entry on every listing,
+  and what actually protects a flash is the checksum the operator compares.
+
+### Security
+
+- **Every path is confined to the card, in one function with its own tests.**
+  A listing that accepts `../..` is a directory browser rooted at `/` on a
+  device that can reflash four computers — and the same resolver will serve
+  rename and delete later, so it is worth getting right once.
+
+  The root and the target are both canonicalised and compared, so `a/../../etc`
+  and a **symlink** pointing off the card are caught by the same rule rather
+  than by a check written against the text of the request. A leading `/` is
+  stripped rather than honoured. A path that does not exist answers "not
+  found", never "outside", because saying "outside" for a typo tells a client
+  something about the filesystem it did not earn.
+
 ## [2.33.0] — 2026-09-11
 
 ### Fixed
