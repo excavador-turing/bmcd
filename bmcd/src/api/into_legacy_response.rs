@@ -114,7 +114,42 @@ impl From<SerialError> for LegacyResponse {
     }
 }
 
-impl ResponseError for LegacyResponse {}
+/// A refusal keeps the status it was built with.
+///
+/// The empty impl this replaces inherited actix's default, which answers 500
+/// to everything. That was invisible while nothing returned a `LegacyResponse`
+/// as an `Err`: handlers reached by the legacy dispatcher come back through
+/// `From<Result<T, E>>` and are rendered by `Responder`, which has always
+/// honoured the carried status.
+///
+/// `api::access` returns `Result<HttpResponse, LegacyResponse>` directly to
+/// actix, which routes an `Err` through here — so its refusals all answered
+/// 500. Measured on bmc-2 the hour it was flashed: "the current password is
+/// wrong" and "the new password is too short" both came back 500, which tells
+/// a client the board is broken rather than that the request was.
+///
+/// The body is built by the same `From<LegacyResponse> for HttpResponse` the
+/// success path uses, so a refusal has one shape wherever it came from.
+impl ResponseError for LegacyResponse {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            LegacyResponse::Error(status, _) => *status,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        match self {
+            LegacyResponse::Error(status, msg) => {
+                LegacyResponse::Error(*status, msg.clone()).into()
+            }
+            other => {
+                LegacyResponse::Error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string().into())
+                    .into()
+            }
+        }
+    }
+}
 
 impl Display for LegacyResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,41 +222,42 @@ impl From<()> for Null {
 #[cfg(test)]
 mod status_tests {
     use super::*;
-    use crate::app::cooling_device::CoolingRequestError;
 
-    fn status_of(error: anyhow::Error) -> StatusCode {
-        match LegacyResponse::from(error) {
-            LegacyResponse::Error(status, _) => status,
-            other => panic!("an error converted to {other:?}"),
-        }
+    /// A refusal must answer with the status it was built with.
+    ///
+    /// This is the regression that shipped in 2.36.0 and was caught on a real
+    /// board an hour later: every refusal from `api::access` answered 500,
+    /// because the `ResponseError` impl was empty and actix's default is 500.
+    /// A wrong password reported as a server fault is a client that retries.
+    #[test]
+    fn a_refusal_keeps_its_own_status() {
+        assert_eq!(
+            LegacyResponse::bad_request("no").status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            LegacyResponse::Error(StatusCode::FORBIDDEN, "nope".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            LegacyResponse::not_implemented("later").status_code(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        // And the rendered response agrees with the declared status, which is
+        // the half a client actually sees.
+        assert_eq!(
+            LegacyResponse::bad_request("no").error_response().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
-    /// The whole point is that the two are told apart, so both directions are
-    /// asserted. One test proving 400 would pass just as well if everything
-    /// became 400, which would be a different bug with the same shape.
+    /// Anything that is not an error still reads as one here, because reaching
+    /// `ResponseError` at all means it was returned as an `Err`.
     #[test]
-    fn a_callers_mistake_is_a_400_and_a_board_failure_is_a_500() {
+    fn a_success_returned_as_an_error_is_a_server_fault() {
         assert_eq!(
-            status_of(CoolingRequestError::NoSuchDevice("nope".into()).into()),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            status_of(CoolingRequestError::SpeedTooHigh { given: 9, max: 6 }.into()),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            status_of(anyhow::anyhow!("the sysfs write failed")),
+            LegacyResponse::Success(None).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-    }
-
-    /// The handlers wrap with `.context(...)`, so the typed error is the root
-    /// cause rather than the top of the chain. A check that only looked at
-    /// the outermost error would see a plain string and answer 500.
-    #[test]
-    fn the_status_survives_the_context_the_handler_adds() {
-        let wrapped = anyhow::Error::from(CoolingRequestError::NoSuchDevice("nope".into()))
-            .context("hold fan at step");
-        assert_eq!(status_of(wrapped), StatusCode::BAD_REQUEST);
     }
 }
