@@ -92,6 +92,129 @@ fn default_identity_header() -> String {
     "x-forwarded-email".to_string()
 }
 
+/// Where the interface stores a CA it was given (`api/access.rs`).
+///
+/// A FIXED path, and that is what makes the feature possible at all. This
+/// daemon reads its configuration with the `config` crate, which has no
+/// writer, and `config.yaml` is the operator's file with the operator's
+/// comments in it. Rewriting it from an HTTP handler would mean shipping a
+/// YAML serialiser and losing every comment on the first save.
+///
+/// So the interface changes a FILE and never the configuration. `config.yaml`
+/// still wins when it names a path: `effective_client_ca` prefers it, and the
+/// handlers refuse to touch anything when it is set, telling the operator to
+/// edit the file they already chose to use.
+pub const MANAGED_CLIENT_CA: &str = "/etc/ssl/certs/bmcd_client_ca.pem";
+
+/// The one thing besides the bundle that the interface can set.
+///
+/// A separate file rather than a second copy of the configuration: it holds
+/// exactly one setting, it is written by one handler, and a board that has
+/// never used the interface does not have it at all.
+pub const ACCESS_OVERRIDES: &str = "/etc/bmcd/access.json";
+
+/// Settings the interface owns, as stored.
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
+pub struct AccessOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_header: Option<String>,
+}
+
+impl AccessOverrides {
+    /// Absent or unreadable reads as "nothing overridden". A board whose
+    /// sidecar is corrupt falls back to its configuration rather than
+    /// refusing to describe itself.
+    pub fn load() -> Self {
+        std::fs::read(ACCESS_OVERRIDES)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn store(&self) -> std::io::Result<()> {
+        let path = Path::new(ACCESS_OVERRIDES);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_atomically(path, &serde_json::to_vec_pretty(self)?)
+    }
+}
+
+/// Write through a temporary file in the SAME directory, then rename.
+///
+/// A half-written CA bundle is a board that asks for a client certificate and
+/// can verify none, discovered at the next login rather than now; a rename is
+/// atomic on the same filesystem, so the file is either the old one or the
+/// new one and never half of either.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+pub fn write_client_ca(pem: &[u8]) -> std::io::Result<()> {
+    write_atomically(Path::new(MANAGED_CLIENT_CA), pem)
+}
+
+pub fn remove_client_ca() -> std::io::Result<()> {
+    match std::fs::remove_file(MANAGED_CLIENT_CA) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Which of the three sources decided a setting, so the interface can say so
+/// instead of presenting every value as equally changeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// config.yaml said so. Not changeable from the interface.
+    Config,
+    /// The interface stored it.
+    Override,
+    /// Nobody said; this is the built-in.
+    Default,
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Config => write!(f, "config"),
+            Source::Override => write!(f, "override"),
+            Source::Default => write!(f, "default"),
+        }
+    }
+}
+
+impl Tls {
+    /// The CA to verify client certificates against, or `None` for a board
+    /// that trusts no proxy.
+    ///
+    /// EXISTENCE, not configuration, decides the managed path. A configured
+    /// path that does not exist makes the daemon fail to start -- which is
+    /// why neither setting ships in the firmware's default config.yaml -- and
+    /// a board whose CA was removed must come back up rather than refuse to.
+    pub fn effective_client_ca(&self) -> Option<PathBuf> {
+        if let Some(path) = self.client_ca.as_ref() {
+            return Some(path.clone());
+        }
+        let managed = PathBuf::from(MANAGED_CLIENT_CA);
+        managed.exists().then_some(managed)
+    }
+
+    /// The header name and where it came from.
+    pub fn effective_identity_header(&self, overrides: &AccessOverrides) -> (String, Source) {
+        if self.identity_header != default_identity_header() {
+            return (self.identity_header.clone(), Source::Config);
+        }
+        match overrides.identity_header.as_deref() {
+            Some(name) if !name.is_empty() => (name.to_string(), Source::Override),
+            _ => (self.identity_header.clone(), Source::Default),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Log {
     pub stdout: bool,
