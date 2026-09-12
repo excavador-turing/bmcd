@@ -8,6 +8,29 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.36.1] — 2026-09-12
+
+### Fixed
+
+- **Every refusal from the new access endpoints answered 500.** Measured on
+  bmc-2 within the hour of flashing v2.28.0: "the current password is wrong"
+  and "the new password is too short" both came back `500 Internal Server
+  Error`, which tells a client the board is broken rather than that the
+  request was — and 500 is the canonical retryable status, so a client is
+  being invited to retry an answer that will never change.
+
+  `impl ResponseError for LegacyResponse {}` was empty, so actix's default
+  status applied to everything. That was invisible until now because handlers
+  reached through the legacy dispatcher come back as a `LegacyResponse`
+  rendered by `Responder`, which has always honoured the carried status;
+  `api::access` is the first to return one as an `Err` directly to actix.
+
+  It now reports the status it was built with and renders through the same
+  conversion the success path uses, so a refusal has one shape wherever it
+  came from. The guards themselves were correct throughout — the right
+  requests were refused with the right messages, with the wrong number on
+  them.
+
 ## [2.36.0] — 2026-09-12
 
 ### Added
