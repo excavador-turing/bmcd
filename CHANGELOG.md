@@ -8,6 +8,41 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.36.2] — 2026-09-12
+
+### Fixed
+
+- **The board refused every attempt to resume a TLS session, fatally.** This
+  is the intermittent fleet console failure: a serial console or an API call
+  through the gateway would occasionally fail outright, on both boards,
+  with nothing in the daemon's log and the board perfectly healthy either
+  side of it.
+
+  Envoy keeps one TLS session per upstream cluster and offers it on the next
+  connection it opens. Measured on the gateway, a third of all new upstream
+  connections to the two boards died this way — 8 of 28 to one, 19 of 45 to
+  the other — while every connection taken from the pool was fine, which is
+  what made it look random from a browser. Reproduced deterministically from
+  a pod on the gateway's own node: 30 fresh connections all succeeded, and 30
+  that offered back a saved session all failed with `tlsv1 alert internal
+  error`.
+
+  OpenSSL will not resume a session on a server that asks for client
+  certificates unless the context carries a session id context, and the
+  refusal is not a quiet cache miss — it is `internal_error`, fatal, sent
+  before a byte of HTTP is exchanged. The error, `ssl_get_prev_session:
+  session id context uninitialized`, is raised on the server, which never
+  logged it; the client sees only an alert it cannot explain.
+
+  So the fault arrived with client certificates in 2.30.0 and was invisible
+  from the daemon's side for six releases.
+
+  The acceptor now sets a session id context, derived from the client CA so
+  that a board whose trust anchor is replaced will not resume a session
+  authenticated under the old one. There is a test that performs two real
+  handshakes against the real acceptor and offers the first session back; it
+  fails on 2.36.1 with the OpenSSL error above.
+
 ## [2.36.1] — 2026-09-12
 
 ### Fixed

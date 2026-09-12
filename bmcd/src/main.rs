@@ -596,6 +596,40 @@ fn load_tls_config(
         tracing::info!("client certificates from {} will be trusted", ca.display());
     }
 
+    // Name this context, so the sessions it hands out are sessions it will
+    // take back.
+    //
+    // OpenSSL refuses to resume a session on a server that asks for client
+    // certificates unless the context carries a session id context, and the
+    // refusal is not a quiet cache miss -- it is `internal_error`, fatal, sent
+    // before a byte of HTTP. The error is `session id context uninitialized`
+    // and it is raised on the SERVER, which never logs it, so the only trace
+    // is an alert the client cannot explain.
+    //
+    // That is the intermittent fleet console failure: Envoy keeps one session
+    // per upstream cluster and offers it on the next connection it opens, so a
+    // third of all new connections to the boards died -- 8 of 28 to one, 19 of
+    // 45 to the other -- while every pooled connection was fine. From a
+    // browser it looked like a board that randomly stopped answering.
+    //
+    // The value is derived from the client CA rather than fixed, so a board
+    // whose trust anchor is replaced will not resume a session that was
+    // authenticated under the old one. The daemon restarts on that change
+    // today, which drops every session anyway; this makes it true without
+    // depending on the restart.
+    let sid_ctx = match tls_config.effective_client_ca().as_ref() {
+        Some(ca) => {
+            let bytes = std::fs::read(ca)
+                .with_context(|| format!("reading client CA from {}", ca.display()))?;
+            openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &bytes)?.to_vec()
+        }
+        None => openssl::hash::hash(openssl::hash::MessageDigest::sha256(), b"bmcd:no-client-ca")?
+            .to_vec(),
+    };
+    // SHA-256 is 32 bytes, which is exactly OpenSSL's maximum.
+    tls.set_session_id_context(&sid_ctx)
+        .context("setting the session id context")?;
+
     let facts = certificate_facts(&cert);
     if let Some(key) = facts.key.as_deref() {
         tracing::info!("serving a {key} certificate");
@@ -901,6 +935,175 @@ mod tests {
         // client's opinion of a handshake the server saw differently.
         assert_eq!(client_view, server_view);
         client_view
+    }
+
+    /// What happened when a client offered back a session this acceptor gave
+    /// it: did the second handshake complete, was it actually a resumption,
+    /// and what did the server say if it refused.
+    #[derive(Debug)]
+    struct Resumption {
+        completed: bool,
+        reused: bool,
+        // Read through `Debug` in the assertion messages, which is where it
+        // earns its place: it is the only thing that names the fault.
+        #[allow(dead_code)]
+        server_error: Option<String>,
+    }
+
+    /// Two connections to the real acceptor. The first keeps whatever session
+    /// the server hands out; the second offers it back.
+    ///
+    /// The read after each handshake is load-bearing. Under TLS 1.3 the
+    /// session does not exist when the handshake finishes -- the server sends
+    /// `NewSessionTicket` afterwards, and the client only learns of it when it
+    /// next reads. Grabbing `ssl().session()` straight after connecting finds
+    /// nothing, which looks exactly like a server that offered no session.
+    fn resumption_report(tls: &config::Tls) -> Resumption {
+        use openssl::ssl::{SslSession, SslSessionCacheMode, SslStream};
+        use std::io::Read;
+        use std::sync::{Arc, Mutex};
+
+        let (acceptor, _) = load_tls_config(tls).expect("acceptor");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Serve exactly two connections, reporting the first refusal. The
+        // server end is where the interesting failure lives: a client only
+        // ever sees the alert.
+        let server = std::thread::spawn(move || {
+            let mut failure: Option<String> = None;
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().expect("accept");
+                match acceptor.accept(socket) {
+                    Ok(mut stream) => {
+                        let _ = stream.write_all(b"ok");
+                        let _ = stream.flush();
+                        // Hold the connection open long enough for the client
+                        // to read, and with it the session ticket.
+                        let mut sink = [0u8; 1];
+                        let _ = stream.read(&mut sink);
+                    }
+                    Err(e) => {
+                        if failure.is_none() {
+                            failure = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            failure
+        });
+
+        let kept: Arc<Mutex<Option<SslSession>>> = Arc::new(Mutex::new(None));
+        let sink = kept.clone();
+
+        let mut connector = SslConnector::builder(SslMethod::tls()).expect("connector");
+        connector.set_verify(SslVerifyMode::NONE);
+        // A client context caches nothing by default, and the callback that
+        // hands us the ticket never fires without this.
+        connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        connector.set_new_session_callback(move |_ssl, session| {
+            let mut slot = sink.lock().expect("session slot");
+            if slot.is_none() {
+                *slot = Some(session);
+            }
+        });
+        let connector = connector.build();
+
+        // First connection: take whatever session is offered.
+        {
+            let socket = TcpStream::connect(addr).expect("connect");
+            let mut stream = connector
+                .configure()
+                .expect("configure")
+                .verify_hostname(false)
+                .use_server_name_indication(false)
+                .connect("localhost", socket)
+                .expect("first handshake");
+            let mut buf = [0u8; 2];
+            let _ = stream.read(&mut buf);
+        }
+
+        let session = kept.lock().expect("session slot").take();
+        let Some(session) = session else {
+            // No session on offer at all is a different failure from a session
+            // that is refused, and the caller needs to be able to tell them
+            // apart.
+            let server_error = server.join().expect("server thread");
+            return Resumption {
+                completed: false,
+                reused: false,
+                server_error: server_error.or(Some("no session was issued".to_string())),
+            };
+        };
+
+        // Second connection: offer it back.
+        let socket = TcpStream::connect(addr).expect("connect");
+        let mut ssl = connector
+            .configure()
+            .expect("configure")
+            .verify_hostname(false)
+            .use_server_name_indication(false)
+            .into_ssl("localhost")
+            .expect("ssl");
+        // Safe here: the session came from this same client context moments
+        // ago and outlives the handshake below.
+        unsafe { ssl.set_session(&session).expect("offer the session back") };
+
+        let mut stream = SslStream::new(ssl, socket).expect("stream");
+        let completed = stream.connect().is_ok();
+        let reused = completed && stream.ssl().session_reused();
+        if completed {
+            let mut buf = [0u8; 2];
+            let _ = stream.read(&mut buf);
+        }
+        drop(stream);
+
+        let server_error = server.join().expect("server thread");
+        Resumption {
+            completed,
+            reused,
+            server_error,
+        }
+    }
+
+    /// A session this daemon hands out has to be one it will take back.
+    ///
+    /// This is the fault behind the intermittent console failures on the
+    /// fleet. Envoy keeps one upstream session per cluster and offers it on
+    /// the next connection it opens; the board answered `internal_error` and
+    /// the connection died before a byte of HTTP. Measured on the gateway, a
+    /// third of all new upstream connections to the two boards failed this way
+    /// -- 8 of 28 to one, 19 of 45 to the other -- while every pooled
+    /// connection was fine, which is why it looked random from a browser.
+    ///
+    /// OpenSSL will not resume a session on a server that asks for client
+    /// certificates unless the context carries a session id context, and
+    /// refusing is not a cache miss: it is a fatal alert. So the fault
+    /// appeared the day client certificates were switched on, in 2.30.0, and
+    /// nothing about it is visible from the daemon's own side.
+    #[test]
+    fn a_session_this_daemon_issues_can_be_resumed() {
+        let (_dir, tls) = throwaway_tls_config("bmcd-resume");
+        let plain = resumption_report(&tls);
+        assert!(
+            plain.completed && plain.reused,
+            "a board with no client CA should resume: {plain:?}"
+        );
+
+        // The same acceptor, with a client CA configured -- which is what
+        // turns on `SslVerifyMode::PEER`, and is how every board in the fleet
+        // is set up.
+        let (_ca_dir, mut with_ca) = throwaway_tls_config("bmcd-resume-mtls");
+        with_ca.client_ca = Some(with_ca.certificate.clone());
+        let mtls = resumption_report(&with_ca);
+        assert!(
+            mtls.completed,
+            "asking for client certificates must not make a session unresumable: {mtls:?}"
+        );
+        assert!(
+            mtls.reused,
+            "the second handshake completed but started a new session: {mtls:?}"
+        );
     }
 
     /// Which kind of key a throwaway certificate is built on. An operator can
