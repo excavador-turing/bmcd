@@ -68,6 +68,25 @@ pub enum UsbConfig {
     Flashing(NodeId, UsbRoute),
 }
 
+impl UsbConfig {
+    /// The three facts every caller wants out of a configuration: which
+    /// module it applies to, what that module is acting as, and where the
+    /// other end of the bus is.
+    ///
+    /// One function because there are two callers -- the legacy `type=usb`
+    /// response and the metrics exposition -- and a board that told an
+    /// operator one thing through the API and another on a dashboard would
+    /// be worse than a board that told them nothing.
+    pub fn parts(&self) -> (NodeId, UsbMode, UsbRoute) {
+        match *self {
+            UsbConfig::UsbA(node) => (node, UsbMode::Device, UsbRoute::AlternativePort),
+            UsbConfig::Bmc(node) => (node, UsbMode::Device, UsbRoute::Bmc),
+            UsbConfig::Node(node, route) => (node, UsbMode::Host, route),
+            UsbConfig::Flashing(node, route) => (node, UsbMode::Flash, route),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct NodeInfo {
     pub name: Option<String>,

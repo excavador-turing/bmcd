@@ -34,12 +34,12 @@
 //! plain HTTP; a second unauthenticated surface -- one that reports the
 //! board's serial-adjacent details, its firmware versions and its traffic
 //! counters -- would be the same mistake twice.
-use crate::app::bmc_application::BmcApplication;
+use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::cooling_device::CoolingDevice;
 use crate::app::firmware_info::{get_firmware_slots, FirmwareSlots};
 use crate::app::health_info::{get_health, Health};
 use crate::app::switch_info::{get_switch_ports, PortKind, SwitchPort};
-use crate::hal::NodeId;
+use crate::hal::{NodeId, UsbMode, UsbRoute};
 use actix_web::{web, HttpResponse, Responder};
 use std::fmt::Write;
 use std::path::Path;
@@ -70,6 +70,63 @@ pub struct NodePower {
     pub on: Option<bool>,
     /// Seconds since the node was powered on, as the daemon has recorded it.
     pub power_on_seconds: Option<u64>,
+}
+
+/// The board's USB multiplexer, as the daemon has it **persisted**.
+///
+/// Persisted is the word that carries this. `tpi flash` and
+/// `tpi advanced msd` leave the configuration at `Flashing(NodeN, ..)`, the
+/// daemon writes that to its database, and re-applies it on every start --
+/// which asserts that module's USB-boot pin and stops it booting from its own
+/// eMMC. The module keeps running, because it is already booted. The fault
+/// appears at its NEXT reboot, which can be weeks later, and then it comes up
+/// in the USB loader instead of its operating system.
+///
+/// From outside, such a module is indistinguishable from dead hardware: the
+/// serial console prints nothing at all, not even a bootloader banner,
+/// because the loader does not use the console; it answers nothing on the
+/// network; and the BMC reports its rail on. `tpi usb status` cannot separate
+/// the two either -- it prints the same route for `UsbA` and `Flashing`.
+///
+/// Measured on hive-6, 2026-09-12: twenty minutes spent on a module that
+/// looked dead, with the one fact that explained it sitting unexported in the
+/// daemon's own database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbTopology {
+    /// `node1`..`node4`, spelled as the power families spell it.
+    pub node: String,
+    /// What that module is acting as: `host`, `device` or `flash`.
+    pub mode: &'static str,
+    /// Where the other end of the bus is: `bmc` or `alternative-port`.
+    pub route: &'static str,
+    /// `usb2` or `usb3`, as the pin controller reports it.
+    pub bus_type: String,
+}
+
+impl UsbTopology {
+    fn of(config: UsbConfig, bus_type: String) -> Self {
+        let (node, mode, route) = config.parts();
+        UsbTopology {
+            node: format!("node{}", node as u8 + 1),
+            mode: match mode {
+                UsbMode::Host => "host",
+                UsbMode::Device => "device",
+                UsbMode::Flash => "flash",
+            },
+            route: match route {
+                UsbRoute::Bmc => "bmc",
+                UsbRoute::AlternativePort => "alternative-port",
+            },
+            bus_type,
+        }
+    }
+
+    /// Which module, if any, has its USB-boot pin asserted. Exactly one
+    /// configuration does this, and it is the one nobody means to leave
+    /// behind.
+    fn armed_node(&self) -> Option<&str> {
+        (self.mode == "flash").then_some(self.node.as_str())
+    }
 }
 
 /// What the daemon knows about the certificate it is serving.
@@ -106,6 +163,9 @@ pub struct Snapshot {
     pub cooling: Vec<CoolingDevice>,
     pub ports: Vec<SwitchPort>,
     pub nodes: Vec<NodePower>,
+    /// `None` only in tests; a running daemon always has a configuration,
+    /// because the key is registered with a default at startup.
+    pub usb: Option<UsbTopology>,
     pub health: Health,
     pub firmware: FirmwareSlots,
     pub certificate: Certificate,
@@ -158,12 +218,15 @@ async fn collect(bmc: &BmcApplication, certificate: Certificate) -> Snapshot {
         .unwrap_or_default();
     cooling.sort_by(|left, right| left.device.cmp(&right.device));
 
+    let (usb_config, bus_type) = bmc.get_usb_mode().await;
+
     Snapshot {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         sensors: read_sensors(Path::new(THERMAL_CLASS)).await,
         cooling,
         ports: get_switch_ports().await,
         nodes,
+        usb: Some(UsbTopology::of(usb_config, bus_type)),
         health: get_health().await,
         firmware: get_firmware_slots(super::legacy::firmware_version().await).await,
         certificate,
@@ -331,6 +394,7 @@ fn render(snapshot: &Snapshot) -> String {
     render_thermal(&mut out, snapshot);
     render_switch(&mut out, snapshot);
     render_nodes(&mut out, snapshot);
+    render_usb(&mut out, snapshot.usb.as_ref());
     render_health(&mut out, &snapshot.health);
     render_firmware(&mut out, &snapshot.firmware);
 
@@ -567,6 +631,56 @@ fn render_nodes(out: &mut String, snapshot: &Snapshot) {
                 })
             })
             .collect::<Vec<_>>(),
+    );
+}
+
+/// Two families: one to alert on, one to read.
+///
+/// `bmcd_node_usb_boot_armed` is the alertable half, and it is deliberately
+/// four samples rather than one. A single "which node is armed" gauge cannot
+/// express "none", and "none" is the normal state this has to assert. Four
+/// zeros say it plainly, and a rule fires on the one that is not zero.
+///
+/// The threshold that matters is *duration*, not the state itself: flashing a
+/// module is a legitimate thing to be doing. A module still armed fifteen
+/// minutes later is a forgotten `tpi usb device -n N`, and a page then
+/// reaches an operator who still remembers doing it -- rather than at that
+/// module's next reboot, which may be weeks away and will look like dead
+/// hardware.
+fn render_usb(out: &mut String, usb: Option<&UsbTopology>) {
+    let Some(usb) = usb else {
+        return;
+    };
+
+    let armed = usb.armed_node();
+    family(
+        out,
+        "bmcd_node_usb_boot_armed",
+        "gauge",
+        "1 when a module's USB-boot pin is asserted, which stops it booting from its own eMMC.",
+        &(1..=4)
+            .map(|index| {
+                let name = format!("node{index}");
+                let value = f64::from(u8::from(armed == Some(name.as_str())));
+                Sample::new(vec![("node", name)], value)
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    family(
+        out,
+        "bmcd_usb_config",
+        "gauge",
+        "The board's persisted USB multiplexer configuration.",
+        &[Sample::new(
+            labels(&[
+                ("node", usb.node.as_str()),
+                ("mode", usb.mode),
+                ("route", usb.route),
+                ("bus_type", usb.bus_type.as_str()),
+            ]),
+            1.0,
+        )],
     );
 }
 
@@ -931,6 +1045,10 @@ mod tests {
                 zone: Some("thermal_zone0".to_string()),
                 overridden: false,
             }],
+            usb: Some(UsbTopology::of(
+                UsbConfig::UsbA(NodeId::Node2),
+                "usb3".to_string(),
+            )),
             ports: vec![
                 port("node1", PortKind::Node, true),
                 port("node2", PortKind::Node, true),
@@ -1039,6 +1157,7 @@ mod tests {
             sensors: Vec::new(),
             cooling: Vec::new(),
             ports: Vec::new(),
+            usb: None,
             nodes: vec![NodePower {
                 name: "node1".to_string(),
                 on: None,
@@ -1271,6 +1390,17 @@ mod tests {
                 "bmcd_node_power_on_seconds{node=\"node1\"} 52418\n",
                 "bmcd_node_power_on_seconds{node=\"node2\"} 52401\n",
                 "\n",
+                "# HELP bmcd_node_usb_boot_armed 1 when a module's USB-boot pin is asserted, which stops it booting from its own eMMC.\n",
+                "# TYPE bmcd_node_usb_boot_armed gauge\n",
+                "bmcd_node_usb_boot_armed{node=\"node1\"} 0\n",
+                "bmcd_node_usb_boot_armed{node=\"node2\"} 0\n",
+                "bmcd_node_usb_boot_armed{node=\"node3\"} 0\n",
+                "bmcd_node_usb_boot_armed{node=\"node4\"} 0\n",
+                "\n",
+                "# HELP bmcd_usb_config The board's persisted USB multiplexer configuration.\n",
+                "# TYPE bmcd_usb_config gauge\n",
+                "bmcd_usb_config{node=\"node2\",mode=\"device\",route=\"alternative-port\",bus_type=\"usb3\"} 1\n",
+                "\n",
                 "# HELP bmcd_uptime_seconds Seconds since the BMC booted.\n",
                 "# TYPE bmcd_uptime_seconds gauge\n",
                 "bmcd_uptime_seconds 172.43\n",
@@ -1382,6 +1512,95 @@ mod tests {
     /// emitted as a header with no samples: a scraper reading `# TYPE` with
     /// nothing under it learns the metric exists and is unset, which is not
     /// what "this board has no thermal zone" means.
+    /// The metric that would have named hive-6's fault in one query.
+    ///
+    /// A module left in flash mode looks exactly like dead hardware from
+    /// every remote angle -- silent console, unreachable, rail reported on --
+    /// and until this family existed the only readout that named the mode was
+    /// a log line on the BMC itself.
+    #[test]
+    fn a_module_left_in_flash_mode_is_named_in_the_scrape() {
+        let mut snapshot = a_healthy_board();
+        snapshot.usb = Some(UsbTopology::of(
+            UsbConfig::Flashing(NodeId::Node2, UsbRoute::Bmc),
+            "usb2".to_string(),
+        ));
+        let rendered = render(&snapshot);
+
+        assert!(
+            rendered.contains("bmcd_node_usb_boot_armed{node=\"node2\"} 1\n"),
+            "the armed module must be named:\n{rendered}"
+        );
+        for quiet in ["node1", "node3", "node4"] {
+            assert!(
+                rendered.contains(&format!("bmcd_node_usb_boot_armed{{node=\"{quiet}\"}} 0\n")),
+                "{quiet} is not armed and must say so:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(
+                "bmcd_usb_config{node=\"node2\",mode=\"flash\",route=\"bmc\",bus_type=\"usb2\"} 1\n"
+            ),
+            "the configuration itself must be readable:\n{rendered}"
+        );
+    }
+
+    /// The half that makes the assertion above mean something. If every
+    /// configuration armed a module, the test above would pass while the
+    /// metric said nothing.
+    #[test]
+    fn an_ordinary_usb_configuration_arms_no_module() {
+        for config in [
+            UsbConfig::UsbA(NodeId::Node2),
+            UsbConfig::Bmc(NodeId::Node2),
+            UsbConfig::Node(NodeId::Node2, UsbRoute::Bmc),
+            UsbConfig::Node(NodeId::Node2, UsbRoute::AlternativePort),
+        ] {
+            let mut snapshot = a_healthy_board();
+            snapshot.usb = Some(UsbTopology::of(config, "usb3".to_string()));
+            let rendered = render(&snapshot);
+            for node in ["node1", "node2", "node3", "node4"] {
+                assert!(
+                    rendered.contains(&format!("bmcd_node_usb_boot_armed{{node=\"{node}\"}} 0\n")),
+                    "{config:?} must arm nothing, {node} says otherwise"
+                );
+            }
+        }
+    }
+
+    /// `UsbConfig::parts` is the one mapping the `type=usb` response and this
+    /// exposition share. Exactly one variant asserts the pin; if that ever
+    /// changed quietly, a board would keep reporting a module as ready to
+    /// boot while its eMMC was switched out from under it.
+    #[test]
+    fn only_flashing_asserts_the_usb_boot_pin() {
+        assert_eq!(UsbConfig::UsbA(NodeId::Node1).parts().1, UsbMode::Device);
+        assert_eq!(UsbConfig::Bmc(NodeId::Node1).parts().1, UsbMode::Device);
+        assert_eq!(
+            UsbConfig::Node(NodeId::Node1, UsbRoute::Bmc).parts().1,
+            UsbMode::Host
+        );
+        assert_eq!(
+            UsbConfig::Flashing(NodeId::Node1, UsbRoute::Bmc).parts().1,
+            UsbMode::Flash
+        );
+    }
+
+    /// Every module maps to the label the power families already use, so a
+    /// dashboard can join the two. An off-by-one here would blame the wrong
+    /// module, which is worse than reporting nothing.
+    #[test]
+    fn the_node_label_matches_the_power_families() {
+        for (index, node) in [NodeId::Node1, NodeId::Node2, NodeId::Node3, NodeId::Node4]
+            .into_iter()
+            .enumerate()
+        {
+            let topology = UsbTopology::of(UsbConfig::Flashing(node, UsbRoute::Bmc), "usb3".into());
+            assert_eq!(topology.node, format!("node{}", index + 1));
+            assert_eq!(topology.armed_node(), Some(topology.node.as_str()));
+        }
+    }
+
     #[test]
     fn a_family_with_no_samples_is_not_written() {
         let mut out = String::new();
