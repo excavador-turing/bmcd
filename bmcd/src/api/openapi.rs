@@ -281,6 +281,110 @@ fn retarget(node: Value) -> Value {
 
 /// The document. Regenerated on every request; it is a few kilobytes and
 /// the alternative is a cache that outlives a version bump.
+/// `/api/bmc/access` and its two writes, described by hand.
+///
+/// A `problem+json` refusal is the same shape as everywhere else, so these
+/// reuse the `Problem` component rather than inventing a second error type.
+fn access_paths() -> Vec<(String, Value)> {
+    let problem = json!({
+        "description": "A refusal, RFC 9457.",
+        "content": { "application/problem+json": { "schema": component_ref("Problem") } }
+    });
+
+    vec![
+        (
+            "/api/bmc/access".to_string(),
+            json!({ "get": {
+                "summary": "Who may reach this board, and how you reached it",
+                "operationId": "getAccess",
+                "description": "The local account the password belongs to, the trust anchor for \
+                                proxied identity if one is in effect, the header an identity is \
+                                read from, and how THIS request was authenticated. \
+                                `client_ca_pinned_in_config` means config.yaml chose it and the \
+                                daemon will not overwrite that choice.",
+                "responses": {
+                    "200": { "description": "The board's access configuration.",
+                             "content": { "application/json": { "schema": component_ref("AccessState") } } },
+                    "default": problem
+                }
+            }}),
+        ),
+        (
+            "/api/bmc/access/password".to_string(),
+            json!({ "post": {
+                "summary": "Change a local account's password",
+                "operationId": "setPassword",
+                "description": "The CURRENT password is required, including from an operator a \
+                                proxy vouched for: a certificate proves the gateway trusts you, \
+                                not that you hold this board's console. At least 12 characters, \
+                                counted as characters rather than bytes. Existing sessions keep \
+                                working -- a token outlives the password it was minted from.",
+                "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                    "type": "object",
+                    "required": ["username", "current_password", "new_password"],
+                    "properties": {
+                        "username": { "type": "string", "description": "Whose password. `root` on a board." },
+                        "current_password": { "type": "string", "format": "password" },
+                        "new_password": { "type": "string", "format": "password", "minLength": 12 }
+                    }
+                })}}},
+                "responses": {
+                    "204": { "description": "Changed." },
+                    "403": { "description": "The current password is wrong. The same answer is given for an \
+                                             account that does not exist, so this cannot enumerate them.",
+                             "content": { "application/problem+json": { "schema": component_ref("Problem") } } },
+                    "default": problem
+                }
+            }}),
+        ),
+        (
+            "/api/bmc/access/client-ca".to_string(),
+            json!({
+                "put": {
+                    "summary": "Set the CA whose client certificates name an operator",
+                    "operationId": "putClientCa",
+                    "description": "The bundle is loaded through the same call the TLS acceptor makes at \
+                                    startup before it is stored, so a bundle this accepts is one the daemon \
+                                    can start with. Takes effect on the next reload (`opt=set&type=reload`). \
+                                    Refused when config.yaml pins the path.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "required": ["pem"],
+                        "properties": {
+                            "pem": { "type": "string", "description": "One or more certificates, PEM." },
+                            "identity_header": { "type": "string",
+                                "description": "Optional. The header an identity is read from; absent leaves it alone." }
+                        }
+                    })}}},
+                    "responses": {
+                        "202": { "description": "Stored; a reload is required.",
+                                 "content": { "application/json": { "schema": json!({
+                                     "type": "object",
+                                     "properties": {
+                                         "reload_required": { "type": "boolean" },
+                                         "detail": { "type": "string" }
+                                     }
+                                 })}}},
+                        "default": problem
+                    }
+                },
+                "delete": {
+                    "summary": "Stop trusting any proxy",
+                    "operationId": "deleteClientCa",
+                    "description": "Refused when the caller is authenticated BY that CA -- removing it ends \
+                                    the session asking, through the proxy it is asking through. Do it from \
+                                    the board's own interface with a password. Also refused when config.yaml \
+                                    pins the path.",
+                    "responses": {
+                        "202": { "description": "Removed; a reload is required." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+    ]
+}
+
 pub fn document() -> Value {
     let mut paths = serde_json::Map::new();
     let schemas = response_schemas();
@@ -373,7 +477,56 @@ pub fn document() -> Value {
         entry[method] = operation;
     }
 
+    // The access endpoints are NOT aliases and cannot be: the loop above
+    // documents everything as a legacy `opt=`/`type=` call with its
+    // parameters in the query string, and a password must never be in one --
+    // the legacy dispatcher writes every `set` query to the audit log. They
+    // take a JSON body instead, so they are described here by hand.
+    for (path, entry) in access_paths() {
+        paths.insert(path, entry);
+    }
+
     let mut schema_components = components();
+    schema_components.insert(
+        "AccessState".to_string(),
+        json!({
+            "type": "object",
+            "description": "Who may reach this board. See GET /api/bmc/access.",
+            "properties": {
+                "actor": {
+                    "type": "object",
+                    "description": "How this request was authenticated.",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "scheme": { "type": "string", "enum": ["mtls", "token", "basic", "loopback", "none"] }
+                    },
+                    "required": ["name", "scheme"]
+                },
+                "local_account": { "type": "string" },
+                "client_ca": {
+                    "type": ["object", "null"],
+                    "description": "Null when this board trusts no proxy.",
+                    "properties": {
+                        "subject": { "type": "string" },
+                        "issuer": { "type": "string" },
+                        "not_after": { "type": "string" },
+                        "fingerprint": { "type": "string", "description": "SHA-256 over the DER, colon-separated." },
+                        "count": { "type": "integer", "description": "Certificates in the bundle; all are trusted." }
+                    }
+                },
+                "identity_header": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "source": { "type": "string", "enum": ["config", "override", "default"] }
+                    },
+                    "required": ["name", "source"]
+                },
+                "client_ca_pinned_in_config": { "type": "boolean" }
+            },
+            "required": ["actor", "local_account", "identity_header", "client_ca_pinned_in_config"]
+        }),
+    );
     schema_components.insert(
         "Problem".to_string(),
         json!({
@@ -449,6 +602,24 @@ pub fn config(cfg: &mut web::ServiceConfig) {
 mod tests {
     use super::*;
 
+    /// Operations that are deliberately NOT aliases.
+    ///
+    /// The access endpoints cannot be. An alias is documented as a legacy
+    /// `opt=`/`type=` call with its parameters in the query string, and the
+    /// legacy dispatcher writes every `set` query to the audit log -- so a
+    /// password given that way is recorded in clear. They take a JSON body
+    /// instead and are described by hand in `access_paths`.
+    ///
+    /// Listed, not tolerated by a loosened count: adding an operation outside
+    /// the alias table stays a deliberate act with its reason written down,
+    /// which is the whole point of the assertion below.
+    const NOT_ALIASES: &[(&str, &str)] = &[
+        ("/api/bmc/access", "get"),
+        ("/api/bmc/access/password", "post"),
+        ("/api/bmc/access/client-ca", "put"),
+        ("/api/bmc/access/client-ca", "delete"),
+    ];
+
     #[test]
     fn every_alias_is_an_operation_and_every_operation_is_an_alias() {
         let doc = document();
@@ -457,7 +628,16 @@ mod tests {
         for (_, methods) in paths {
             operations += methods.as_object().expect("methods").len();
         }
-        assert_eq!(operations, ALIASES.len());
+        assert_eq!(operations, ALIASES.len() + NOT_ALIASES.len());
+
+        // And each exception is really there, so the list cannot drift into
+        // an allowance for operations that no longer exist.
+        for (path, method) in NOT_ALIASES {
+            assert!(
+                paths.get(*path).and_then(|m| m.get(*method)).is_some(),
+                "{method} {path} is listed as a non-alias operation but is not in the document"
+            );
+        }
     }
 
     #[test]

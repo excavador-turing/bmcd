@@ -8,6 +8,66 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.36.0] — 2026-09-12
+
+### Added
+
+- **Who may reach this board, from the interface that asks for the password**
+  (SQU-209). Both halves of this board's access control used to live only on
+  its filesystem and arrive over SSH: the local password through `passwd` on a
+  console, the client CA through a script in another repository. Nothing in
+  the web interface could answer "who can get in", and the one interface that
+  demands a password every time could not change it.
+
+  `GET /api/bmc/access` now answers with the local account, the trust anchor
+  for proxied identity if one is in effect — subject, issuer, expiry and a
+  SHA-256 fingerprint to compare against the proxy's — the header an identity
+  is read from and which of config/override/default chose it, and **how the
+  asking request was itself authenticated**. A page can now say "you are here
+  as oleg@tsarev.id, vouched for by the gateway" rather than guess.
+
+  `POST /api/bmc/access/password` changes a local password, and
+  `PUT`/`DELETE /api/bmc/access/client-ca` set and remove the trust anchor.
+
+  **Not through the legacy dispatcher, and that is the point.** Every
+  `opt=set` call is written to the audit log with its whole query string, so a
+  password routed that way would be recorded in clear in `bmcd.<date>.log` and
+  in remote syslog when SQU-108 lands. These take a JSON body and log the
+  action and the actor, never the secret.
+
+  The rules each exist because of a specific way this could go wrong:
+
+  - **The current password is required, including from an operator a proxy
+    vouched for.** A certificate proves the gateway trusts you; it does not
+    prove you hold this board's console, and a change made without the old
+    password is a lockout anyone with a live session can perform.
+  - **Twelve characters, counted as characters.** A passphrase is not shorter
+    because it is written in Cyrillic, and `BanPatrol` slows an online guess
+    but does nothing for a stolen `/etc/shadow`.
+  - **A wrong password and an account that does not exist get the same
+    refusal**, so this cannot be used to enumerate accounts.
+  - **`chpasswd`, with the pair on stdin.** Not a shell and not a command
+    line: this daemon runs as root, and a password in `argv` is in `ps` for
+    anyone on the box.
+  - **A CA bundle is loaded the way the TLS acceptor will load it, before it
+    is stored.** A bundle that cannot be loaded makes the daemon fail to
+    *start* — which is exactly why `client_ca` was never safe to ship in a
+    default `config.yaml` — so it must never reach the disk.
+  - **Removing the CA is refused when the caller is authenticated by it.**
+    That request ends its own session, through the proxy it is asking
+    through. Do it from the board's own interface, with a password.
+
+  **The daemon does not rewrite `config.yaml`.** That file is the operator's,
+  it carries comments, and the daemon reads it with a crate that has no
+  writer. So the interface owns two small files instead — the bundle itself at
+  a fixed path, and a JSON sidecar for the header name — and `config.yaml`
+  still wins wherever it speaks. Where it pinned a value, these endpoints
+  refuse to touch it and say so.
+
+  A consequence worth having: `client_ca` now falls back to that fixed path
+  **when the file exists**, so a board whose anchor was removed comes back up
+  instead of refusing to start.
+
 ## [2.35.0] — 2026-09-12
 
 ### Fixed

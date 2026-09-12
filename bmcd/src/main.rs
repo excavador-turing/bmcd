@@ -92,6 +92,13 @@ async fn main() -> anyhow::Result<()> {
     let _logger_lifetime = init_logger(&config.log);
 
     let (tls, certificate) = load_tls_config(&config.tls)?;
+    // Resolved ONCE, here, so the authenticator and the /access page cannot
+    // disagree about which header names the operator. config.yaml wins; the
+    // interface's sidecar fills in only where it said nothing.
+    let (identity_header, identity_header_source) = config
+        .tls
+        .effective_identity_header(&config::AccessOverrides::load());
+    tracing::info!("proxied identity is read from {identity_header} ({identity_header_source})");
     let certificate = Data::new(certificate);
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
     let serial_service = Data::new(SerialConnections::new());
@@ -102,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
             "Access to Baseboard Management Controller",
             config.authentication.token_expires,
             config.authentication.authentication_attempts,
-            &config.tls.identity_header,
+            &identity_header,
         )
         .await?,
     );
@@ -153,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
     // address the authenticator makes its loopback decision on comes from the
     // socket, not from here.
     // Cloned before the server factory takes ownership of them.
+    // The TLS settings travel with the app so `/api/bmc/access` can report
+    // what this board trusts, and refuse to change what config.yaml pinned.
+    let tls_facts = Data::new(config::Tls {
+        private_key: config.tls.private_key.clone(),
+        certificate: config.tls.certificate.clone(),
+        client_ca: config.tls.client_ca.clone(),
+        identity_header: config.tls.identity_header.clone(),
+    });
     let metrics_bmc = bmc.clone();
     let metrics_host = config.host.clone();
     let metrics_port = config.metrics_port;
@@ -168,13 +183,20 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(bmc.clone())
                         .app_data(streaming_data_service.clone())
                         .app_data(serial_service.clone())
+                        .app_data(tls_facts.clone())
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)
                         // The same operations, one path each, for clients
                         // that read the specification. Same authenticator,
                         // same app data, same dispatcher.
-                        .configure(paths::config),
+                        .configure(paths::config)
+                        // Who may get in: the local password and the trust
+                        // anchor for proxied identity (SQU-209). Its own
+                        // module because the legacy dispatcher writes every
+                        // `set` query to the audit log, and a password must
+                        // not be in one.
+                        .configure(crate::api::access::config),
                 )
                 // Serve a static tree of files of the web UI. Must be the last item.
                 .service(Files::new("/", &config.www).index_file("index.html"))
@@ -567,7 +589,7 @@ fn load_tls_config(
     // So a verified certificate is a statement ("a proxy holding our CA's
     // certificate is calling") and its absence is not a denial. What the
     // statement BUYS is decided in the authentication service, not here.
-    if let Some(ca) = tls_config.client_ca.as_ref() {
+    if let Some(ca) = tls_config.effective_client_ca().as_ref() {
         tls.set_ca_file(ca)
             .with_context(|| format!("loading client CA from {}", ca.display()))?;
         tls.set_verify(SslVerifyMode::PEER);
