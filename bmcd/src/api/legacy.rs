@@ -1025,12 +1025,8 @@ async fn set_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
 async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
     let (config, bus_type) = bmc.get_usb_mode().await;
 
-    let (node, mode, route) = match config {
-        UsbConfig::UsbA(node) => (node, UsbMode::Device, UsbRoute::AlternativePort),
-        UsbConfig::Bmc(node) => (node, UsbMode::Device, UsbRoute::Bmc),
-        UsbConfig::Node(node, route) => (node, UsbMode::Host, route),
-        UsbConfig::Flashing(node, route) => (node, UsbMode::Flash, route),
-    };
+    // The same mapping the metrics exposition uses, so the two cannot drift.
+    let (node, mode, route) = config.parts();
 
     // A one-element array, which is upstream's shape for this endpoint.
     json!([crate::api::responses::UsbState {

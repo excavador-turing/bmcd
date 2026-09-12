@@ -8,6 +8,46 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.36.3] — 2026-09-12
+
+### Added
+
+- **`/metrics` now reports the USB multiplexer, including which module is
+  armed for USB boot.** Two families: `bmcd_node_usb_boot_armed`, one sample
+  per module, and `bmcd_usb_config`, which names the node, mode, route and bus
+  type of the persisted configuration.
+
+  `tpi flash` and `tpi advanced msd` leave the configuration at
+  `Flashing(NodeN, …)`. The daemon persists that and re-applies it on every
+  start, which asserts that module's USB-boot pin and stops it booting from
+  its own eMMC. The module keeps running, because it is already booted — so
+  the fault appears at its **next** reboot, possibly weeks later, and then it
+  comes up in the USB loader instead of its operating system.
+
+  From outside, that module is indistinguishable from dead hardware: nothing
+  at all on the serial console, not even a bootloader banner, because the
+  loader does not use the console; nothing on the network; and the BMC
+  reporting its rail on. `tpi usb status` could not separate the two either,
+  because it prints the same route for `UsbA` and `Flashing`. The only readout
+  that named the mode was a line in the daemon's own log.
+
+  Measured on hive-6, 2026-09-12: twenty minutes spent on a module that looked
+  dead, with the fact that explained it sitting unexported in the daemon's
+  database. `bmcd_node_usb_boot_armed{node="node2"} 1` would have answered it
+  in one query, and a rule on fifteen minutes of it pages the operator who
+  armed it while they still remember doing so.
+
+  The armed family is four samples rather than one because a single
+  "which node" gauge cannot express *none*, and none is the normal state it
+  exists to assert.
+
+### Changed
+
+- `UsbConfig::parts()` is now the single mapping from a stored configuration
+  to `(node, mode, route)`. The `type=usb` response and the metrics exposition
+  share it, so a board cannot report one thing through the API and another on
+  a dashboard.
+
 ## [2.36.2] — 2026-09-12
 
 ### Fixed
