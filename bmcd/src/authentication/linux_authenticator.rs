@@ -35,12 +35,18 @@ use tokio::{
     sync::Mutex,
 };
 
-const SHADOW_FILE: &str = "/etc/shadow";
+// One name for this file, in `factory_password`, because three copies of a
+// path are three chances to change two of them.
+use super::factory_password::SHADOW_FILE;
 
 type LinuxContext = AuthenticationContext<UnixValidator>;
 
 pub struct LinuxAuthenticator {
     context: Arc<Mutex<LinuxContext>>,
+    /// The board's own shadow file, asked on every request whether `root` is
+    /// still `turing`. Built once and shared, because it caches on the file's
+    /// modification time.
+    factory: Arc<crate::authentication::factory_password::FactoryPassword>,
     authentication_path: &'static str,
     realm: &'static str,
     /// Which header names the human, when a verified client certificate
@@ -65,6 +71,9 @@ impl LinuxAuthenticator {
                 authentication_token_duration,
                 authentication_attemps,
             ))),
+            factory: Arc::new(
+                crate::authentication::factory_password::FactoryPassword::new(SHADOW_FILE),
+            ),
             authentication_path,
             realm,
             identity_header: identity_header.as_ref().into(),
@@ -163,6 +172,7 @@ where
             self.authentication_path,
             self.realm,
             self.identity_header.clone(),
+            self.factory.clone(),
         )))
     }
 }

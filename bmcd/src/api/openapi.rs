@@ -301,7 +301,9 @@ fn access_paths() -> Vec<(String, Value)> {
                                 proxied identity if one is in effect, the header an identity is \
                                 read from, and how THIS request was authenticated. \
                                 `client_ca_pinned_in_config` means config.yaml chose it and the \
-                                daemon will not overwrite that choice.",
+                                daemon will not overwrite that choice. Also `factory_password`: true while the board is still on `root` / `turing`, \
+                                which is when this endpoint and the password change are the only \
+                                two that answer.",
                 "responses": {
                     "200": { "description": "The board's access configuration.",
                              "content": { "application/json": { "schema": component_ref("AccessState") } } },
@@ -747,7 +749,14 @@ pub fn document() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "The board management controller of a Turing Pi 2, as built by the excavador-turing fork. \
                             Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
-                            which older clients speak and which is not going away.",
+                            which older clients speak and which is not going away.\n\n\
+                            **A board still on its factory password answers 403 to everything here** except \
+                            `/authenticate`, `/access` and `/access/password`. Boards ship as `root` / \
+                            `turing`, which is printed in the quick-start guide and is the same on every \
+                            board, so until it is changed the only thing the board will do is let you change \
+                            it. The refusal is `application/problem+json` and says so. Requests from the \
+                            board's own loopback interface are exempt, because that is how the firmware \
+                            promotes itself on first boot.",
             "contact": { "name": "excavador-turing", "url": "https://github.com/excavador-turing" },
             "license": { "name": "Apache-2.0" }
         },
