@@ -8,6 +8,55 @@ version here only reaches hardware once `BMC-Firmware` bumps that pin.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Install your own certificate and key, from the interface or the API.**
+  `GET`, `PUT` and `DELETE` on `/api/bmc/tls/certificate`. For anyone running
+  their own CA — the request came twice from people running step-ca — who
+  wants a board that a browser trusting that CA opens without a warning, and
+  a serial console that works, since a click-through exception does not cover
+  the console's WebSocket.
+
+  Before this the only way to put such a certificate on a board was to copy
+  two files over SSH.
+
+  Everything is checked before anything is written, because a board given a
+  certificate it cannot serve may be a board nobody can reach to correct it.
+  The key must belong to the certificate; the certificate must be valid now;
+  it must permit server authentication, where it says anything about purpose
+  at all; and it must name this board. A certificate naming some other host is
+  refused with both name lists in the reason, rather than installed for a
+  browser to reject later.
+
+  The key travels in a JSON body on its own path, never a query string. The
+  legacy dispatcher writes every `opt=set` call to the audit log in full, so a
+  key routed through it would be recorded in clear. What is logged is the
+  action, the actor, the subject and the expiry.
+
+  `DELETE` removes the pair and has the board issue its own, so it is never
+  left without one.
+
+### Changed
+
+- **The certificate is no longer fixed at startup.** It lives behind a lock
+  and is chosen per connection through OpenSSL's servername callback, so
+  installing one takes effect on the next connection with no restart — and
+  the session that sent it survives to read the answer.
+
+  The callback is SNI's, and a BMC is normally reached by address, which sends
+  no SNI. OpenSSL runs the callback for those handshakes too, and there is a
+  test that connects with server-name indication switched off and asserts it
+  is served the certificate installed a moment earlier. Without that, every
+  board would keep serving its startup certificate while the API reported the
+  new one.
+
+- **`bmcd_tls_certificate_info` gains a `source` label**, `self-signed` or
+  `installed`, read from the issuer rather than from any record of how the
+  file was written. It decides whether the board renews the certificate on its
+  own, so an expiry alert means something different for each.
+
 ## [2.36.3] — 2026-09-12
 
 ### Added
