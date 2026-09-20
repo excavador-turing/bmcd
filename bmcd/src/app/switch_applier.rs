@@ -218,6 +218,20 @@ mod tests {
         assert_eq!(interface_name(PortId::Bmc), None);
     }
 
+    /// A name is not a switch setting. Renaming a VLAN must not touch the
+    /// hardware, or every relabelling would cost the board a reconfiguration
+    /// of something that was already right.
+    #[test]
+    fn renaming_a_vlan_plans_nothing() {
+        let running = trunk();
+        let mut renamed = running.clone();
+        renamed
+            .names
+            .insert(20, "the modules, out the back".to_string());
+        assert_ne!(running, renamed, "the documents do differ");
+        assert!(plan(&running, &renamed).is_empty());
+    }
+
     /// Filtering must not be switched on before the VLANs exist, and must be
     /// switched off before they are removed. A bridge filtering with no VLANs
     /// forwards nothing.

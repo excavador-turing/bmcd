@@ -383,13 +383,21 @@ fn access_paths() -> Vec<(String, Value)> {
                                     the whole proof: after an apply the old path no longer \
                                     exists, so any authenticated request that reaches the daemon \
                                     came through the new configuration. Only on confirm is \
-                                    anything written to the overlay.",
+                                    anything written to the overlay.\n\nWhich is why a \
+                                    confirmation sent over **loopback** is refused with 403: it \
+                                    crossed no switch port, so it proves nothing, and it would \
+                                    make permanent a configuration nobody has shown to work. \
+                                    Confirm from the interface, or from `tpi` on another \
+                                    machine. Apply and revert are open to loopback; only this is \
+                                    not.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object", "required": ["token"],
                         "properties": { "token": { "type": "string" } }
                     })}}},
                     "responses": {
                         "200": { "description": "Kept, and persisted." },
+                        "403": { "description": "It came from the board itself and proves nothing.",
+                                 "content": { "application/problem+json": { "schema": component_ref("Problem") } } },
                         "default": problem
                     }
                 }
