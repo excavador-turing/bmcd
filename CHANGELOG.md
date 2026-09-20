@@ -10,6 +10,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A certificate naming the board by its real DNS name is no longer
+  refused.** The name check compared the certificate against the board's own
+  idea of what it is called, which on a real board is not what its certificate
+  says.
+
+  Found on bmc-2 while running the install gate. The board knows itself as
+  `bmc-2`. Its DHCP search domain is `haarlem.internal`. The certificate its
+  own authority issued names `bmc-2.haarlem.lan`. Three different answers to
+  "what is this board called", none of them wrong, and only one of them
+  written anywhere the board can read. That certificate was accepted only
+  because it happens to carry an IP address as well.
+
+  A certificate naming just an FQDN — which is what `step ca certificate
+  bmc.lan` produces, and what the people who asked for this feature will have
+  — would have been refused.
+
+  So the check now also asks the question a browser actually asks. A browser
+  does not compare a certificate against the board's idea of its own name; it
+  compares it against the name the operator typed, having resolved that name
+  to the board. A name that resolves to one of this board's addresses is a
+  name someone can reach it by.
+
+  Bounded at two seconds per name, and failure is simply "no match", so a
+  board whose DNS is down behaves exactly as it did before. Wildcards and
+  address literals are never looked up.
+
+
 ### Security
 
 - **The password validator no longer logs a hash of what was typed.** It

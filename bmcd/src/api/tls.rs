@@ -220,6 +220,71 @@ fn board_names() -> Vec<String> {
     names
 }
 
+/// Every address this board currently holds, loopback and link-local aside.
+///
+/// Separate from [`board_names`] because the two are used differently: those
+/// are compared as text, these are compared against what a name RESOLVES to.
+fn board_addresses() -> Vec<std::net::IpAddr> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .into_iter()
+        .map(|interface| interface.ip())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !is_link_local(ip))
+        .collect()
+}
+
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
+/// True when one of the certificate's names points at this board.
+///
+/// THE TEXT COMPARISON IS NOT ENOUGH, and a real board proved it. bmc-2 knows
+/// itself as `bmc-2`; its DHCP search domain is `haarlem.internal`; and the
+/// certificate its own authority issued names `bmc-2.haarlem.lan`. Three
+/// different answers to "what is this board called", none of them wrong, and
+/// only one of them written anywhere the board can read.
+///
+/// So ask the question a browser actually asks. A browser does not compare a
+/// certificate against the board's idea of its own name -- it compares it
+/// against the name the OPERATOR typed, having resolved that name to the
+/// board. A name that resolves here is a name someone can reach this board by,
+/// and a certificate carrying it is one their browser will accept.
+///
+/// Bounded, and failure is simply "no match": a board whose DNS is down falls
+/// back to the text comparison, which is where it was before this existed.
+async fn names_resolving_here(names: &[String]) -> bool {
+    let mine = board_addresses();
+    if mine.is_empty() {
+        return false;
+    }
+
+    for name in names {
+        // A wildcard cannot be resolved, and an address in the SAN was already
+        // compared as text.
+        if name.starts_with("*.") || name.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        let lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::lookup_host(format!("{name}:443")),
+        )
+        .await;
+        let Ok(Ok(addrs)) = lookup else {
+            continue;
+        };
+        if addrs.into_iter().any(|addr| mine.contains(&addr.ip())) {
+            return true;
+        }
+    }
+    false
+}
+
 /// True when `cert` asserts at least one name this board answers to.
 ///
 /// Wildcards count: `*.lan` covers `bmc-1.lan`, and a person issuing from
@@ -276,7 +341,7 @@ fn may_serve(cert: &X509) -> bool {
 /// Every check happens before a byte is written. A board that has been given
 /// a certificate it cannot serve is a board nobody can reach to correct it,
 /// so the only safe order is to prove the pair usable, then store it.
-fn validate(upload: &CertificateUpload) -> Result<(PKey<Private>, X509, Vec<X509>), String> {
+async fn validate(upload: &CertificateUpload) -> Result<(PKey<Private>, X509, Vec<X509>), String> {
     let mut chain = X509::stack_from_pem(upload.certificate.as_bytes())
         .map_err(|e| format!("not a PEM certificate: {e}"))?;
     if chain.is_empty() {
@@ -314,11 +379,15 @@ fn validate(upload: &CertificateUpload) -> Result<(PKey<Private>, X509, Vec<X509
     }
 
     let board = board_names();
-    if !names_this_board(&leaf, &board) {
+    let asserted = names_in(&leaf);
+    if !names_this_board(&leaf, &board) && !names_resolving_here(&asserted).await {
         return Err(format!(
-            "the certificate names {:?}, and this board answers to {:?} -- no browser would accept it",
-            names_in(&leaf),
-            board
+            "the certificate names {:?}. This board answers to {:?}, and none of \
+             the certificate's names resolves to one of its addresses {:?} -- no \
+             browser would accept it",
+            asserted,
+            board,
+            board_addresses()
         ));
     }
 
@@ -353,7 +422,7 @@ async fn put_certificate(
     body: web::Json<CertificateUpload>,
 ) -> Result<HttpResponse, LegacyResponse> {
     let body = body.into_inner();
-    let (key, leaf, chain) = validate(&body).map_err(LegacyResponse::bad_request)?;
+    let (key, leaf, chain) = validate(&body).await.map_err(LegacyResponse::bad_request)?;
 
     // The key first, and only then the certificate. Either order leaves a
     // window where the two files disagree; this one leaves the OLD
@@ -554,18 +623,20 @@ mod tests {
     /// `localhost` is in `board_names()` on every machine, so a fixture that
     /// names it passes the "does this name the board" check wherever the
     /// tests run -- including in CI, which has no board and no br0.
-    #[test]
-    fn a_good_pair_is_accepted() {
-        let result = validate(&upload(Fixture::default()));
+    #[tokio::test]
+    async fn a_good_pair_is_accepted() {
+        let result = validate(&upload(Fixture::default())).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
-    #[test]
-    fn a_key_from_a_different_certificate_is_refused() {
+    #[tokio::test]
+    async fn a_key_from_a_different_certificate_is_refused() {
         let mut body = upload(Fixture::default());
         body.private_key = upload(Fixture::default()).private_key;
 
-        let error = validate(&body).expect_err("a mismatched pair must be refused");
+        let error = validate(&body)
+            .await
+            .expect_err("a mismatched pair must be refused");
         assert!(
             error.contains("does not belong"),
             "the reason should name the problem: {error}"
@@ -575,12 +646,13 @@ mod tests {
     /// The failure the whole endpoint exists to prevent: a certificate no
     /// browser would accept, installed on a board that may then be reachable
     /// only by ignoring the warning it was meant to remove.
-    #[test]
-    fn a_certificate_that_does_not_name_this_board_is_refused() {
+    #[tokio::test]
+    async fn a_certificate_that_does_not_name_this_board_is_refused() {
         let error = validate(&upload(Fixture {
             sans: &["DNS:someone-elses-board.example"],
             ..Default::default()
         }))
+        .await
         .expect_err("a certificate for another host must be refused");
         assert!(
             error.contains("no browser would accept it"),
@@ -588,44 +660,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_certificate_with_no_names_at_all_is_refused() {
+    #[tokio::test]
+    async fn a_certificate_with_no_names_at_all_is_refused() {
         let error = validate(&upload(Fixture {
             sans: &[],
             ..Default::default()
         }))
+        .await
         .expect_err("a certificate with no SAN must be refused");
         assert!(error.contains("names []"), "{error}");
     }
 
-    #[test]
-    fn an_expired_certificate_is_refused() {
+    #[tokio::test]
+    async fn an_expired_certificate_is_refused() {
         let error = validate(&upload(Fixture {
             starts_in: None,
             ..Default::default()
         }))
+        .await
         .expect_err("an expired certificate must be refused");
         assert!(error.contains("expired on"), "{error}");
     }
 
-    #[test]
-    fn a_certificate_from_the_future_is_refused() {
+    #[tokio::test]
+    async fn a_certificate_from_the_future_is_refused() {
         let error = validate(&upload(Fixture {
             starts_in: Some(7),
             ..Default::default()
         }))
+        .await
         .expect_err("a certificate not yet valid must be refused");
         assert!(error.contains("not valid until"), "{error}");
     }
 
     /// A certificate that lists its purposes and leaves out server
     /// authentication cannot serve TLS, whatever else is right about it.
-    #[test]
-    fn a_certificate_that_may_not_serve_is_refused() {
+    #[tokio::test]
+    async fn a_certificate_that_may_not_serve_is_refused() {
         let error = validate(&upload(Fixture {
             usages: Some(&["clientAuth", "codeSigning"]),
             ..Default::default()
         }))
+        .await
         .expect_err("a non-server certificate must be refused");
         assert!(error.contains("server authentication"), "{error}");
     }
@@ -633,13 +709,33 @@ mod tests {
     /// No extended key usage at all means unrestricted, which is what a small
     /// private CA usually issues. Refusing those would refuse the very people
     /// this endpoint is for.
-    #[test]
-    fn a_certificate_with_no_stated_usage_is_accepted() {
+    #[tokio::test]
+    async fn a_certificate_with_no_stated_usage_is_accepted() {
         let result = validate(&upload(Fixture {
             usages: None,
             ..Default::default()
-        }));
+        }))
+        .await;
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// The resolver only ever ADDS matches, so the cases worth pinning are the
+    /// ones where it must not.
+    ///
+    /// A real success cannot be asserted here without depending on this
+    /// machine's DNS, so it is not: the board is where that was proved, and
+    /// both of bmc-2's certificate names resolve to bmc-2's own address there.
+    #[tokio::test]
+    async fn the_resolver_matches_nothing_it_cannot_verify() {
+        // RFC 2606 reserves `.example`, so this can never resolve anywhere.
+        assert!(!names_resolving_here(&["nothing.example".to_string()]).await);
+        // A wildcard is not a name that can be looked up.
+        assert!(!names_resolving_here(&["*.lan".to_string()]).await);
+        // An address in the SAN was already compared as text; resolving it
+        // again would be asking DNS to confirm a literal.
+        assert!(!names_resolving_here(&["192.0.2.1".to_string()]).await);
+        // Nothing to match against is not a match.
+        assert!(!names_resolving_here(&[]).await);
     }
 
     /// Somebody issuing from their own CA may well hold a wildcard.
@@ -672,10 +768,10 @@ mod tests {
     /// Nothing that reaches this endpoint may ever appear in a log line, so
     /// the view it returns is checked for the key rather than trusted to
     /// leave it out.
-    #[test]
-    fn the_returned_view_carries_no_key_material() {
+    #[tokio::test]
+    async fn the_returned_view_carries_no_key_material() {
         let body = upload(Fixture::default());
-        let (key, leaf, chain) = validate(&body).expect("valid");
+        let (key, leaf, chain) = validate(&body).await.expect("valid");
         let view = describe(&Served {
             source: Source::of(&leaf),
             key,
