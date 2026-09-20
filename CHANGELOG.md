@@ -10,6 +10,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The switch as one document, and the rules the board refuses.** The model
+  half of the most-asked feature on the public roadmap. Two read-only
+  endpoints come with it: `GET /api/bmc/network/switch/presets` and
+  `POST /api/bmc/network/switch/validate`.
+
+  The configuration is **one object naming all seven ports** — four modules,
+  the BMC's own port, and both uplinks — rather than a set of calls. Partial
+  application is how a board strands itself: six `bridge vlan` calls where the
+  fourth fails leave a switch in a state nobody designed. One document is
+  applied as one operation, and rollback is then "apply the previous
+  document".
+
+  Three presets. **Flat** is one bridge with filtering off, how a board ships
+  and the reset target. **Split** is two groups that never meet, the BMC out
+  of one uplink and the modules out of the other, with nothing tagged, so the
+  other end needs no VLAN configuration at all. **Trunk** is one cable
+  carrying both, tagged, with the second uplink redundant under spanning tree
+  by default.
+
+  **The board expands its own presets.** A client that expanded `Split` itself
+  would eventually disagree with the board about what `Split` means, and that
+  disagreement shows up as a board nobody can reach.
+
+  Five refusals, each one a lockout rather than a preference:
+
+  - the BMC's own port in no untagged VLAN
+  - the BMC's own port alone in its VLAN
+  - a BMC VLAN that no uplink carries, so the board answers only to the
+    modules it is meant to administer
+  - a tagged BMC port, which its network stack cannot read
+  - two uplinks sharing a VLAN with spanning tree off, which is a loop
+
+  Everything else is a warning with the port it is about, so an interface can
+  say what is odd without refusing it.
+
+  Nothing here applies anything to hardware. The apply, the confirm window and
+  persistence are separate and deliberately cannot be reached from this model.
+
+
 ### Fixed
 
 - **A certificate naming the board by its real DNS name is no longer

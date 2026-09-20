@@ -15,6 +15,7 @@ pub mod access;
 pub mod into_legacy_response;
 pub mod legacy;
 pub mod metrics;
+pub mod network;
 pub mod openapi;
 pub mod paths;
 pub mod responses;

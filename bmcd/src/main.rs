@@ -203,7 +203,8 @@ async fn main() -> anyhow::Result<()> {
                         // `set` query to the audit log, and a password must
                         // not be in one.
                         .configure(crate::api::access::config)
-                        .configure(crate::api::tls::config),
+                        .configure(crate::api::tls::config)
+                        .configure(crate::api::network::config),
                 )
                 // Serve a static tree of files of the web UI. Must be the last item.
                 .service(Files::new("/", &config.www).index_file("index.html"))

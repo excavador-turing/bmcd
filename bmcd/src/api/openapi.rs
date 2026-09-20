@@ -338,6 +338,47 @@ fn access_paths() -> Vec<(String, Value)> {
             }}),
         ),
         (
+            "/api/bmc/network/switch/presets".to_string(),
+            json!({
+                "get": {
+                    "summary": "The switch presets, expanded by the board",
+                    "operationId": "getSwitchPresets",
+                    "description": "Each preset's full port table, so every client previews the \
+                                    same thing. A client that expanded a preset itself would \
+                                    eventually disagree with the board about what it means, and \
+                                    that disagreement shows up as a board nobody can reach. \
+                                    `trunk` is shown with example VLAN identifiers; the real ones \
+                                    are the operator's, because the router has to match them.",
+                    "responses": {
+                        "200": { "description": "Every preset, with the board's own warnings." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/switch/validate".to_string(),
+            json!({
+                "post": {
+                    "summary": "What the board would say about a configuration",
+                    "operationId": "validateSwitchConfiguration",
+                    "description": "Takes a preset or a whole document and returns the document \
+                                    as the board reads it, a refusal if it has one, and any \
+                                    warnings. Changes nothing. A refusal comes back inside a 200: \
+                                    the caller asked a question and got an answer, and did not \
+                                    make a bad request.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "description": "Either {\"preset\": \"flat\"|\"split\"|\"trunk\", ...} or a full document.",
+                        "type": "object"
+                    })}}},
+                    "responses": {
+                        "200": { "description": "The verdict: document, refusal, warnings." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
             "/api/bmc/tls/certificate".to_string(),
             json!({
                 "get": {
@@ -698,6 +739,8 @@ mod tests {
         ("/api/bmc/tls/certificate", "get"),
         ("/api/bmc/tls/certificate", "put"),
         ("/api/bmc/tls/certificate", "delete"),
+        ("/api/bmc/network/switch/presets", "get"),
+        ("/api/bmc/network/switch/validate", "post"),
     ];
 
     #[test]
