@@ -453,9 +453,15 @@ mod tests {
     struct Fixture {
         cn: &'static str,
         sans: &'static [&'static str],
-        /// Days from now. Negative for a certificate that has expired,
-        /// positive-and-starting-later for one not yet valid.
-        starts_in: i32,
+        /// Days from now that the certificate becomes valid. `None` means it
+        /// was valid in 2020 and expired in 2020 -- an expired fixture.
+        ///
+        /// Fixed dates rather than an offset from the clock, because
+        /// `Asn1Time::from_unix` takes a `time_t`, which is 32 bits on the
+        /// board's armv7. An `i64` here compiles on a workstation and fails to
+        /// cross-compile, which is exactly the class of fault the board's
+        /// cross-compile check exists to catch.
+        starts_in: Option<u32>,
         lasts_days: u32,
         /// `None` leaves the extension out entirely, which means
         /// unrestricted.
@@ -467,7 +473,7 @@ mod tests {
             Fixture {
                 cn: "bmc-test",
                 sans: &["DNS:localhost"],
-                starts_in: 0,
+                starts_in: Some(0),
                 lasts_days: 30,
                 usages: Some(&["serverAuth"]),
             }
@@ -490,27 +496,16 @@ mod tests {
         builder.set_issuer_name(&name).expect("issuer");
         builder.set_pubkey(&key).expect("pubkey");
 
-        let not_before = if fixture.starts_in >= 0 {
-            Asn1Time::days_from_now(fixture.starts_in as u32).expect("not before")
-        } else {
-            Asn1Time::from_unix(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_secs() as i64
-                    + i64::from(fixture.starts_in) * 86_400,
-            )
-            .expect("not before")
+        let (not_before, not_after) = match fixture.starts_in {
+            Some(days) => (
+                Asn1Time::days_from_now(days).expect("not before"),
+                Asn1Time::days_from_now(days + fixture.lasts_days).expect("not after"),
+            ),
+            None => (
+                Asn1Time::from_str("20200101000000Z").expect("not before"),
+                Asn1Time::from_str("20200201000000Z").expect("not after"),
+            ),
         };
-        let not_after = Asn1Time::from_unix(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_secs() as i64
-                + i64::from(fixture.starts_in) * 86_400
-                + i64::from(fixture.lasts_days) * 86_400,
-        )
-        .expect("not after");
         builder.set_not_before(&not_before).expect("not before");
         builder.set_not_after(&not_after).expect("not after");
 
@@ -606,8 +601,7 @@ mod tests {
     #[test]
     fn an_expired_certificate_is_refused() {
         let error = validate(&upload(Fixture {
-            starts_in: -60,
-            lasts_days: 30,
+            starts_in: None,
             ..Default::default()
         }))
         .expect_err("an expired certificate must be refused");
@@ -617,7 +611,7 @@ mod tests {
     #[test]
     fn a_certificate_from_the_future_is_refused() {
         let error = validate(&upload(Fixture {
-            starts_in: 7,
+            starts_in: Some(7),
             ..Default::default()
         }))
         .expect_err("a certificate not yet valid must be refused");
