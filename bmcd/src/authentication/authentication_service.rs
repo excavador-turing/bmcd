@@ -886,10 +886,13 @@ mod tests {
         );
     }
 
-    /// Loopback is exempt, and that is load-bearing: `S99postupdate` reads
-    /// the metrics that decide whether a freshly flashed image is promoted,
-    /// over loopback, on the first boot of a board that is by definition
-    /// still on its factory password.
+    /// Loopback is exempt because refusing it would protect nothing: anyone
+    /// with a shell on the board is already root on it. What it buys is the
+    /// on-board `tpi` working on a board that has not been set up.
+    ///
+    /// It is NOT about the first-boot promotion check, whatever an earlier
+    /// version of this comment claimed -- `/metrics` is a separate listener
+    /// and `S99postupdate` does not come through here at all.
     #[actix_web::test]
     async fn loopback_is_not_gated_by_the_factory_password() {
         let dir = tempdir::TempDir::new("gate-loopback").expect("temp dir");
