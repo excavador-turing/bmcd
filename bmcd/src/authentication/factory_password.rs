@@ -39,20 +39,36 @@
 //!
 //! ## Loopback is exempt, deliberately
 //!
-//! `/api/bmc` already drops authentication entirely for the loopback
-//! interface: that is how the on-board `tpi` works without credentials, and
-//! how `S99postupdate` reads the metrics that decide whether a freshly
-//! flashed image is promoted or rolled back.
+//! Because refusing it would protect nothing. `/api/bmc` already drops
+//! authentication entirely for the loopback interface, and somebody with a
+//! shell on the board is already root on it -- they can read `/etc/shadow`,
+//! run `chpasswd`, or stop this daemon. The threat this gate exists for is a
+//! stranger who can reach port 443 on the management LAN, and that stranger
+//! is not on loopback.
 //!
-//! Refusing loopback would therefore fail the promotion check on the first
-//! boot of every factory board -- the exact boards this protects -- and roll
-//! the firmware back. It would also protect nothing: loopback is not the
-//! management LAN, and somebody with a shell on the board owns the board
-//! already. The threat here is a stranger who can reach port 443, and that
-//! stranger is not on loopback.
+//! What the exemption buys, concretely: the on-board `tpi` keeps working on a
+//! board that has not been set up. Per the known-faults page it is the only
+//! thing left that relies on the bypass at all.
 //!
 //! `tpi` pointed at a factory board **from another machine** is over the
-//! network, is gated, and prints the reason.
+//! network, is gated, and prints the reason -- which is what the ticket's
+//! gate actually asks for.
+//!
+//! ## What this exemption is NOT for
+//!
+//! It was first justified here as protecting the first-boot promotion check,
+//! on the grounds that `S99postupdate` reads metrics over loopback. **That is
+//! wrong and the claim is withdrawn.** `/metrics` is served by a separate
+//! plain-HTTP listener on 9110 with no authentication middleware at all, and
+//! the gate's liveness probe hits `https://127.0.0.1/` -- the static
+//! interface, not `/api/bmc`. Neither passes through here, so promotion is
+//! unaffected whichever way this goes. `S99postupdate` says as much in its own
+//! comments: its last dependence on the loopback bypass was removed when
+//! `/metrics` moved.
+//!
+//! Recorded rather than quietly deleted, because a security exemption with a
+//! reason that does not hold is worse than one with a thin reason: the next
+//! person to read it inherits the confidence without the fact.
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;

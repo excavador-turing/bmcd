@@ -222,10 +222,17 @@ where
 ///
 /// `Loopback` is named rather than folded into "authenticated", because it is
 /// the bypass: `/api/bmc` skips authentication entirely for requests from the
-/// board itself, which is how the on-board `tpi` works without credentials and
-/// how the promotion gate reads its metrics token. An audit trail that cannot
-/// tell that apart from a real credential is not an audit trail — and this is
-/// the line somebody reading one would most want to find.
+/// board itself, which is how the on-board `tpi` works without credentials.
+/// An audit trail that cannot tell that apart from a real credential is not an
+/// audit trail — and this is the line somebody reading one would most want to
+/// find.
+///
+/// It used to say "and how the promotion gate reads its metrics token". It
+/// does not: `/metrics` moved to its own plain-HTTP listener that takes no
+/// credential, and `S99postupdate` has made one plain request ever since. The
+/// on-board `tpi` is the only thing left that relies on the bypass at all,
+/// which is worth knowing before anyone reasons about what removing it would
+/// cost.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Actor {
     Loopback,

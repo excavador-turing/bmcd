@@ -31,15 +31,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   factory board again. A change made by anything — this daemon, `passwd`, an
   editor — is noticed on the next request, with no restart.
 
-  **Loopback is exempt, and that is load-bearing.** `/api/bmc` already drops
-  authentication for the loopback interface: it is how the on-board `tpi`
-  works and how `S99postupdate` reads the metrics that decide whether a
-  freshly flashed image is promoted or rolled back. Gating it would fail the
-  promotion check on the first boot of every factory board — the exact boards
-  this protects — and roll the firmware back. It would also protect nothing:
-  the threat is a stranger who can reach port 443, and that stranger is not on
-  loopback. `tpi` pointed at a factory board from another machine is over the
-  network, is gated, and says so.
+  **Loopback is exempt, because refusing it would protect nothing.** Anyone
+  with a shell on the board is already root on it — they can read
+  `/etc/shadow`, run `chpasswd`, or stop the daemon. The threat this gate
+  exists for is a stranger who can reach port 443 on the management LAN, and
+  that stranger is not on loopback. What the exemption buys is the on-board
+  `tpi` working on a board that has not been set up; it is the only thing left
+  that relies on the bypass at all. `tpi` pointed at a factory board from
+  another machine is over the network, is gated, and says so.
+
+  *(An earlier draft of this entry justified the exemption by the first-boot
+  promotion check. That was wrong: `/metrics` is a separate plain-HTTP
+  listener and `S99postupdate` does not pass through `/api/bmc` at all.
+  Corrected rather than deleted — a security exemption with a reason that does
+  not hold is worse than one with a thin reason.)*
 
   A wrong password on a factory board is still answered as a wrong password.
   Saying "this board is on its factory password" to a failed login would
