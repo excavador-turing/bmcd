@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v2.37.0] — 2026-09-20
+
 ### Security
 
 - **A board still on its factory password can do exactly one thing.** Every
