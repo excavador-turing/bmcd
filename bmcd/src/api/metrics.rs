@@ -151,6 +151,10 @@ pub struct Certificate {
     /// `rsa-4096`. Not secret, and the first question asked when a client
     /// cannot negotiate.
     pub key: Option<String>,
+    /// `self-signed` when the board issued it, `installed` when somebody put
+    /// it there. The difference decides whether the board will renew it on
+    /// its own, so an expiry alert means something different for each.
+    pub source: Option<String>,
 }
 
 /// Everything one scrape reports, gathered before any of it is formatted.
@@ -181,10 +185,16 @@ async fn handle_metrics(
     bmc: web::Data<BmcApplication>,
     // Optional so a listener assembled without it still serves every other
     // family, rather than answering 500 for want of one gauge.
-    certificate: Option<web::Data<Certificate>>,
+    //
+    // Read through the store on every scrape, not captured once: a
+    // certificate installed at runtime replaces what the listener serves, and
+    // a scrape still describing the startup certificate would be worse than
+    // no series at all -- it would be a confident wrong answer about which
+    // certificate is on the wire.
+    certificate: Option<web::Data<crate::tls_store::ServedCertificate>>,
 ) -> impl Responder {
     let certificate = certificate
-        .map(|data| data.as_ref().clone())
+        .map(|store| store.current().facts())
         .unwrap_or_default();
     let snapshot = collect(bmc.as_ref(), certificate).await;
     HttpResponse::Ok()
@@ -417,17 +427,29 @@ fn render_certificate(out: &mut String, certificate: &Certificate) {
             .collect::<Vec<_>>(),
     );
 
+    // `source` is on the same series as `key` rather than a family of its
+    // own, because the two are always known together and a rule that alerts
+    // on expiry wants both in one join: an installed certificate running down
+    // needs a person, a self-signed one renews itself.
+    //
+    // A certificate whose key cannot be described still reports its source,
+    // with `key="unknown"`. Dropping the series in that case would hide the
+    // very certificate somebody is trying to diagnose.
     family(
         out,
         "bmcd_tls_certificate_info",
         "gauge",
-        "The key the certificate this listener serves is built on.",
-        &certificate
-            .key
-            .as_deref()
-            .map(|key| Sample::new(labels(&[("key", key)]), 1.0))
-            .into_iter()
-            .collect::<Vec<_>>(),
+        "The key the certificate this listener serves is built on, and where it came from.",
+        &match (certificate.key.as_deref(), certificate.source.as_deref()) {
+            (None, None) => Vec::new(),
+            (key, source) => vec![Sample::new(
+                labels(&[
+                    ("key", key.unwrap_or("unknown")),
+                    ("source", source.unwrap_or("unknown")),
+                ]),
+                1.0,
+            )],
+        },
     );
 }
 
@@ -1006,6 +1028,7 @@ mod tests {
         snapshot.certificate = Certificate {
             expires_unix: Some(1_789_000_000),
             key: Some("ecdsa-p384".to_string()),
+            source: Some("self-signed".to_string()),
         };
         let rendered = render(&snapshot);
         assert!(rendered.contains(concat!(
@@ -1016,7 +1039,7 @@ mod tests {
         assert!(
             rendered.contains(concat!(
                 "# TYPE bmcd_tls_certificate_info gauge\n",
-                "bmcd_tls_certificate_info{key=\"ecdsa-p384\"} 1\n",
+                "bmcd_tls_certificate_info{key=\"ecdsa-p384\",source=\"self-signed\"} 1\n",
             )),
             "info family missing from:\n{rendered}"
         );

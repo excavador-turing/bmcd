@@ -20,6 +20,7 @@ mod hal;
 mod persistency;
 mod serial_service;
 mod streaming_data_service;
+mod tls_store;
 mod usb_boot;
 mod utils;
 
@@ -52,7 +53,7 @@ use openssl::{
     asn1::Asn1Time,
     nid::Nid,
     pkey::{Id, PKey, Private},
-    ssl::{select_next_proto, AlpnError, SslAcceptor, SslMethod, SslVerifyMode},
+    ssl::{select_next_proto, AlpnError, SniError, SslAcceptor, SslMethod, SslVerifyMode},
     x509::{X509VerifyResult, X509},
 };
 use std::{
@@ -91,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(&config_path).context("Error parsing config file")?;
     let _logger_lifetime = init_logger(&config.log);
 
-    let (tls, certificate) = load_tls_config(&config.tls)?;
+    let (tls, served_certificate) = load_tls_config(&config.tls)?;
     // Resolved ONCE, here, so the authenticator and the /access page cannot
     // disagree about which header names the operator. config.yaml wins; the
     // interface's sidecar fills in only where it said nothing.
@@ -99,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
         .tls
         .effective_identity_header(&config::AccessOverrides::load());
     tracing::info!("proxied identity is read from {identity_header} ({identity_header_source})");
-    let certificate = Data::new(certificate);
+    // The STORE, not a snapshot of it. `/metrics` must describe the
+    // certificate being served now, and after an install that is no longer
+    // the one read at startup.
+    let certificate = Data::new(served_certificate.clone());
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
     let serial_service = Data::new(SerialConnections::new());
     let streaming_data_service = Data::new(StreamingDataService::new());
@@ -169,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         identity_header: config.tls.identity_header.clone(),
     });
     let metrics_bmc = bmc.clone();
+    let metrics_certificate = certificate.clone();
     let metrics_host = config.host.clone();
     let metrics_port = config.metrics_port;
 
@@ -184,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(streaming_data_service.clone())
                         .app_data(serial_service.clone())
                         .app_data(tls_facts.clone())
+                        .app_data(certificate.clone())
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)
@@ -196,7 +202,8 @@ async fn main() -> anyhow::Result<()> {
                         // module because the legacy dispatcher writes every
                         // `set` query to the audit log, and a password must
                         // not be in one.
-                        .configure(crate::api::access::config),
+                        .configure(crate::api::access::config)
+                        .configure(crate::api::tls::config),
                 )
                 // Serve a static tree of files of the web UI. Must be the last item.
                 .service(Files::new("/", &config.www).index_file("index.html"))
@@ -258,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_server = HttpServer::new(move || {
         App::new()
             .app_data(metrics_bmc.clone())
-            .app_data(certificate.clone())
+            .app_data(metrics_certificate.clone())
             .service(web::scope("/metrics").configure(metrics::config))
     })
     .workers(1)
@@ -479,22 +486,6 @@ fn load_keys_from_pem<P: AsRef<Path>>(
 /// length-prefixed wire form.
 const ALPN_HTTP11: &[u8] = b"\x08http/1.1";
 
-/// What to say about the certificate this listener serves, for `/metrics`.
-///
-/// Derived from the certificate the daemon actually loaded, not from a fresh
-/// read: replacing the file without restarting is precisely when a re-read
-/// would describe something the listener is not serving.
-///
-/// Everything here is already public -- it is sent to every client during the
-/// handshake -- so there is nothing to withhold from an unauthenticated
-/// scrape.
-fn certificate_facts(cert: &X509) -> metrics::Certificate {
-    metrics::Certificate {
-        expires_unix: certificate_expiry_unix(cert),
-        key: cert.public_key().ok().as_ref().map(describe_key),
-    }
-}
-
 /// ASN.1 times are not unix times. OpenSSL will not hand one over directly,
 /// so the distance from the epoch is measured and added up; a certificate
 /// whose date cannot be read reports nothing rather than 1970, which would
@@ -531,7 +522,7 @@ fn describe_key(key: &PKey<openssl::pkey::Public>) -> String {
 /// listener about which certificate is in use.
 fn load_tls_config(
     tls_config: &config::Tls,
-) -> anyhow::Result<(SslAcceptor, metrics::Certificate)> {
+) -> anyhow::Result<(SslAcceptor, tls_store::ServedCertificate)> {
     let (private_key, cert) = load_keys_from_pem(&tls_config.private_key, &tls_config.certificate)?;
     // `_v5`, and the suffix is the whole point: `mozilla_intermediate` is
     // Mozilla's version 4 profile, which pins the maximum protocol version to
@@ -554,8 +545,58 @@ fn load_tls_config(
     // negotiates; 1.2 stays as the fallback, because a BMC is the thing you
     // reach for with whatever client you have.
     let mut tls = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+
+    // The pair is NOT set on the builder. It lives in the store, and every
+    // new connection is handed whatever is in there at the time -- which is
+    // what makes installing a certificate something other than a restart.
+    //
+    // OpenSSL still wants a certificate on the context at build time for some
+    // internal checks, so the current pair is set here as well; the callback
+    // below overrides it per connection. Both come from the same read, so a
+    // board that never installs anything behaves exactly as before.
     tls.set_private_key(&private_key)?;
     tls.set_certificate(&cert)?;
+
+    let store = tls_store::ServedCertificate::new(tls_store::Served {
+        key: private_key,
+        leaf: cert.clone(),
+        chain: Vec::new(),
+        source: tls_store::Source::of(&cert),
+    });
+
+    // Hand out the current pair, once per handshake.
+    //
+    // This is SNI's callback and the board has no use for SNI, but OpenSSL
+    // runs it for every handshake, including the ones where the client sent
+    // no server name -- it is the final handler for that extension, and final
+    // handlers run whether or not the extension was present. A BMC is usually
+    // reached by address, and an address sends no SNI, so that detail is the
+    // difference between this working and this working only in a browser
+    // typed a hostname into.
+    //
+    // A failure here is fatal to the handshake, which is correct: the
+    // alternative is serving whatever stale pair the context happens to hold
+    // and leaving the operator to wonder why the certificate they installed
+    // is not the one being served.
+    let for_callback = store.clone();
+    tls.set_servername_callback(move |ssl, _alert| {
+        let served = for_callback.current();
+        ssl.set_certificate(&served.leaf)
+            .and_then(|()| ssl.set_private_key(&served.key))
+            .map_err(|e| {
+                tracing::error!("could not serve the current certificate: {e}");
+                SniError::ALERT_FATAL
+            })?;
+        for issuer in &served.chain {
+            // A chain that will not attach is worth a line but not a refused
+            // connection: the leaf is what authenticates the board, and a
+            // client that already trusts the issuer needs no intermediates.
+            if let Err(e) = ssl.add_chain_cert(issuer.clone()) {
+                tracing::warn!("could not attach a chain certificate: {e}");
+            }
+        }
+        Ok(())
+    });
 
     // Offer `http/1.1` and nothing else.
     //
@@ -630,11 +671,14 @@ fn load_tls_config(
     tls.set_session_id_context(&sid_ctx)
         .context("setting the session id context")?;
 
-    let facts = certificate_facts(&cert);
+    let facts = store.current().facts();
     if let Some(key) = facts.key.as_deref() {
-        tracing::info!("serving a {key} certificate");
+        tracing::info!(
+            "serving a {key} certificate ({})",
+            facts.source.as_deref().unwrap_or("unknown origin")
+        );
     }
-    Ok((tls.build(), facts))
+    Ok((tls.build(), store))
 }
 
 /// Pick a protocol from the client's ALPN list. `client_protocols` is
@@ -806,7 +850,8 @@ mod tests {
 
         for (kind, expected) in cases {
             let (_dir, tls) = throwaway_tls_config_of(kind, "bmcd-describe");
-            let (_acceptor, facts) = load_tls_config(&tls).expect("acceptor");
+            let (_acceptor, store) = load_tls_config(&tls).expect("acceptor");
+            let facts = store.current().facts();
 
             assert_eq!(facts.key.as_deref(), Some(expected));
 
@@ -1182,5 +1227,132 @@ mod tests {
     /// The estate's own key type, for the tests that do not care which.
     fn write_self_signed_pair(key_path: &Path, cert_path: &Path) {
         write_self_signed_pair_of(KeyKind::P384, key_path, cert_path);
+    }
+
+    /// A pair in memory, with `cn` as its subject, so two of them can be told
+    /// apart from the client end of a handshake.
+    fn pair_named(cn: &str) -> (PKey<Private>, X509) {
+        let pkey = KeyKind::P384.generate();
+
+        let mut name = openssl::x509::X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_nid(Nid::COMMONNAME, cn).expect("cn");
+        let name = name.build();
+
+        let mut builder = X509Builder::new().expect("x509 builder");
+        builder.set_version(2).expect("version");
+        builder.set_subject_name(&name).expect("subject");
+        builder.set_issuer_name(&name).expect("issuer");
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
+            .expect("not before");
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).expect("not after"))
+            .expect("not after");
+        builder.set_pubkey(&pkey).expect("pubkey");
+        builder
+            .sign(&pkey, KeyKind::P384.digest())
+            .expect("self-sign");
+        (pkey, builder.build())
+    }
+
+    /// One handshake against `acceptor`, from a client that sends NO server
+    /// name, returning the subject of the certificate it was offered.
+    fn subject_offered_without_sni(acceptor: &SslAcceptor) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let acceptor = acceptor.clone();
+
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            let _ = acceptor.accept(socket);
+        });
+
+        let mut connector = SslConnector::builder(SslMethod::tls()).expect("connector");
+        connector.set_verify(SslVerifyMode::NONE);
+        let socket = TcpStream::connect(addr).expect("connect");
+        let stream = connector
+            .build()
+            .configure()
+            .expect("configure")
+            .verify_hostname(false)
+            // The whole point. A client reaching a BMC by address sends no
+            // SNI, and this is the callback's hardest case.
+            .use_server_name_indication(false)
+            .connect("localhost", socket)
+            .expect("handshake");
+
+        let subject = stream
+            .ssl()
+            .peer_certificate()
+            .expect("the server sent a certificate")
+            .subject_name()
+            .entries()
+            .map(|e| e.data().to_string().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        drop(stream);
+        server.join().expect("server thread");
+        subject
+    }
+
+    /// Installing a certificate must change what the next connection is
+    /// served, without the listener being rebuilt -- that is the whole reason
+    /// the pair lives in a store rather than on the acceptor.
+    ///
+    /// And it must do so for a client that sent no server name. The mechanism
+    /// is OpenSSL's SNI callback, which reads as though it only fires when a
+    /// name was sent; it does not, and a BMC is reached by address far more
+    /// often than by name. If that ever changes, every board would keep
+    /// serving its startup certificate while the API reported the new one.
+    #[test]
+    fn serves_the_current_pair_to_a_client_without_sni() {
+        let (_dir, tls) = throwaway_tls_config("bmcd-hot-swap");
+        let (acceptor, store) = load_tls_config(&tls).expect("acceptor");
+
+        let before = subject_offered_without_sni(&acceptor);
+
+        let (key, leaf) = pair_named("installed-by-the-operator");
+        store.replace(tls_store::Served {
+            key,
+            leaf,
+            chain: Vec::new(),
+            source: tls_store::Source::Installed,
+        });
+
+        let after = subject_offered_without_sni(&acceptor);
+        assert_ne!(
+            before, after,
+            "the same certificate was served after a replace"
+        );
+        assert!(
+            after.contains("installed-by-the-operator"),
+            "expected the installed certificate, got {after}"
+        );
+    }
+
+    /// `/metrics` reads through the same store, so it cannot report the
+    /// startup certificate while the listener serves another one.
+    #[test]
+    fn the_reported_facts_follow_the_swap() {
+        let (_dir, tls) = throwaway_tls_config("bmcd-swap-facts");
+        let (_acceptor, store) = load_tls_config(&tls).expect("acceptor");
+        assert_eq!(
+            store.current().facts().source.as_deref(),
+            Some("installed"),
+            "a throwaway certificate is not the board's own generator's"
+        );
+
+        let (key, leaf) = pair_named(tls_store::SELF_SIGNED_ISSUER);
+        store.replace(tls_store::Served {
+            key,
+            leaf,
+            chain: Vec::new(),
+            source: tls_store::Source::SelfSigned,
+        });
+        assert_eq!(
+            store.current().facts().source.as_deref(),
+            Some("self-signed")
+        );
     }
 }

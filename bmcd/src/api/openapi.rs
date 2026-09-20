@@ -338,6 +338,62 @@ fn access_paths() -> Vec<(String, Value)> {
             }}),
         ),
         (
+            "/api/bmc/tls/certificate".to_string(),
+            json!({
+                "get": {
+                    "summary": "The certificate this board serves",
+                    "operationId": "getTlsCertificate",
+                    "description": "Subject, issuer, validity, fingerprint, key type, the names it \
+                                    asserts, and whether the board issued it (`self-signed`) or \
+                                    somebody installed it (`installed`). Nothing here is secret: all \
+                                    of it is sent to every client during the handshake.",
+                    "responses": {
+                        "200": { "description": "What is on the wire now.",
+                                 "content": { "application/json": { "schema": component_ref("TlsCertificate") } } },
+                        "default": problem
+                    }
+                },
+                "put": {
+                    "summary": "Install your own certificate and key",
+                    "operationId": "putTlsCertificate",
+                    "description": "For a board that should serve a certificate from your own CA. Every \
+                                    check runs before anything is written: the key must belong to the \
+                                    certificate, the certificate must be valid now, it must permit server \
+                                    authentication, and it must name this board -- a certificate naming \
+                                    none of the board's names is one no browser would accept, so it is \
+                                    refused with the reason rather than installed. Takes effect on the \
+                                    next connection; no restart, and the session sending this survives.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "required": ["certificate", "private_key"],
+                        "properties": {
+                            "certificate": { "type": "string",
+                                "description": "PEM. Intermediates may follow the leaf, leaf first." },
+                            "private_key": { "type": "string",
+                                "description": "PEM. Never logged and never returned." }
+                        }
+                    })}}},
+                    "responses": {
+                        "200": { "description": "Installed, and being served.",
+                                 "content": { "application/json": { "schema": component_ref("TlsCertificate") } } },
+                        "default": problem
+                    }
+                },
+                "delete": {
+                    "summary": "Remove an installed certificate",
+                    "operationId": "deleteTlsCertificate",
+                    "description": "Removes the installed pair and has the board issue its own, so it is \
+                                    never left without a certificate. Refused when the board is already \
+                                    serving its own. Takes effect on the next connection.",
+                    "responses": {
+                        "200": { "description": "Removed; the board issued its own.",
+                                 "content": { "application/json": { "schema": component_ref("TlsCertificate") } } },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
             "/api/bmc/access/client-ca".to_string(),
             json!({
                 "put": {
@@ -488,6 +544,27 @@ pub fn document() -> Value {
 
     let mut schema_components = components();
     schema_components.insert(
+        "TlsCertificate".to_string(),
+        json!({
+            "type": "object",
+            "description": "The certificate this listener serves. See GET /api/bmc/tls/certificate.",
+            "properties": {
+                "subject": { "type": "string" },
+                "issuer": { "type": "string" },
+                "not_before": { "type": "string" },
+                "not_after": { "type": "string" },
+                "fingerprint": { "type": "string", "description": "SHA-256 over the DER, colon-separated." },
+                "key": { "type": ["string", "null"],
+                         "description": "ecdsa-p384, rsa-2048, ed25519. Null when it cannot be described." },
+                "source": { "type": "string", "enum": ["self-signed", "installed"],
+                            "description": "Whether the board issued it. The board renews only its own." },
+                "names": { "type": "array", "items": { "type": "string" },
+                           "description": "Every name and address the certificate asserts." },
+                "chain_length": { "type": "integer", "description": "Intermediates sent with the leaf." }
+            }
+        }),
+    );
+    schema_components.insert(
         "AccessState".to_string(),
         json!({
             "type": "object",
@@ -618,6 +695,9 @@ mod tests {
         ("/api/bmc/access/password", "post"),
         ("/api/bmc/access/client-ca", "put"),
         ("/api/bmc/access/client-ca", "delete"),
+        ("/api/bmc/tls/certificate", "get"),
+        ("/api/bmc/tls/certificate", "put"),
+        ("/api/bmc/tls/certificate", "delete"),
     ];
 
     #[test]
