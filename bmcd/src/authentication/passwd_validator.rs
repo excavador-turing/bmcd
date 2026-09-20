@@ -20,11 +20,19 @@ pub trait PasswordValidator {
 pub struct UnixValidator {}
 
 impl PasswordValidator for UnixValidator {
+    /// Nothing derived from the submitted password is logged, at any level.
+    ///
+    /// This used to log `crypt(password, hash)` at debug. For a correct
+    /// password that is the stored hash, which is only as secret as
+    /// `/etc/shadow`. For a WRONG one it is a hash of whatever was typed --
+    /// and what people type into the wrong login box is usually a password
+    /// that is correct somewhere else. A log file is a much easier thing to
+    /// read than `/etc/shadow`, and the board's logs are collected.
+    ///
+    /// It was debugging scaffolding for the validator itself, which is four
+    /// lines and has tests. There is no question it answers that is worth
+    /// writing a password derivative to disk for.
     fn validate(hash: &str, password: &str) -> Result<(), AuthenticationError> {
-        tracing::debug!(
-            "computed={}",
-            pwhash::unix::crypt(password, hash).unwrap_or_default()
-        );
         if !pwhash::unix::verify(password, hash) {
             Err(AuthenticationError::IncorrectCredentials)
         } else {
