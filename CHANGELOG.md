@@ -10,6 +10,58 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **A confirmation sent from the board itself is refused.** `POST
+  /api/bmc/network/switch/confirm` answers **403** to a request that arrived
+  over loopback, and says why:
+
+  > A confirmation has to arrive over the network you just changed; that is
+  > what it proves. This one came from the board itself, which proves
+  > nothing. Confirm from the interface, or from `tpi` on another machine.
+
+  The whole design of apply-then-confirm rests on where the confirmation came
+  from: after an apply the old path no longer exists, so a request that
+  reaches the daemon came through the new configuration. A request over
+  loopback crossed no switch port. It proves nothing, and it made the change
+  permanent anyway — which is to say the one protection against locking
+  yourself out had a hole in it that could be walked through by accident,
+  from a console, by somebody being careful.
+
+  Found on hardware, not by reading. On 2026-09-20 a document reasoned to be
+  equivalent to Flat was applied to bmc-2 and confirmed from the board's own
+  ssh session; the board's owner lost the interface, and the window that
+  exists for exactly that case never ran, because the confirmation had
+  already arrived.
+
+  Apply and revert stay open to loopback. Applying is how a board is recovered
+  from its console, and reverting is the safe direction — it puts back a
+  configuration that was proved once already. Only the step that makes a
+  change permanent has to have come from somewhere.
+
+### Added
+
+- **VLANs can be given names.** An optional `names` map on the switch
+  document, VLAN id to a word of up to 32 characters, carried and persisted
+  with the rest of it.
+
+  It reaches the hardware nowhere: two documents differing only in their names
+  plan no commands at all. It exists because a table of numbers is not a
+  layout anybody can read a year later, and because the alternative — a name
+  file beside the document — is a second thing to keep in step with the first,
+  which would drift the first time somebody applied a preset.
+
+  `Trunk` names its own two VLANs `management` and `nodes`, because those are
+  the numbers the operator chose and has to match on the router. `Flat` and
+  `Split` name nothing: Split's identifiers never leave the board, so putting
+  them on a page would be showing somebody two numbers they can do nothing
+  with.
+
+  A name is checked for being a name — not blank, not longer than 32
+  characters, no control characters, and not attached to a reserved VLAN id —
+  and for nothing else. Naming a VLAN nobody is in yet is allowed: people name
+  a layout while they are building it.
+
 ### Added
 
 - **Applying a switch configuration, and being able to undo it.** The rest of

@@ -31,6 +31,11 @@ impl LegacyResponse {
         LegacyResponse::Error(StatusCode::BAD_REQUEST, msg.into())
     }
 
+    /// The caller is who they say they are, and still may not have this.
+    pub fn forbidden<S: Into<Cow<'static, str>>>(msg: S) -> Self {
+        LegacyResponse::Error(StatusCode::FORBIDDEN, msg.into())
+    }
+
     pub fn not_implemented<S: Into<Cow<'static, str>>>(msg: S) -> Self {
         LegacyResponse::Error(StatusCode::NOT_IMPLEMENTED, msg.into())
     }

@@ -65,6 +65,14 @@ pub const SPLIT_NODE_VID: u16 = 4094;
 /// The single VLAN `Flat` puts everything in, when filtering is off.
 pub const FLAT_VID: u16 = 1;
 
+/// How long a VLAN's name may be.
+///
+/// Thirty-two characters, which is a word or two -- enough for `storage` or
+/// `guest wifi`, not enough for a sentence. A name is a label in a table
+/// beside a number, and a table column that can be any width is a table that
+/// stops being readable the first time somebody pastes into it.
+pub const MAX_VLAN_NAME: usize = 32;
+
 /// A port of the on-board switch.
 ///
 /// Seven, not the six with netdevs. The BMC's own port has no interface in
@@ -177,6 +185,19 @@ pub struct SwitchDocument {
     pub vlan_filtering: bool,
     pub stp: bool,
     pub ports: BTreeMap<PortId, PortConfig>,
+    /// What the operator calls each VLAN. A word beside a number, so that a
+    /// layout is still legible to whoever opens this board next year.
+    ///
+    /// It reaches the hardware nowhere: [`crate::app::switch_applier::plan`]
+    /// never reads it, and two documents differing only here produce no
+    /// commands at all. It is carried because the alternative -- a name file
+    /// beside the document -- is a second thing to keep in step with the
+    /// first, and they would drift the first time somebody applied a preset.
+    ///
+    /// Naming a VLAN nobody is in yet is allowed: people name a layout while
+    /// they are building it.
+    #[serde(default)]
+    pub names: BTreeMap<u16, String>,
 }
 
 /// Which uplink arrangement `Trunk` uses for ge1.
@@ -226,6 +247,9 @@ impl Preset {
                     vlan_filtering: false,
                     stp: false,
                     ports,
+                    // Nothing to name: filtering is off, so there is one
+                    // network and it is the only one there has ever been.
+                    names: BTreeMap::new(),
                 }
             }
             Preset::Split => {
@@ -245,6 +269,11 @@ impl Preset {
                     // nothing.
                     stp: false,
                     ports,
+                    // Deliberately unnamed. Under Split no tag leaves the
+                    // board, so 4093 and 4094 are invisible to the router and
+                    // to the operator; naming them would put two numbers on a
+                    // page that exist only because the switch needs two.
+                    names: BTreeMap::new(),
                 }
             }
             Preset::Trunk {
@@ -273,6 +302,16 @@ impl Preset {
                     // true here.
                     stp: matches!(second_uplink, SecondUplink::Redundant),
                     ports,
+                    // Named, unlike the other two presets, because these are
+                    // the numbers the operator chose and has to match on the
+                    // router. A tagged VLAN that leaves the board is a thing
+                    // somebody will have to recognise elsewhere.
+                    names: [
+                        (management_vid, "management".to_string()),
+                        (node_vid, "nodes".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
                 }
             }
         }
@@ -343,6 +382,37 @@ impl SwitchDocument {
                         port.label()
                     )));
                 }
+            }
+        }
+
+        // A name is checked for being a name, and for nothing else. It
+        // cannot strand a board -- it never reaches the switch -- so the only
+        // job here is to keep the table it will be drawn in readable, and to
+        // catch the two cases where a client is plainly confused about what
+        // it is sending.
+        for (vid, name) in &self.names {
+            if !(VID_MIN..=VID_MAX).contains(vid) {
+                return Some(Refusal::new(format!(
+                    "a name was given for VLAN {vid}, which is outside 1-4094; 0 and 4095 are \
+                     reserved by 802.1Q"
+                )));
+            }
+            if name.trim().is_empty() {
+                return Some(Refusal::new(format!(
+                    "the name for VLAN {vid} is blank. Leave the name out rather than sending an \
+                     empty one."
+                )));
+            }
+            if name.chars().count() > MAX_VLAN_NAME {
+                return Some(Refusal::new(format!(
+                    "the name for VLAN {vid} is longer than {MAX_VLAN_NAME} characters. It is a \
+                     label in a table, not a description."
+                )));
+            }
+            if name.chars().any(char::is_control) {
+                return Some(Refusal::new(format!(
+                    "the name for VLAN {vid} contains a control character."
+                )));
             }
         }
 
@@ -699,13 +769,80 @@ mod tests {
         assert!(d.members(999).is_empty());
     }
 
+    #[test]
+    fn trunk_names_the_two_vlans_the_router_has_to_match() {
+        let d = trunk().expand();
+        assert_eq!(d.names.get(&10).map(String::as_str), Some("management"));
+        assert_eq!(d.names.get(&20).map(String::as_str), Some("nodes"));
+    }
+
+    /// Split's identifiers never leave the board, so putting them on a page
+    /// would be showing somebody two numbers they can do nothing with.
+    #[test]
+    fn split_names_nothing() {
+        assert!(Preset::Split.expand().names.is_empty());
+    }
+
+    #[test]
+    fn a_blank_or_overlong_or_unprintable_name_is_refused() {
+        for (name, expected) in [
+            ("   ".to_string(), "blank"),
+            ("x".repeat(MAX_VLAN_NAME + 1), "longer than"),
+            ("stor\nage".to_string(), "control character"),
+        ] {
+            let mut d = trunk().expand();
+            d.names.insert(20, name.clone());
+            let refusal = d
+                .refusal()
+                .unwrap_or_else(|| panic!("{name:?} is not a name"));
+            assert!(refusal.reason.contains(expected), "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_for_a_reserved_vlan_id_is_refused() {
+        let mut d = trunk().expand();
+        d.names.insert(4095, "nowhere".to_string());
+        let refusal = d.refusal().expect("4095 is reserved");
+        assert!(refusal.reason.contains("reserved by 802.1Q"), "{refusal:?}");
+    }
+
+    /// People name a layout while they are building it, and the VLAN comes
+    /// after the word for it as often as the other way round.
+    #[test]
+    fn a_name_for_a_vlan_nobody_is_in_is_allowed() {
+        let mut d = trunk().expand();
+        d.names.insert(77, "storage".to_string());
+        assert_eq!(d.refusal(), None);
+        assert!(!d.vlans().contains(&77));
+    }
+
+    /// A name at the limit is a name. The off-by-one here would be found by
+    /// somebody typing a name, which is the worst place to find one.
+    #[test]
+    fn a_name_of_exactly_the_maximum_length_is_accepted() {
+        let mut d = trunk().expand();
+        d.names.insert(20, "x".repeat(MAX_VLAN_NAME));
+        assert_eq!(d.refusal(), None);
+    }
+
     /// The document is what crosses the wire, so it has to survive the trip.
     #[test]
     fn a_document_round_trips_through_json() {
-        let d = trunk().expand();
+        let mut d = trunk().expand();
+        d.names.insert(30, "storage".to_string());
         let json = serde_json::to_string(&d).expect("serialise");
         let back: SwitchDocument = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(d, back);
+    }
+
+    /// A client that predates names sends a document without the key, and the
+    /// board has to read it rather than answer 400 to everything it says.
+    #[test]
+    fn a_document_with_no_names_key_is_still_a_document() {
+        let json = r#"{"vlan_filtering":false,"stp":false,"ports":{}}"#;
+        let d: SwitchDocument = serde_json::from_str(json).expect("names is optional");
+        assert!(d.names.is_empty());
     }
 
     #[test]

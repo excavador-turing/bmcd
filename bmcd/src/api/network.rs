@@ -209,6 +209,25 @@ fn actor_name(request: &HttpRequest) -> String {
     }
 }
 
+/// Did this request come from the board itself?
+///
+/// `/api/bmc` drops authentication for the loopback interface, which is how
+/// the on-board `tpi` works without credentials. For everything else that is a
+/// convenience. For a confirmation it is a hole, and the one below closes it.
+fn from_the_board_itself(request: &HttpRequest) -> bool {
+    use crate::authentication::authentication_context::Actor;
+    matches!(request.extensions().get::<Actor>(), Some(Actor::Loopback))
+}
+
+/// What the board says to a confirmation that came from its own shell.
+///
+/// Written out here, once, because the same words belong in the interface and
+/// in the guide, and three copies of this sentence would diverge.
+const CONFIRM_FROM_THE_BOARD: &str =
+    "A confirmation has to arrive over the network you just changed; that is what it proves. \
+     This one came from the board itself, which proves nothing. Confirm from the interface, or \
+     from `tpi` on another machine.";
+
 fn refuse(e: SwitchError) -> LegacyResponse {
     match e {
         SwitchError::Change(_) => LegacyResponse::bad_request(e.to_string()),
@@ -264,11 +283,38 @@ async fn put_switch(
 /// apply the old path no longer exists, so any authenticated request that
 /// reaches this daemon came through the new configuration. Nothing else needs
 /// checking, and nothing else could be checked as cheaply.
+///
+/// ## Which is why a confirmation from the board itself is refused
+///
+/// The proof is the arrival, not the request. A confirmation sent over
+/// loopback -- from `tpi` on the board, from a shell, from a script running
+/// there -- crossed no switch port, so it says nothing whatever about whether
+/// the configuration that was just applied works. It persists it anyway.
+///
+/// This is not theoretical. On 2026-09-20 a document reasoned to be equivalent
+/// to Flat was applied to bmc-2 and confirmed from the board's own ssh
+/// session. The owner lost the interface; the window that exists for exactly
+/// that case never got to run, because the confirmation had already arrived.
+/// The reasoning being sound was not the point -- a proof from loopback is
+/// empty regardless of what it is proving.
+///
+/// Apply and revert stay open to loopback. Applying is how you would recover a
+/// board from its console, and reverting is the safe direction: it puts back
+/// the configuration that was already proved once. Only the step that makes a
+/// change permanent needs to have come from somewhere.
 async fn post_confirm(
     request: HttpRequest,
     switch: web::Data<SwitchService>,
     body: web::Json<ConfirmRequest>,
 ) -> Result<HttpResponse, LegacyResponse> {
+    if from_the_board_itself(&request) {
+        tracing::warn!(
+            "a switch confirmation arrived over loopback and was refused; it would have proved \
+             nothing"
+        );
+        return Err(LegacyResponse::forbidden(CONFIRM_FROM_THE_BOARD));
+    }
+
     switch
         .confirm(&body.into_inner().token)
         .await
@@ -278,6 +324,9 @@ async fn post_confirm(
 }
 
 /// Put a pending change back now, rather than waiting out its window.
+///
+/// Open to loopback, unlike confirm: this is the direction that cannot strand
+/// anybody, and a console is where you would reach for it.
 async fn post_revert(
     request: HttpRequest,
     switch: web::Data<SwitchService>,
@@ -285,4 +334,114 @@ async fn post_revert(
     switch.revert().await.map_err(refuse)?;
     tracing::info!("switch change reverted by {}", actor_name(&request));
     Ok(HttpResponse::Ok().json(switch.view().await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authentication::authentication_context::Actor;
+    use actix_web::http::StatusCode;
+    use actix_web::test::TestRequest;
+
+    fn request_from(actor: Option<Actor>) -> HttpRequest {
+        let request = TestRequest::default().to_http_request();
+        if let Some(actor) = actor {
+            request.extensions_mut().insert(actor);
+        }
+        request
+    }
+
+    fn service() -> web::Data<SwitchService> {
+        let dir = tempdir::TempDir::new("switch-confirm").expect("temp dir");
+        web::Data::new(SwitchService::load(dir.path().join("switch.json")))
+    }
+
+    fn confirm_body() -> web::Json<ConfirmRequest> {
+        web::Json(ConfirmRequest {
+            token: "whatever".to_string(),
+        })
+    }
+
+    /// The refusal this endpoint exists to make.
+    ///
+    /// Nothing is pending, so a confirmation that got past the gate would fail
+    /// with "no change is waiting" -- a 400. Getting a 403 instead is the
+    /// proof that it never got that far, and that the gate is ahead of the
+    /// state machine rather than tangled in it.
+    #[actix_web::test]
+    async fn a_confirmation_from_the_board_itself_is_refused() {
+        let error = post_confirm(
+            request_from(Some(Actor::Loopback)),
+            service(),
+            confirm_body(),
+        )
+        .await
+        .expect_err("loopback proves nothing");
+
+        let LegacyResponse::Error(status, message) = error else {
+            panic!("a refusal, not a success");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            message.contains("came from the board itself"),
+            "the message has to say what to do instead: {message}"
+        );
+        assert!(message.contains("another machine"), "{message}");
+    }
+
+    /// The control. Without it the test above would pass just as well if
+    /// confirm were refused to everybody.
+    #[actix_web::test]
+    async fn a_confirmation_over_the_network_reaches_the_state_machine() {
+        let user = Actor::User {
+            name: "root".to_string(),
+            scheme: "bearer",
+        };
+        let error = post_confirm(request_from(Some(user)), service(), confirm_body())
+            .await
+            .expect_err("nothing is pending on a fresh board");
+
+        let LegacyResponse::Error(status, message) = error else {
+            panic!("a refusal, not a success");
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "it reached the state machine and was turned down there: {message}"
+        );
+        assert!(message.contains("no change is waiting"), "{message}");
+    }
+
+    /// An unauthenticated request is not loopback, and must not be treated as
+    /// though it were: the gate is about where the request came from, and
+    /// "nobody said" is not "from the board".
+    #[actix_web::test]
+    async fn a_request_with_no_actor_is_not_mistaken_for_loopback() {
+        let error = post_confirm(request_from(None), service(), confirm_body())
+            .await
+            .expect_err("nothing is pending on a fresh board");
+
+        let LegacyResponse::Error(status, _) = error else {
+            panic!("a refusal, not a success");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Reverting from a console is how somebody digs themselves out, so the
+    /// gate must not have been put on the whole module.
+    #[actix_web::test]
+    async fn a_revert_from_the_board_itself_is_allowed_through() {
+        let error = post_revert(request_from(Some(Actor::Loopback)), service())
+            .await
+            .expect_err("nothing is pending on a fresh board");
+
+        let LegacyResponse::Error(status, message) = error else {
+            panic!("a refusal, not a success");
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "loopback may revert; it simply had nothing to revert: {message}"
+        );
+    }
 }
