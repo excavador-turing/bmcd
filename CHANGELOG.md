@@ -12,6 +12,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Applying a switch configuration, and being able to undo it.** The rest of
+  the switch work: `GET` and `PUT /api/bmc/network/switch`, and
+  `POST .../confirm` and `.../revert`.
+
+  A change is applied on approval and kept on proof. `PUT` answers **202**,
+  not 200: the configuration is on the switch but it is not yours to keep yet.
+  Confirm within the window, or the board puts the previous one back by
+  itself and records why, so the interface can say *your change at 12:03 was
+  reverted because it was not confirmed*.
+
+  **The confirmation must arrive on a new connection, and that is the whole
+  proof.** After an apply the old path no longer exists, so any authenticated
+  request that reaches the daemon came through the new configuration. Nothing
+  else needs checking.
+
+  **The window does not start when the apply returns.** It starts when the
+  uplink carrying the BMC's VLAN reports forwarding. Spanning tree holds a
+  port in listening and learning for its own forwarding delay first — 30
+  seconds by default — so a window counted from the apply would expire before
+  anybody could confirm a correct Trunk change, and would revert every one of
+  them. The default window is 30 seconds and may be set per apply between 10
+  and 300.
+
+  **Only a confirmed document is ever written.** A reboot in the middle of an
+  unconfirmed change finds the previous one in `/etc/bmcd/switch.json`,
+  because the pending one was never persisted.
+
+  **Safe mode skips applying, not reading.** Holding KEY1 at power-on puts
+  `safemode` on the kernel command line, which `preinit` already reads; the
+  daemon reads it the same way and leaves the switch alone. That is the last
+  exit from a configuration that was reachable when it was confirmed and has
+  since stopped being, because a cable moved or the router changed.
+
+  The commands are planned as a list and then run, so the part most likely to
+  be wrong — the order — is a pure function with tests. Filtering is enabled
+  after the VLANs exist and disabled before they are removed, because a bridge
+  filtering with no VLANs forwards nothing.
+
+
+### Added
+
 - **The switch as one document, and the rules the board refuses.** The model
   half of the most-asked feature on the public roadmap. Two read-only
   endpoints come with it: `GET /api/bmc/network/switch/presets` and

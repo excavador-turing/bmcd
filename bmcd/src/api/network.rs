@@ -29,16 +29,23 @@
 //! [`crate::app::switch_document`]; this is the way to ask them a question.
 
 use crate::api::into_legacy_response::LegacyResponse;
+use crate::app::switch_change::{DEFAULT_WINDOW, MAX_WINDOW, MIN_WINDOW};
 use crate::app::switch_document::{
     Preset, Refusal, SecondUplink, SwitchDocument, Warning, SPLIT_MANAGEMENT_VID, SPLIT_NODE_VID,
     VID_MAX, VID_MIN,
 };
-use actix_web::{web, HttpResponse};
+use crate::app::switch_service::{SwitchError, SwitchService};
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/network/switch")
+            .route("", web::get().to(get_switch))
+            .route("", web::put().to(put_switch))
+            .route("/confirm", web::post().to(post_confirm))
+            .route("/revert", web::post().to(post_revert))
             .route("/presets", web::get().to(get_presets))
             .route("/validate", web::post().to(post_validate)),
     );
@@ -80,6 +87,11 @@ struct Verdict {
 struct Limits {
     vid_min: u16,
     vid_max: u16,
+    /// The confirm window: what you get if you say nothing, and the range you
+    /// may choose from.
+    window_default_s: u64,
+    window_min_s: u64,
+    window_max_s: u64,
     /// What `Split` uses internally. Shown so a client can explain that these
     /// exist without inviting anyone to change them: under `Split` no tag
     /// leaves the board, so the numbers are invisible everywhere else.
@@ -130,6 +142,9 @@ async fn get_presets() -> HttpResponse {
         limits: Limits {
             vid_min: VID_MIN,
             vid_max: VID_MAX,
+            window_default_s: DEFAULT_WINDOW.as_secs(),
+            window_min_s: MIN_WINDOW.as_secs(),
+            window_max_s: MAX_WINDOW.as_secs(),
             split_internal_vids: [SPLIT_MANAGEMENT_VID, SPLIT_NODE_VID],
         },
         presets: presets
@@ -169,4 +184,105 @@ async fn post_validate(body: web::Json<Proposal>) -> Result<HttpResponse, Legacy
         refusal,
         warnings,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyRequest {
+    #[serde(flatten)]
+    proposal: Proposal,
+    /// Seconds to wait for a confirmation. Absent means the board's default.
+    #[serde(default)]
+    window_s: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmRequest {
+    token: String,
+}
+
+fn actor_name(request: &HttpRequest) -> String {
+    use crate::authentication::authentication_context::Actor;
+    match request.extensions().get::<Actor>() {
+        Some(Actor::User { name, .. }) => name.clone(),
+        Some(Actor::Loopback) => "loopback".to_string(),
+        None => "unattributed".to_string(),
+    }
+}
+
+fn refuse(e: SwitchError) -> LegacyResponse {
+    match e {
+        SwitchError::Change(_) => LegacyResponse::bad_request(e.to_string()),
+        other => LegacyResponse::from(anyhow::anyhow!("{other}")),
+    }
+}
+
+async fn get_switch(switch: web::Data<SwitchService>) -> HttpResponse {
+    HttpResponse::Ok().json(switch.view().await)
+}
+
+/// Apply a configuration, and start waiting to be proved right.
+///
+/// The answer is `202`, not `200`: the change is on the switch but it is not
+/// yours to keep yet. Confirm within the window or the board puts the previous
+/// one back by itself.
+async fn put_switch(
+    request: HttpRequest,
+    switch: web::Data<SwitchService>,
+    body: web::Json<ApplyRequest>,
+) -> Result<HttpResponse, LegacyResponse> {
+    let body = body.into_inner();
+    let document = match body.proposal {
+        Proposal::Preset(preset) => preset.expand(),
+        Proposal::Document(document) => document,
+    };
+
+    // The refusals run here too, and here they ARE a rejection. `validate`
+    // answers a question; this one is being asked to do something.
+    if let Some(refusal) = document.refusal() {
+        return Err(LegacyResponse::bad_request(refusal.reason));
+    }
+
+    let window = body
+        .window_s
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WINDOW);
+
+    let pending = switch.apply(document, window).await.map_err(refuse)?;
+
+    tracing::info!(
+        "switch configuration applied by {}, awaiting confirmation within {}s",
+        actor_name(&request),
+        pending.window_s
+    );
+
+    Ok(HttpResponse::Accepted().json(pending))
+}
+
+/// Keep the change.
+///
+/// This must arrive on a NEW connection, and that is the whole proof. After an
+/// apply the old path no longer exists, so any authenticated request that
+/// reaches this daemon came through the new configuration. Nothing else needs
+/// checking, and nothing else could be checked as cheaply.
+async fn post_confirm(
+    request: HttpRequest,
+    switch: web::Data<SwitchService>,
+    body: web::Json<ConfirmRequest>,
+) -> Result<HttpResponse, LegacyResponse> {
+    switch
+        .confirm(&body.into_inner().token)
+        .await
+        .map_err(refuse)?;
+    tracing::info!("switch configuration confirmed by {}", actor_name(&request));
+    Ok(HttpResponse::Ok().json(switch.view().await))
+}
+
+/// Put a pending change back now, rather than waiting out its window.
+async fn post_revert(
+    request: HttpRequest,
+    switch: web::Data<SwitchService>,
+) -> Result<HttpResponse, LegacyResponse> {
+    switch.revert().await.map_err(refuse)?;
+    tracing::info!("switch change reverted by {}", actor_name(&request));
+    Ok(HttpResponse::Ok().json(switch.view().await))
 }

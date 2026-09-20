@@ -104,6 +104,32 @@ async fn main() -> anyhow::Result<()> {
     // certificate being served now, and after an install that is no longer
     // the one read at startup.
     let certificate = Data::new(served_certificate.clone());
+    // The switch configuration, read from the overlay and put on the switch
+    // before anything is served -- so a board comes up on the network its
+    // operator confirmed rather than on the one it boots with. Safe mode skips
+    // the applying, not the reading, so the daemon can still say what the
+    // configuration is while deliberately not running it.
+    let switch = Data::new(crate::app::switch_service::SwitchService::load(
+        crate::app::switch_service::SWITCH_CONFIG,
+    ));
+    if let Err(e) = switch.boot_apply().await {
+        // Not fatal. A board that refuses to start because its switch
+        // configuration would not apply is a board nobody can log in to and
+        // fix, which is the failure this whole feature exists to avoid.
+        tracing::error!("could not apply the stored switch configuration: {e}");
+    }
+
+    // The window is only a promise if something is counting. One task, one
+    // second, for the whole daemon.
+    let ticker = switch.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::app::switch_service::TICK);
+        loop {
+            interval.tick().await;
+            ticker.tick().await;
+        }
+    });
+
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
     let serial_service = Data::new(SerialConnections::new());
     let streaming_data_service = Data::new(StreamingDataService::new());
@@ -190,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(serial_service.clone())
                         .app_data(tls_facts.clone())
                         .app_data(certificate.clone())
+                        .app_data(switch.clone())
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)
