@@ -100,6 +100,56 @@ There is no `GET /api/bmc/info`: it answers 401 unauthenticated, which makes it
 look like a route, and once authenticated it falls through to the SPA and
 returns `index.html`.
 
+### Four operations take a JSON body, and must
+
+Everything above puts its arguments in the query string, and the legacy
+dispatcher writes every `opt=set` call to the audit log **with its whole query
+string**. So the operations that carry a secret cannot go through it:
+
+| path | methods | |
+|---|---|---|
+| `/api/bmc/access` | `GET` | who may reach this board, and how you reached it |
+| `/api/bmc/access/password` | `POST` | change the local password |
+| `/api/bmc/access/client-ca` | `PUT`, `DELETE` | the CA whose client certificates name an operator |
+| `/api/bmc/tls/certificate` | `GET`, `PUT`, `DELETE` | the certificate this board serves over HTTPS |
+
+Each logs the action, the actor and what changed — a certificate's subject and
+expiry, a bundle's subject count — and never the key or the password.
+
+`PUT /api/bmc/tls/certificate` validates before it writes anything: the key
+must belong to the certificate, the certificate must be valid now, it must
+permit server authentication wherever it states any purpose at all, and it
+must name this board. A board given a certificate it cannot serve may be a
+board nobody can reach to correct it, so nothing is stored by halves, and a
+refusal carries both name lists rather than "no browser would accept it".
+
+It takes effect on the **next connection**. The pair lives behind a lock in
+[`bmcd/src/tls_store.rs`](bmcd/src/tls_store.rs) and is chosen per handshake
+through OpenSSL's servername callback, so there is no restart and the session
+that sent the certificate survives to read the answer. That callback is SNI's,
+and a BMC is usually reached by address, which sends no SNI — OpenSSL runs it
+for those handshakes too, and
+`serves_the_current_pair_to_a_client_without_sni` is the test that keeps it
+true.
+
+`DELETE` removes the pair and runs the board's own generator, so the board is
+never left without a certificate.
+
+The reader's guide to all of this is
+[Your own certificate](https://turingpi.xyz/guides/your-own-certificate/).
+
+### An unrouted path under `/api/bmc` does not answer 404
+
+The app's `default_service` returns `index.html` and the scope has none of its
+own, so a path this daemon does not route answers **200 with the web
+interface**. A client working out whether a board is too old for one of the
+endpoints above has to judge the **shape** of the answer, not its status.
+
+Both clients do, and each learned it the hard way: the interface checks with a
+type guard, and `tpi` with `endpoint_is_absent`, which counts a JSON parse
+failure as absence and has tests so it cannot be narrowed back to a status
+check.
+
 ### Authentication is `/etc/shadow`, watched
 
 There is no user database. `LinuxAuthenticator` parses `/etc/shadow` at startup,
