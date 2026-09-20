@@ -23,6 +23,7 @@ pub mod health_info;
 pub mod hostname;
 pub mod ntp;
 pub mod sdcard_files;
+pub mod switch_document;
 pub mod switch_info;
 pub mod sysfs;
 pub mod thermal_info;
