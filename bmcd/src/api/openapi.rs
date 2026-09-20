@@ -338,6 +338,78 @@ fn access_paths() -> Vec<(String, Value)> {
             }}),
         ),
         (
+            "/api/bmc/network/switch".to_string(),
+            json!({
+                "get": {
+                    "summary": "The switch configuration, running and confirmed",
+                    "operationId": "getSwitch",
+                    "description": "What the board is running, what was last confirmed and \
+                                    therefore what a reboot comes back to, any change still \
+                                    waiting to be confirmed, and the last revert with its reason.",
+                    "responses": {
+                        "200": { "description": "The switch, as the daemon sees it." },
+                        "default": problem
+                    }
+                },
+                "put": {
+                    "summary": "Apply a configuration, to be confirmed",
+                    "operationId": "applySwitch",
+                    "description": "Takes a preset or a whole document, and an optional \
+                                    `window_s`. Answers **202**, not 200: the change is on the \
+                                    switch but it is not yours to keep yet. Confirm within the \
+                                    window or the board puts the previous configuration back by \
+                                    itself. The window does not start counting until the uplink \
+                                    carrying the BMC's VLAN reports forwarding, because spanning \
+                                    tree holds a port for its own forwarding delay first -- \
+                                    counting from the apply would revert every correct change.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "description": "A preset or a document, plus an optional window_s."
+                    })}}},
+                    "responses": {
+                        "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/switch/confirm".to_string(),
+            json!({
+                "post": {
+                    "summary": "Keep a pending change",
+                    "operationId": "confirmSwitch",
+                    "description": "Send the token from the apply, on a NEW connection. That is \
+                                    the whole proof: after an apply the old path no longer \
+                                    exists, so any authenticated request that reaches the daemon \
+                                    came through the new configuration. Only on confirm is \
+                                    anything written to the overlay.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object", "required": ["token"],
+                        "properties": { "token": { "type": "string" } }
+                    })}}},
+                    "responses": {
+                        "200": { "description": "Kept, and persisted." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/switch/revert".to_string(),
+            json!({
+                "post": {
+                    "summary": "Put a pending change back now",
+                    "operationId": "revertSwitch",
+                    "description": "Rather than waiting out its window.",
+                    "responses": {
+                        "200": { "description": "Reverted." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
             "/api/bmc/network/switch/presets".to_string(),
             json!({
                 "get": {
@@ -741,6 +813,10 @@ mod tests {
         ("/api/bmc/tls/certificate", "delete"),
         ("/api/bmc/network/switch/presets", "get"),
         ("/api/bmc/network/switch/validate", "post"),
+        ("/api/bmc/network/switch", "get"),
+        ("/api/bmc/network/switch", "put"),
+        ("/api/bmc/network/switch/confirm", "post"),
+        ("/api/bmc/network/switch/revert", "post"),
     ];
 
     #[test]
