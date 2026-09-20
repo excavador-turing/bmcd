@@ -747,7 +747,14 @@ pub fn document() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "The board management controller of a Turing Pi 2, as built by the excavador-turing fork. \
                             Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
-                            which older clients speak and which is not going away.",
+                            which older clients speak and which is not going away.\n\n\
+                            **A board still on its factory password answers 403 to everything here** except \
+                            `/authenticate`, `/access` and `/access/password`. Boards ship as `root` / \
+                            `turing`, which is printed in the quick-start guide and is the same on every \
+                            board, so until it is changed the only thing the board will do is let you change \
+                            it. The refusal is `application/problem+json` and says so. Requests from the \
+                            board's own loopback interface are exempt, because that is how the firmware \
+                            promotes itself on first boot.",
             "contact": { "name": "excavador-turing", "url": "https://github.com/excavador-turing" },
             "license": { "name": "Apache-2.0" }
         },

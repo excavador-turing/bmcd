@@ -53,7 +53,7 @@ use std::process::{Command, Stdio};
 /// number was too small after it mattered.
 const MIN_PASSWORD_LEN: usize = 12;
 
-const SHADOW_FILE: &str = "/etc/shadow";
+use crate::authentication::factory_password::SHADOW_FILE;
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(

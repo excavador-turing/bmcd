@@ -14,6 +14,7 @@
 use super::{
     authentication_context::{Actor, AuthenticationContext},
     authentication_errors::{AuthenticationError, SchemedAuthError},
+    factory_password::{FactoryPassword, REFUSAL},
     passwd_validator::UnixValidator,
     verified_proxy::VerifiedProxy,
     websocket_subprotocol::{bearer_token, is_websocket_handshake},
@@ -43,6 +44,9 @@ pub struct AuthenticationService<S> {
     /// Header naming the human, believed only behind a verified client
     /// certificate. See [`crate::authentication::verified_proxy`].
     identity_header: Arc<str>,
+    /// A board still on `root` / `turing` may log in and change it, and
+    /// nothing else. See [`crate::authentication::factory_password`].
+    factory: Arc<FactoryPassword>,
 }
 
 impl<S> AuthenticationService<S> {
@@ -52,6 +56,7 @@ impl<S> AuthenticationService<S> {
         authentication_path: &'static str,
         realm: &'static str,
         identity_header: Arc<str>,
+        factory: Arc<FactoryPassword>,
     ) -> Self {
         AuthenticationService {
             service,
@@ -59,8 +64,25 @@ impl<S> AuthenticationService<S> {
             authentication_path,
             realm,
             identity_header,
+            factory,
         }
     }
+}
+
+/// What a factory board answers to everything but logging in and changing it.
+///
+/// `application/problem+json`, like every other refusal on the path form, so
+/// a client that reads one reads this.
+fn factory_password_response<B>(request: &HttpRequest) -> ServiceResponse<EitherBody<B>> {
+    let response = HttpResponse::Forbidden()
+        .insert_header((header::CONTENT_TYPE, "application/problem+json"))
+        .json(serde_json::json!({
+            "type": "about:blank",
+            "title": "This board is still using its factory password",
+            "status": 403,
+            "detail": REFUSAL,
+        }));
+    ServiceResponse::new(request.clone(), response).map_into_right_body()
 }
 
 /// The human a trusted proxy says it authenticated, if this connection has
@@ -139,6 +161,19 @@ where
         // only makes the header worth reading.
         if let Some((name, subject)) = proxied_identity(&request, &self.identity_header) {
             tracing::debug!("request authorised by {subject} on behalf of {name}");
+            // A factory board cannot be driven from the fleet either. The
+            // gateway vouching for a person says nothing about whether this
+            // board has been set up.
+            if !self.factory.permits(request.request().uri().path()) {
+                tracing::warn!(
+                    "refused {} for {}: this board is still on its factory password",
+                    request.request().uri().path(),
+                    name
+                );
+                return Box::pin(std::future::ready(Ok(factory_password_response(
+                    request.request(),
+                ))));
+            }
             request.extensions_mut().insert(Actor::User {
                 name,
                 scheme: "mtls",
@@ -154,6 +189,7 @@ where
         let context = self.context.clone();
         let auth_path = self.authentication_path;
         let realm = self.realm;
+        let factory = self.factory.clone();
 
         Box::pin(async move {
             let peer = request
@@ -179,6 +215,17 @@ where
                     None => unauthorized_response(request.request(), e, realm),
                 },
                 Ok(actor) => {
+                    // The credential was right; the board is not set up. Only
+                    // now, so that a wrong password is still a wrong password
+                    // rather than this message -- which would otherwise tell
+                    // a stranger the account name is right.
+                    if !factory.permits(request.request().uri().path()) {
+                        tracing::warn!(
+                            "refused {}: this board is still on its factory password",
+                            request.request().uri().path()
+                        );
+                        return Ok(factory_password_response(request.request()));
+                    }
                     request.extensions_mut().insert(actor);
                     service
                         .call(request)
@@ -365,6 +412,17 @@ mod tests {
     fn service(
     ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
     {
+        service_with_shadow("/nonexistent/shadow")
+    }
+
+    /// The same, with a shadow file of the caller's choosing, for the tests
+    /// about a board still on its factory password. The default above points
+    /// at nothing, which reads as "not a factory board" -- so every other
+    /// test in this module is unaffected by the gate.
+    fn service_with_shadow(
+        shadow: &str,
+    ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
+    {
         let context = build_test_context(
             [(TOKEN.to_string(), Instant::now())],
             [(
@@ -383,6 +441,7 @@ mod tests {
             "/api/bmc/authenticate",
             "test realm",
             IDENTITY_HEADER.into(),
+            Arc::new(FactoryPassword::new(shadow)),
         )
     }
 
@@ -752,6 +811,114 @@ mod tests {
     // nothing at all. Anyone who can reach the board on the management LAN
     // can set a header; only the client certificate makes it mean something,
     // and only the TLS handshake can produce one.
+
+    /// A board still on `root` / `turing`, as `/etc/shadow` would have it.
+    fn factory_shadow(dir: &std::path::Path) -> String {
+        let path = dir.join("shadow");
+        let hash =
+            pwhash::sha512_crypt::hash(crate::authentication::factory_password::FACTORY_PASSWORD)
+                .expect("a shadow hash");
+        std::fs::write(&path, format!("root:{hash}:19000:0:99999:7:::\n")).expect("write");
+        path.to_string_lossy().into_owned()
+    }
+
+    async fn call_on_factory_board(request: ServiceRequest, shadow: &str) -> StatusCode {
+        service_with_shadow(shadow)
+            .call(request)
+            .await
+            .expect("the middleware always answers")
+            .status()
+    }
+
+    /// The whole point: a correct credential, and the board still says no.
+    ///
+    /// The credential IS correct here -- `PASSWORD`, which the test context
+    /// accepts -- so a 403 is the factory gate and not a rejected login.
+    #[actix_web::test]
+    async fn a_factory_board_refuses_everything_but_login_and_the_password_change() {
+        let dir = tempdir::TempDir::new("gate").expect("temp dir");
+        let shadow = factory_shadow(dir.path());
+
+        let refused = rest_call()
+            .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+            .to_srv_request();
+        assert_eq!(
+            call_on_factory_board(refused, &shadow).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_factory_board_still_lets_you_log_in_and_change_the_password() {
+        let dir = tempdir::TempDir::new("gate-open").expect("temp dir");
+        let shadow = factory_shadow(dir.path());
+
+        // Logging in has to work, or there is no way to reach the change.
+        assert_eq!(
+            call_on_factory_board(login(PEER, PASSWORD), &shadow).await,
+            StatusCode::OK
+        );
+
+        for path in ["/api/bmc/access", "/api/bmc/access/password"] {
+            let allowed = TestRequest::post()
+                .uri(path)
+                .peer_addr(PEER.parse().expect("a peer address"))
+                .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                .to_srv_request();
+            assert_eq!(
+                call_on_factory_board(allowed, &shadow).await,
+                StatusCode::OK,
+                "{path} must stay open on a factory board"
+            );
+        }
+    }
+
+    /// A wrong password on a factory board is a wrong password, not a lecture
+    /// about the factory password. Answering the lecture would confirm the
+    /// account name to somebody guessing.
+    #[actix_web::test]
+    async fn a_wrong_password_on_a_factory_board_is_still_unauthorized() {
+        let dir = tempdir::TempDir::new("gate-wrong").expect("temp dir");
+        let shadow = factory_shadow(dir.path());
+        assert_eq!(
+            call_on_factory_board(wrong_password(PEER), &shadow).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Loopback is exempt, and that is load-bearing: `S99postupdate` reads
+    /// the metrics that decide whether a freshly flashed image is promoted,
+    /// over loopback, on the first boot of a board that is by definition
+    /// still on its factory password.
+    #[actix_web::test]
+    async fn loopback_is_not_gated_by_the_factory_password() {
+        let dir = tempdir::TempDir::new("gate-loopback").expect("temp dir");
+        let shadow = factory_shadow(dir.path());
+        let local = rest_call_from("127.0.0.1:41234").to_srv_request();
+        assert_eq!(
+            call_on_factory_board(local, &shadow).await,
+            StatusCode::OK,
+            "a factory board must still promote its own firmware"
+        );
+    }
+
+    /// And the control: the same request on a board whose password was
+    /// changed goes straight through.
+    #[actix_web::test]
+    async fn a_board_with_a_changed_password_is_not_gated() {
+        let dir = tempdir::TempDir::new("gate-changed").expect("temp dir");
+        let path = dir.path().join("shadow");
+        let hash = pwhash::sha512_crypt::hash("a much better password").expect("a shadow hash");
+        std::fs::write(&path, format!("root:{hash}:19000:0:99999:7:::\n")).expect("write");
+
+        let request = rest_call()
+            .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+            .to_srv_request();
+        assert_eq!(
+            call_on_factory_board(request, &path.to_string_lossy()).await,
+            StatusCode::OK
+        );
+    }
 
     const IDENTITY_HEADER: &str = "x-forwarded-email";
 

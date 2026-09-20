@@ -12,6 +12,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A board still on its factory password can do exactly one thing.** Every
+  board leaves the factory as `root` / `turing` — printed in the quick-start
+  guide, identical on every board ever sold, on a project whose own front page
+  says a board should not face the internet. Upstream has had an issue open
+  about it since 2023.
+
+  Until it is changed, `/api/bmc` answers **403 to everything** except
+  `/authenticate`, `/access` and `/access/password`, with a
+  `application/problem+json` body saying why. Not a banner: a banner is a
+  thing people close.
+
+  **The test is the factory password, not the first login.** `root`'s hash is
+  asked whether it still verifies the word `turing`, of `/etc/shadow` itself,
+  cached against that file's modification time. Never a flag. A board whose
+  password was changed over SSH before anyone opened the interface is never
+  asked; a board reset to factory defaults is asked again, because it is a
+  factory board again. A change made by anything — this daemon, `passwd`, an
+  editor — is noticed on the next request, with no restart.
+
+  **Loopback is exempt, and that is load-bearing.** `/api/bmc` already drops
+  authentication for the loopback interface: it is how the on-board `tpi`
+  works and how `S99postupdate` reads the metrics that decide whether a
+  freshly flashed image is promoted or rolled back. Gating it would fail the
+  promotion check on the first boot of every factory board — the exact boards
+  this protects — and roll the firmware back. It would also protect nothing:
+  the threat is a stranger who can reach port 443, and that stranger is not on
+  loopback. `tpi` pointed at a factory board from another machine is over the
+  network, is gated, and says so.
+
+  A wrong password on a factory board is still answered as a wrong password.
+  Saying "this board is on its factory password" to a failed login would
+  confirm the account name to somebody guessing.
+
+  The fleet is gated too: a gateway vouching for a person says nothing about
+  whether the board has been set up.
+
 - **A confirmation sent from the board itself is refused.** `POST
   /api/bmc/network/switch/confirm` answers **403** to a request that arrived
   over loopback, and says why:
