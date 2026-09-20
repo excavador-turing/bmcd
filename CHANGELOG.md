@@ -10,6 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **The password validator no longer logs a hash of what was typed.** It
+  logged `crypt(password, hash)` at debug level on every attempt. For a
+  correct password that is the stored hash, which is only as secret as
+  `/etc/shadow`. For a wrong one it is a hash of whatever was typed — and what
+  people type into the wrong login box is usually a password that is correct
+  somewhere else. A log file is far easier to read than `/etc/shadow`, and the
+  board's logs are collected.
+
+  It was scaffolding for a four-line function that has tests.
+
+
 ### Added
 
 - **Install your own certificate and key, from the interface or the API.**
