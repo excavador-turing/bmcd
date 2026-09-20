@@ -53,7 +53,7 @@ use std::process::{Command, Stdio};
 /// number was too small after it mattered.
 const MIN_PASSWORD_LEN: usize = 12;
 
-use crate::authentication::factory_password::SHADOW_FILE;
+use crate::authentication::factory_password::{FactoryPassword, SHADOW_FILE};
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -80,6 +80,14 @@ struct AccessState {
     /// not rewrite: the interface must send the operator to that file rather
     /// than pretend it can change it.
     client_ca_pinned_in_config: bool,
+    /// True while the board is still on `root` / `turing`, in which case this
+    /// endpoint and the password change are the only two that answer.
+    ///
+    /// Reported positively rather than left for a client to infer from the
+    /// 403s it collects: the interface has to decide what to render BEFORE it
+    /// asks for anything else, and an interface that learns its state from
+    /// failures shows a broken page first and the explanation second.
+    factory_password: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +223,7 @@ async fn get_access(request: HttpRequest, tls: web::Data<config::Tls>) -> HttpRe
             source: header_source.to_string(),
         },
         client_ca_pinned_in_config: tls.client_ca.is_some(),
+        factory_password: FactoryPassword::new(SHADOW_FILE).still_set(),
     };
 
     HttpResponse::Ok().json(state)

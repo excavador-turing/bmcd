@@ -301,7 +301,9 @@ fn access_paths() -> Vec<(String, Value)> {
                                 proxied identity if one is in effect, the header an identity is \
                                 read from, and how THIS request was authenticated. \
                                 `client_ca_pinned_in_config` means config.yaml chose it and the \
-                                daemon will not overwrite that choice.",
+                                daemon will not overwrite that choice. Also `factory_password`: true while the board is still on `root` / `turing`, \
+                                which is when this endpoint and the password change are the only \
+                                two that answer.",
                 "responses": {
                     "200": { "description": "The board's access configuration.",
                              "content": { "application/json": { "schema": component_ref("AccessState") } } },

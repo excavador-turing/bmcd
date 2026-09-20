@@ -48,6 +48,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The fleet is gated too: a gateway vouching for a person says nothing about
   whether the board has been set up.
 
+  `GET /api/bmc/access` gains **`factory_password`**, so the interface can
+  decide what to render before it asks for anything else. An interface that
+  learned its state from the 403s it collected would show a broken page first
+  and the explanation second.
+
 - **A confirmation sent from the board itself is refused.** `POST
   /api/bmc/network/switch/confirm` answers **403** to a request that arrived
   over loopback, and says why:
