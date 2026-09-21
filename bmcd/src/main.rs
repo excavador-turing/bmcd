@@ -130,6 +130,21 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // The board's own address: what /etc/network/interfaces says, which the
+    // boot path already applied. Nothing to apply here; its window has the
+    // same one-second clock as the switch's.
+    let address = Data::new(crate::app::address_service::AddressService::load(
+        crate::app::address_service::INTERFACES_FILE,
+    ));
+    let address_ticker = address.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::app::address_service::TICK);
+        loop {
+            interval.tick().await;
+            address_ticker.tick().await;
+        }
+    });
+
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
     let serial_service = Data::new(SerialConnections::new());
     let streaming_data_service = Data::new(StreamingDataService::new());
@@ -217,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(tls_facts.clone())
                         .app_data(certificate.clone())
                         .app_data(switch.clone())
+                        .app_data(address.clone())
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)
@@ -231,7 +247,8 @@ async fn main() -> anyhow::Result<()> {
                         // not be in one.
                         .configure(crate::api::access::config)
                         .configure(crate::api::tls::config)
-                        .configure(crate::api::network::config),
+                        .configure(crate::api::network::config)
+                        .configure(crate::api::address::config),
                 )
                 // Serve a static tree of files of the web UI. Must be the last item.
                 .service(Files::new("/", &config.www).index_file("index.html"))

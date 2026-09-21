@@ -11,6 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+pub mod address_applier;
+pub mod address_change;
+pub mod address_document;
+pub mod address_service;
 pub mod bmc_application;
 pub mod bmc_info;
 pub mod config_export;

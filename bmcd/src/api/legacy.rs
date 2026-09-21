@@ -397,7 +397,9 @@ async fn set_hostname(query: Query) -> LegacyResponse {
 async fn get_ntp() -> impl Into<LegacyResponse> {
     let config = crate::app::ntp::load().await;
     let health = crate::app::health_info::get_health().await;
+    let sources = crate::app::ntp::sources(&config.servers).await;
     json!(crate::api::responses::Ntp {
+        sources,
         servers: config.servers,
         // False on an image whose chrony.conf predates the `sourcedir` line.
         // Without it a saved list is written and silently never read, and the

@@ -26,6 +26,7 @@
 //! `chronyc reload sources` picks up a sourcedir change without restarting the
 //! daemon or losing the discipline it has built up.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -215,6 +216,98 @@ pub fn sourcedir_configured() -> bool {
         .unwrap_or(false)
 }
 
+/// One source as chrony sees it, from `chronyc -c sources`.
+///
+/// This exists because "not synchronised" on its own sent a user to Discord
+/// on 2026-09-21 with nothing to act on. chrony always knows *why* -- the
+/// server never answered, or answered and was refused for reporting itself
+/// unsynchronised -- and every field here is chrony's own column, never a
+/// guess about it.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct Source {
+    /// The address or name chrony uses for it.
+    pub name: String,
+    /// `server`, `pool` (a member of one) or `peer`.
+    pub kind: String,
+    /// `selected`, `combined`, `excluded`, `unreachable`, `falseticker`,
+    /// `too_variable` -- chrony's own states, in words.
+    pub state: String,
+    pub stratum: u8,
+    /// Seconds between polls, as 2^n.
+    pub poll_seconds: i64,
+    /// How many of the last eight polls were answered.
+    pub reach: u8,
+    /// Seconds since the last answer, or `None` if there never was one.
+    pub last_rx_seconds: Option<u64>,
+    /// The last measured offset of this source, in seconds.
+    pub offset_seconds: f64,
+    /// Whether it is one of the servers configured through this daemon.
+    pub configured: bool,
+}
+
+fn state_word(mark: &str) -> &'static str {
+    match mark {
+        "*" => "selected",
+        "+" => "combined",
+        "-" => "excluded",
+        "?" => "unreachable",
+        "x" => "falseticker",
+        "~" => "too_variable",
+        _ => "unknown",
+    }
+}
+
+fn kind_word(mark: &str) -> &'static str {
+    match mark {
+        "^" => "server",
+        "=" => "peer",
+        "#" => "refclock",
+        _ => "unknown",
+    }
+}
+
+/// Parses `chronyc -c sources`: one CSV line per source, columns mode,
+/// state, name, stratum, poll, reach (octal), lastrx, last offset, original
+/// offset, error. A line that does not fit is dropped rather than guessed.
+pub fn parse_sources(csv: &str, configured: &[String]) -> Vec<Source> {
+    csv.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            if f.len() < 8 {
+                return None;
+            }
+            let reach_octal = u32::from_str_radix(f[5], 8).ok()?;
+            let poll: i64 = f[4].parse().ok()?;
+            let name = f[2].to_string();
+            Some(Source {
+                kind: kind_word(f[0]).to_string(),
+                state: state_word(f[1]).to_string(),
+                configured: configured.iter().any(|c| c == &name),
+                name,
+                stratum: f[3].parse().ok()?,
+                poll_seconds: if poll >= 0 { 1i64 << poll.min(62) } else { 0 },
+                reach: (reach_octal & 0xff).count_ones() as u8,
+                last_rx_seconds: f[6].parse().ok(),
+                offset_seconds: f[7].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Every source chrony knows about, configured ones flagged.
+pub async fn sources(configured: &[String]) -> Vec<Source> {
+    let output = tokio::task::spawn_blocking(|| Command::new(CHRONYC).args(["-c", "sources"]).output())
+        .await
+        .ok()
+        .and_then(Result::ok);
+    match output {
+        Some(out) if out.status.success() => {
+            parse_sources(&String::from_utf8_lossy(&out.stdout), configured)
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +384,30 @@ mod tests {
         // the image's own pool line is the source again.
         let rendered = render(&[]);
         assert!(!rendered.contains("server "), "{rendered}");
+    }
+
+    #[test]
+    fn chronys_csv_becomes_words_and_counts() {
+        let csv = "^,*,81.172.248.188,1,10,377,754,0.001199813,0.001264698,0.004567511\n\
+                   ^,?,192.168.1.1,0,6,0,4294967295,0.000000000,0.000000000,4000000000.000000000\n\
+                   ^,x,ntp.lan,16,6,377,12,0.5,0.5,0.1\n";
+        let got = parse_sources(csv, &["192.168.1.1".into()]);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].state, "selected");
+        assert_eq!(got[0].kind, "server");
+        assert_eq!(got[0].reach, 8);
+        assert_eq!(got[0].poll_seconds, 1024);
+        assert!(!got[0].configured);
+        assert_eq!(got[1].state, "unreachable");
+        assert_eq!(got[1].reach, 0);
+        assert!(got[1].configured);
+        assert_eq!(got[2].state, "falseticker");
+        assert_eq!(got[2].stratum, 16);
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_source_is_dropped_not_guessed() {
+        assert!(parse_sources("506 Cannot talk to daemon\n", &[]).is_empty());
+        assert!(parse_sources("", &[]).is_empty());
     }
 }
