@@ -10,6 +10,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The board's own address, applied then confirmed at the new address.**
+  `GET/PUT /api/bmc/network/address`, `POST .../confirm`, `.../revert`,
+  `.../validate`, `GET .../limits`. One document -- `{"mode":"dhcp"}` or
+  `{"mode":"static","address","prefix","gateway","dns","search"}` -- the
+  same shape as the switch and for the same reason: the address is how you
+  reach the page you change it from. `PUT` answers **202**; the address goes
+  on the bridge, a window runs (30 s by default, 10-300), and unless a
+  confirmation reaches the daemon **at the new address** the previous one is
+  put back and `last_revert` says why. A confirmation from the board itself
+  never used the address and is refused with 403. Only a confirmed document
+  is written to `/etc/network/interfaces` -- the same v2.1 stanza the image
+  ships and `S00dsa` migrates, so the boot path needs nothing new.
+
+  **The bridge is never brought down.** `ifdown br0` would take the compute
+  modules' ports out of the bridge with it; the address is changed with `ip`
+  on a bridge that stays up, and udhcpc is stopped (it releases and flushes
+  on SIGTERM, which is what `-R` is for) or started the way `ifup` starts it.
+  The resolvers for a static address go into `/etc/resolv.conf` at apply, and
+  as an `up` hook in the stanza at boot -- this image has no resolvconf.
+
+  The board refuses what could never be reached: a gateway off the subnet,
+  the network or broadcast address, a prefix outside /8-/30. It warns, and
+  applies, what is merely unwise: no gateway, no resolver (so `pool.ntp.org`
+  never resolves). `GET` reports `running`, `configured` (what a reboot comes
+  back to), `live` (what the bridge actually has), and whether the file was
+  written by this daemon, by hand, or could not be read.
+
+  Asked for from the Discord on 2026-09-21 by a user who had set up the Split
+  layout and then had to change the BMC's address over SSH.
+
+- **`GET ?type=ntp` says what chrony thinks of each source.** `sources`: one
+  entry per source from `chronyc -c sources` -- `selected`, `combined`,
+  `excluded`, `unreachable`, `falseticker` or `too_variable`, stratum, how
+  many of the last eight polls answered, the last offset, and whether it is
+  one of the servers configured through this daemon. Every field is chrony's
+  own column. "Not synchronised" alone sent a user to Discord with nothing
+  to act on; chrony always knows why.
+
 ## [v2.37.0] — 2026-09-20
 
 ### Security

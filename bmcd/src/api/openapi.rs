@@ -461,6 +461,120 @@ fn access_paths() -> Vec<(String, Value)> {
             }),
         ),
         (
+            "/api/bmc/network/address".to_string(),
+            json!({
+                "get": {
+                    "summary": "The board's own address: running, configured, live",
+                    "operationId": "getAddress",
+                    "description": "What the board is on as the daemon understands it, what \
+                                    `/etc/network/interfaces` says and therefore what a reboot \
+                                    comes back to, what the bridge actually has right now, any \
+                                    change still waiting to be confirmed, and the last revert \
+                                    with its reason. `file` says whether the daemon wrote the \
+                                    file, a person did, or the daemon could not read it.",
+                    "responses": {
+                        "200": { "description": "The address, as the daemon sees it." },
+                        "default": problem
+                    }
+                },
+                "put": {
+                    "summary": "Apply an address, to be confirmed at that address",
+                    "operationId": "applyAddress",
+                    "description": "Takes `{\"mode\":\"dhcp\"}` or `{\"mode\":\"static\", \
+                                    \"address\", \"prefix\", \"gateway\", \"dns\", \"search\"}` \
+                                    and an optional `window_s`. Answers **202**: the address is \
+                                    on the bridge but it is not yours to keep yet. Confirm within \
+                                    the window, at the new address, or the board puts the previous \
+                                    one back by itself. The bridge and the modules' ports are never \
+                                    brought down; only the address on top of them changes. Only a \
+                                    confirmed document is written to `/etc/network/interfaces`.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "description": "An address document, plus an optional window_s."
+                    })}}},
+                    "responses": {
+                        "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/address/confirm".to_string(),
+            json!({
+                "post": {
+                    "summary": "Keep a pending address",
+                    "operationId": "confirmAddress",
+                    "description": "Must arrive at the address that was just applied -- after an \
+                                    apply the old one is gone, so reaching the daemon at all is the \
+                                    proof. A confirmation from the board itself never used the \
+                                    address and is refused with 403. Writes the document to \
+                                    `/etc/network/interfaces`.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "properties": { "token": { "type": "string" } },
+                        "required": ["token"]
+                    })}}},
+                    "responses": {
+                        "200": { "description": "Kept and written; the view, as GET returns it." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/address/revert".to_string(),
+            json!({
+                "post": {
+                    "summary": "Put a pending address back now",
+                    "operationId": "revertAddress",
+                    "description": "Rather than waiting out the window. Open to the board itself: \
+                                    this is the direction that cannot strand anybody.",
+                    "responses": {
+                        "200": { "description": "Reverted; the view, as GET returns it." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/address/validate".to_string(),
+            json!({
+                "post": {
+                    "summary": "What the board would say about an address",
+                    "operationId": "validateAddress",
+                    "description": "Returns the document, a refusal if the board would not apply \
+                                    it -- a gateway off the subnet, a prefix with no room, the \
+                                    network or broadcast address -- and warnings for what it would \
+                                    apply but you should hear: no gateway, no resolver. Changes \
+                                    nothing; a refusal comes back inside a 200.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "description": "An address document."
+                    })}}},
+                    "responses": {
+                        "200": { "description": "The verdict: document, refusal, warnings." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/network/address/limits".to_string(),
+            json!({
+                "get": {
+                    "summary": "The bounds a client may ask within",
+                    "operationId": "getAddressLimits",
+                    "description": "Prefix range and the confirm window's default, minimum and \
+                                    maximum, so no client hard-codes a number the daemon publishes.",
+                    "responses": {
+                        "200": { "description": "prefix_min, prefix_max, window_default_s, window_min_s, window_max_s." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
             "/api/bmc/tls/certificate".to_string(),
             json!({
                 "get": {
@@ -834,6 +948,12 @@ mod tests {
         ("/api/bmc/network/switch", "put"),
         ("/api/bmc/network/switch/confirm", "post"),
         ("/api/bmc/network/switch/revert", "post"),
+        ("/api/bmc/network/address", "get"),
+        ("/api/bmc/network/address", "put"),
+        ("/api/bmc/network/address/confirm", "post"),
+        ("/api/bmc/network/address/revert", "post"),
+        ("/api/bmc/network/address/validate", "post"),
+        ("/api/bmc/network/address/limits", "get"),
     ];
 
     #[test]

@@ -127,6 +127,9 @@ pub struct Ntp {
     /// interface must be able to say the setting does nothing.
     pub configurable: bool,
     pub clock: crate::app::health_info::Clock,
+    /// Every source chrony knows about and what it thinks of each -- the
+    /// answer to "why is it not synchronised", which `clock` alone is not.
+    pub sources: Vec<crate::app::ntp::Source>,
 }
 
 /// `GET /api/bmc/info` -- what the Overview page reads.
