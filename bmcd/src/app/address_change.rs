@@ -260,7 +260,13 @@ mod tests {
 
     fn applied(state: &mut AddressState) -> Pending {
         let (pending, effect) = state
-            .apply(fixed(), AddressDocument::Dhcp, DEFAULT_WINDOW, t0(), "tok".into())
+            .apply(
+                fixed(),
+                AddressDocument::Dhcp,
+                DEFAULT_WINDOW,
+                t0(),
+                "tok".into(),
+            )
             .expect("a valid document applies");
         assert_eq!(effect, Effect::Apply(fixed()));
         pending
@@ -316,7 +322,13 @@ mod tests {
         applied(&mut state);
         assert_eq!(
             state
-                .apply(AddressDocument::Dhcp, fixed(), DEFAULT_WINDOW, t0(), "t2".into())
+                .apply(
+                    AddressDocument::Dhcp,
+                    fixed(),
+                    DEFAULT_WINDOW,
+                    t0(),
+                    "t2".into()
+                )
                 .err(),
             Some(ChangeError::AlreadyPending)
         );
@@ -326,9 +338,15 @@ mod tests {
     fn a_failed_apply_puts_the_snapshot_back_at_once() {
         let mut state = AddressState::default();
         applied(&mut state);
-        assert_eq!(state.apply_failed(t0()), Effect::Apply(AddressDocument::Dhcp));
+        assert_eq!(
+            state.apply_failed(t0()),
+            Effect::Apply(AddressDocument::Dhcp)
+        );
         assert!(state.pending().is_none());
-        assert_eq!(state.last_revert().unwrap().reason, RevertReason::ApplyFailed);
+        assert_eq!(
+            state.last_revert().unwrap().reason,
+            RevertReason::ApplyFailed
+        );
     }
 
     #[test]
@@ -337,7 +355,13 @@ mod tests {
         for secs in [9, 301] {
             assert_eq!(
                 state
-                    .apply(fixed(), AddressDocument::Dhcp, Duration::from_secs(secs), t0(), "t".into())
+                    .apply(
+                        fixed(),
+                        AddressDocument::Dhcp,
+                        Duration::from_secs(secs),
+                        t0(),
+                        "t".into()
+                    )
                     .err(),
                 Some(ChangeError::WindowOutOfRange),
                 "{secs}s"

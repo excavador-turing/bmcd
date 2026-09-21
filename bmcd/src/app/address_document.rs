@@ -171,12 +171,16 @@ impl AddressDocument {
                 s.prefix
             )
         } else if s.gateway == Some(s.address) {
-            format!("the gateway cannot be the board's own address {}", s.address)
-        } else if s
-            .search
-            .as_deref()
-            .is_some_and(|d| d.is_empty() || !d.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
-        {
+            format!(
+                "the gateway cannot be the board's own address {}",
+                s.address
+            )
+        } else if s.search.as_deref().is_some_and(|d| {
+            d.is_empty()
+                || !d
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        }) {
             "the search domain may contain letters, digits, dots and hyphens only".to_string()
         } else {
             return None;

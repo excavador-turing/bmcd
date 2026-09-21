@@ -352,10 +352,11 @@ pub fn with_unresolved(
 /// Every source chrony knows about, configured ones flagged, and what it
 /// could not resolve.
 pub async fn sources(configured: &[String]) -> Vec<Source> {
-    let output = tokio::task::spawn_blocking(|| Command::new(CHRONYC).args(["-c", "sources"]).output())
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let output =
+        tokio::task::spawn_blocking(|| Command::new(CHRONYC).args(["-c", "sources"]).output())
+            .await
+            .ok()
+            .and_then(Result::ok);
     let listed = match output {
         Some(out) if out.status.success() => {
             parse_sources(&String::from_utf8_lossy(&out.stdout), configured)
@@ -467,7 +468,11 @@ mod tests {
     fn an_empty_list_names_what_never_resolved() {
         // dojo-major's board, 2026-09-21: pool.ntp.org configured, resolver
         // empty, `chronyc sources` empty, "not synchronised".
-        let got = with_unresolved(vec![], &["pool.ntp.org".into()], "pool pool.ntp.org iburst\n");
+        let got = with_unresolved(
+            vec![],
+            &["pool.ntp.org".into()],
+            "pool pool.ntp.org iburst\n",
+        );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].state, "unresolved");
         assert_eq!(got[0].name, "pool.ntp.org");
@@ -482,7 +487,11 @@ mod tests {
     fn a_resolved_list_is_left_alone() {
         let csv = "^,*,81.172.248.188,1,10,377,754,0.001199813,0.001264698,0.004567511\n";
         let listed = parse_sources(csv, &["pool.ntp.org".into()]);
-        let got = with_unresolved(listed, &["pool.ntp.org".into()], "pool pool.ntp.org iburst\n");
+        let got = with_unresolved(
+            listed,
+            &["pool.ntp.org".into()],
+            "pool pool.ntp.org iburst\n",
+        );
         // pool.ntp.org resolved to 81.172.248.188; a name that resolved is
         // not reported as unresolved just because it appears as an address.
         assert_eq!(got.len(), 1);

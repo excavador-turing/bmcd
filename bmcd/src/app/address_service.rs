@@ -28,7 +28,9 @@
 //! on a parser. What the network actually has is reported beside it, as
 //! `live`, so a hand change from a console is visible without being trusted.
 use crate::app::address_applier::{self, ApplyError, LiveAddress};
-use crate::app::address_change::{AddressState, ChangeError, Effect, Pending, RevertRecord, DEFAULT_WINDOW};
+use crate::app::address_change::{
+    AddressState, ChangeError, Effect, Pending, RevertRecord, DEFAULT_WINDOW,
+};
 use crate::app::address_document::{parse, AddressDocument};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -229,7 +231,9 @@ fn describe(document: &AddressDocument) -> String {
         AddressDocument::Static(s) => format!(
             "static {} via {}",
             s.cidr(),
-            s.gateway.map(|g| g.to_string()).unwrap_or_else(|| "no gateway".into())
+            s.gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "no gateway".into())
         ),
     }
 }
@@ -275,7 +279,11 @@ mod tests {
     fn a_file_it_cannot_read_is_said_to_be_unreadable_and_runs_as_dhcp() {
         let dir = tempdir::TempDir::new("address-unreadable").expect("temp dir");
         let path = dir.path().join("interfaces");
-        std::fs::write(&path, "auto eth0\niface eth0 inet static\n  address 10.0.0.2\n").unwrap();
+        std::fs::write(
+            &path,
+            "auto eth0\niface eth0 inet static\n  address 10.0.0.2\n",
+        )
+        .unwrap();
         let service = AddressService::load(&path);
         let inner = service.inner.try_lock().unwrap();
         assert_eq!(inner.file, FileOrigin::Unreadable);

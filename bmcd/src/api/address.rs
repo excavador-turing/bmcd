@@ -238,7 +238,9 @@ mod tests {
         .unwrap();
         let response = post_validate(web::Json(doc)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let verdict: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(verdict["refusal"]["reason"]
             .as_str()
@@ -249,7 +251,9 @@ mod tests {
     #[actix_web::test]
     async fn the_limits_are_published() {
         let response = get_limits().await;
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let limits: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(limits["window_default_s"], 30);
         assert_eq!(limits["prefix_max"], 30);

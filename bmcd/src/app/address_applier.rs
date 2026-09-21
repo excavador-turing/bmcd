@@ -98,7 +98,11 @@ fn run_lenient(program: &str, args: &[&str]) {
 }
 
 fn udhcpc_pid() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(UDHCPC_PID).ok()?.trim().parse().ok()?;
+    let pid: u32 = std::fs::read_to_string(UDHCPC_PID)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     Path::new(&format!("/proc/{pid}")).exists().then_some(pid)
 }
 
@@ -151,10 +155,20 @@ fn set_static(s: &StaticAddress) -> Result<(), ApplyError> {
     if let Some(gw) = s.gateway {
         run(
             IP,
-            &["-4", "route", "replace", "default", "via", &gw.to_string(), "dev", INTERFACE],
+            &[
+                "-4",
+                "route",
+                "replace",
+                "default",
+                "via",
+                &gw.to_string(),
+                "dev",
+                INTERFACE,
+            ],
         )?;
     }
-    std::fs::write(RESOLV_CONF, resolv_conf(&s.dns, s.search.as_deref())).map_err(ApplyError::Io)?;
+    std::fs::write(RESOLV_CONF, resolv_conf(&s.dns, s.search.as_deref()))
+        .map_err(ApplyError::Io)?;
     Ok(())
 }
 
@@ -211,7 +225,12 @@ pub async fn live() -> LiveAddress {
         .map(|c| parse_resolv(&c))
         .unwrap_or_default();
     LiveAddress {
-        mode: if udhcpc_pid().is_some() { "dhcp" } else { "static" }.to_string(),
+        mode: if udhcpc_pid().is_some() {
+            "dhcp"
+        } else {
+            "static"
+        }
+        .to_string(),
         address,
         gateway,
         dns,
@@ -230,7 +249,10 @@ mod tests {
         assert_eq!(search.as_deref(), Some("haarlem.internal"));
         assert_eq!(
             dns,
-            vec!["192.168.77.1".parse::<Ipv4Addr>().unwrap(), "1.1.1.1".parse().unwrap()]
+            vec![
+                "192.168.77.1".parse::<Ipv4Addr>().unwrap(),
+                "1.1.1.1".parse().unwrap()
+            ]
         );
     }
 }
