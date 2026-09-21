@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.38.0] — 2026-09-21
+
 ### Added
 
 - **The board's own address, applied then confirmed at the new address.**
