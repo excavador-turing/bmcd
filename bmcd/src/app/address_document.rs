@@ -268,13 +268,32 @@ impl AddressDocument {
                     }
                     out.push_str(&format!(
                         "  up printf '{}' > /etc/resolv.conf\n",
-                        resolv_conf(&s.dns, s.search.as_deref()).replace('\n', "\\n")
+                        hook_argument(&resolv_conf(&s.dns, s.search.as_deref()))
                     ));
                 }
             }
         }
         out
     }
+}
+
+/// The text of `/etc/resolv.conf`, as the single argument of a `printf` in
+/// an `up` hook of an `interfaces` file -- which is two encodings deep, and
+/// the second one bit.
+///
+/// The newline is `\n` for printf. The `#` is `\043`, ALSO for printf, and
+/// that one is not a nicety: ifupdown-ng reads `#` anywhere on a line as the
+/// start of a comment, so a literal `# br0` inside the quotes cut the line
+/// off mid-string, `/bin/sh` refused the unterminated quote, and `ifup`
+/// exited 1 for `br0` on every boot. The address was already on the bridge
+/// by then, so the board came up reachable and with an empty resolv.conf --
+/// which is how a reader on a 2.4 board came to have a clock that could not
+/// resolve `time.nist.gov` after a reboot (Discord, 2026-09-22). Measured on
+/// board B: the hook with `#` fails with "unterminated quoted string"; the
+/// hook with `\043` writes the file byte-for-byte, `# br0` and all, and
+/// udhcpc's filter still recognises the lines as its own.
+fn hook_argument(resolv: &str) -> String {
+    resolv.replace('\n', "\\n").replace('#', "\\043")
 }
 
 /// What `/etc/resolv.conf` should say for a static address. The `# br0`
@@ -466,12 +485,35 @@ mod tests {
         assert!(text.contains("  gateway 192.168.1.1\n"));
         assert!(text.contains("  dns-nameservers 192.168.1.1 1.1.1.1\n"));
         assert!(
-            text.contains("  up printf 'search home.lan # br0\\nnameserver 192.168.1.1 # br0\\nnameserver 1.1.1.1 # br0\\n' > /etc/resolv.conf\n"),
+            text.contains("  up printf 'search home.lan \\043 br0\\nnameserver 192.168.1.1 \\043 br0\\nnameserver 1.1.1.1 \\043 br0\\n' > /etc/resolv.conf\n"),
             "{text}"
         );
         let parsed = parse(&text);
         assert!(parsed.ours);
         assert_eq!(parsed.document, Some(doc));
+    }
+
+    /// ifupdown-ng treats `#` anywhere on a line as a comment. The header is
+    /// comments on purpose; the stanza itself must carry none, or the hook
+    /// that writes the resolvers is cut off and `ifup br0` fails at boot.
+    #[test]
+    fn the_br0_stanza_carries_no_comment_character() {
+        for doc in [AddressDocument::Dhcp, AddressDocument::Static(lan())] {
+            let text = doc.render();
+            let stanza = text.split("auto br0").nth(1).expect("a br0 stanza");
+            assert!(!stanza.contains('#'), "{stanza}");
+        }
+    }
+
+    #[test]
+    fn the_hook_reproduces_resolv_conf_exactly_once_printf_has_run() {
+        // What busybox printf makes of the argument: `\n` a newline, `\043` a
+        // hash. Modelled here; proved on the board.
+        let resolv = resolv_conf(&lan().dns, lan().search.as_deref());
+        let arg = hook_argument(&resolv);
+        assert!(!arg.contains('#'));
+        let printed = arg.replace("\\043", "#").replace("\\n", "\n");
+        assert_eq!(printed, resolv);
     }
 
     #[test]

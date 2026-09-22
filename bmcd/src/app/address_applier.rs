@@ -39,7 +39,7 @@ use std::path::Path;
 
 const UDHCPC: &str = "/sbin/udhcpc";
 const UDHCPC_PID: &str = "/var/run/udhcpc.br0.pid";
-const RESOLV_CONF: &str = "/etc/resolv.conf";
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 const IP: &str = "ip";
 /// mdnsd is started with `-i br0` and does not watch for a new address on
 /// it; restarting it is how the board re-announces itself.
