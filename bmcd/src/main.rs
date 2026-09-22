@@ -136,6 +136,13 @@ async fn main() -> anyhow::Result<()> {
     let address = Data::new(crate::app::address_service::AddressService::load(
         crate::app::address_service::INTERFACES_FILE,
     ));
+    // Except for what an earlier version of this daemon got wrong: a hook
+    // ifupdown-ng could not run, and the resolvers it should have written.
+    address
+        .repair(std::path::Path::new(
+            crate::app::address_applier::RESOLV_CONF,
+        ))
+        .await;
     let address_ticker = address.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(crate::app::address_service::TICK);

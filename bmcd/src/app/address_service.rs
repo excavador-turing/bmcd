@@ -31,7 +31,7 @@ use crate::app::address_applier::{self, ApplyError, LiveAddress};
 use crate::app::address_change::{
     AddressState, ChangeError, Effect, Pending, RevertRecord, DEFAULT_WINDOW,
 };
-use crate::app::address_document::{parse, AddressDocument};
+use crate::app::address_document::{parse, resolv_conf, AddressDocument};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -98,6 +98,13 @@ pub struct AddressService {
     path: PathBuf,
 }
 
+/// What `repair` did at start.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Repair {
+    pub file_rewritten: bool,
+    pub resolvers_written: bool,
+}
+
 struct Inner {
     state: AddressState,
     running: AddressDocument,
@@ -133,6 +140,75 @@ impl AddressService {
             }),
             path,
         }
+    }
+
+    /// Put right, at start, what an earlier version of this daemon got wrong.
+    ///
+    /// Two things, both only for a file THIS daemon wrote -- a hand-edited
+    /// file is never touched:
+    ///
+    /// 1. If the file is not byte-for-byte what this version renders for the
+    ///    same document, it is rewritten. The document is unchanged; only
+    ///    the rendering moves. This is how a board that 2.38.0 left with a
+    ///    hook containing a literal `#` (which ifupdown-ng reads as a
+    ///    comment, so `ifup br0` failed on every boot) gets a working file
+    ///    from the first start of the daemon that knows better, rather than
+    ///    at the next time somebody changes the address.
+    ///
+    /// 2. If the board runs a static address with resolvers and
+    ///    `/etc/resolv.conf` does not carry them, they are written now. This
+    ///    daemon starts after the network does, so on a board where the boot
+    ///    hook failed, this is the moment the resolvers arrive; on a board
+    ///    where it worked, the file already matches and nothing is written.
+    ///    resolv.conf on this image is a symlink into tmpfs, so this is
+    ///    honest about what a reboot does: it starts empty every time.
+    ///
+    /// Returns what it did, for the log and for the tests.
+    pub async fn repair(&self, resolv_path: &Path) -> Repair {
+        let inner = self.inner.lock().await;
+        let mut done = Repair::default();
+
+        if inner.file == FileOrigin::Bmcd {
+            let wanted = inner.running.render();
+            let have = std::fs::read_to_string(&self.path).unwrap_or_default();
+            if have != wanted {
+                match write_atomically(&self.path, wanted.as_bytes()) {
+                    Ok(()) => {
+                        done.file_rewritten = true;
+                        tracing::warn!(
+                            "rewrote {}: it was written by an earlier version of this daemon \
+                             and its boot hook could not have run",
+                            self.path.display()
+                        );
+                    }
+                    Err(e) => tracing::error!("could not rewrite {}: {e}", self.path.display()),
+                }
+            }
+        }
+
+        if let AddressDocument::Static(s) = &inner.running {
+            if !s.dns.is_empty() || s.search.is_some() {
+                let wanted = resolv_conf(&s.dns, s.search.as_deref());
+                let have = std::fs::read_to_string(resolv_path).unwrap_or_default();
+                let missing = wanted.lines().any(|l| !have.lines().any(|h| h == l));
+                if missing {
+                    match std::fs::write(resolv_path, &wanted) {
+                        Ok(()) => {
+                            done.resolvers_written = true;
+                            tracing::warn!(
+                                "wrote the static address's resolvers to {}: the boot path had \
+                                 left it without them",
+                                resolv_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("could not write {}: {e}", resolv_path.display())
+                        }
+                    }
+                }
+            }
+        }
+        done
     }
 
     pub async fn view(&self) -> AddressView {
@@ -273,6 +349,67 @@ mod tests {
         std::fs::write(&path, AddressDocument::Dhcp.render()).unwrap();
         let service = AddressService::load(&path);
         assert_eq!(service.inner.try_lock().unwrap().file, FileOrigin::Bmcd);
+    }
+
+    /// The hook 2.38.0 wrote carried a literal `#`, which ifupdown-ng reads
+    /// as a comment; the board came up with `ifup br0` failed and no
+    /// resolvers. The daemon that knows better fixes the file at its first
+    /// start, without waiting for the address to be changed again.
+    #[tokio::test]
+    async fn a_file_this_daemon_wrote_with_the_old_hook_is_rewritten_at_start() {
+        let dir = tempdir::TempDir::new("address-repair").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        let resolv = dir.path().join("resolv.conf");
+        let doc = AddressDocument::Static(crate::app::address_document::StaticAddress {
+            address: "192.168.1.20".parse().unwrap(),
+            prefix: 24,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            dns: vec!["192.168.1.1".parse().unwrap()],
+            search: Some("home.lan".into()),
+        });
+        // As 2.38.0 rendered it: the same lines, the hook with a raw `#`.
+        let old = doc.render().replace("\\043", "#");
+        assert!(old.contains("# br0\\n"), "{old}");
+        std::fs::write(&path, &old).unwrap();
+        std::fs::write(&resolv, "").unwrap();
+
+        let service = AddressService::load(&path);
+        let done = service.repair(&resolv).await;
+        assert_eq!(
+            done,
+            Repair {
+                file_rewritten: true,
+                resolvers_written: true
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc.render());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "search home.lan # br0\nnameserver 192.168.1.1 # br0\n"
+        );
+
+        // A second start finds nothing to do.
+        let again = AddressService::load(&path).repair(&resolv).await;
+        assert_eq!(again, Repair::default());
+    }
+
+    #[tokio::test]
+    async fn a_hand_edited_file_is_never_rewritten_and_dhcp_touches_no_resolvers() {
+        let dir = tempdir::TempDir::new("address-repair-hand").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        let resolv = dir.path().join("resolv.conf");
+        let hand = "auto br0\niface br0 inet static\n  address 10.1.2.3/16\n  gateway 10.1.0.1\n  bridge-ports node1 node2 node3 node4 ge0 ge1\n";
+        std::fs::write(&path, hand).unwrap();
+        std::fs::write(&resolv, "").unwrap();
+        let done = AddressService::load(&path).repair(&resolv).await;
+        assert_eq!(done, Repair::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hand);
+
+        let dhcp = dir.path().join("interfaces-dhcp");
+        std::fs::write(&dhcp, AddressDocument::Dhcp.render()).unwrap();
+        let done = AddressService::load(&dhcp).repair(&resolv).await;
+        assert_eq!(done, Repair::default());
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), "");
     }
 
     #[test]
