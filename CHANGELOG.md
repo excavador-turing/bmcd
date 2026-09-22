@@ -10,6 +10,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.38.2] — 2026-09-22
+
+### Fixed
+
+- **A firmware source that could not be reached reported nothing rather
+  than a failure.** `list_remote` read the updater's stdout and ignored how
+  the process ended. `tpi-selfupdate --list` printed `{"releases":[]}` and
+  exited 0 when it could not reach the source, putting the real reason on
+  stderr where nothing read it -- so on a board with no resolver every
+  remote source came back with no candidates and no error, and the firmware
+  page rendered that as "nothing new". Reported from a 2.4 board on
+  2026-09-22 as "checking github for updated firmware also fails silently",
+  and reproduced on board B: with an empty `/etc/resolv.conf`, four sources,
+  zero candidates, zero errors, and `curl: (6) Could not resolve host` on
+  the updater's stderr.
+
+  The exit status is now read **before** the output. The updater is fixed in
+  firmware v2.36.0 to exit non-zero and print nothing; this is the other
+  half, so the next script that fails cheerfully cannot put the page back to
+  lying. A failure with nothing on stderr now names the exit code instead of
+  saying "no output", which was the only sentence the page had to show.
+
 ## [2.38.1] — 2026-09-22
 
 ### Fixed

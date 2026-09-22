@@ -180,20 +180,48 @@ fn list_remote(source: &Source) -> Result<Listing, String> {
         .map_err(|e| format!("cannot run {SELFUPDATE}: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().find(|l| l.trim_start().starts_with('{'));
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // THE EXIT STATUS IS READ BEFORE THE OUTPUT, and that order is the whole
+    // point. Until now this looked only at stdout: a `{` line was taken as a
+    // listing however the process had ended. The updater used to print
+    // `{"releases":[]}` and exit 0 when it could not reach the source -- the
+    // reason went to stderr, where nothing read it -- so a board with no
+    // resolver reported every remote source as offering nothing, and the
+    // firmware page said there was no update. Reported from a 2.4 board on
+    // 2026-09-22 as "checking github for updated firmware also fails
+    // silently", and reproduced on board B.
+    //
+    // The updater was fixed to exit non-zero and print nothing (firmware
+    // v2.36.0, tests/listing.sh). This is the other half: an empty list is
+    // believed only from a process that said it succeeded, so the next
+    // script that fails cheerfully cannot put the page back to lying.
+    if !output.status.success() {
+        return Err(failure_reason(&stderr, output.status.code()));
+    }
+
+    let line = stdout.lines().find(|l| l.trim_start().starts_with('{'));
     match line {
         Some(line) => serde_json::from_str(line)
             .map_err(|e| format!("cannot parse the updater's listing: {e}")),
-        None => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(stderr
-                .lines()
-                .last()
-                .unwrap_or("no output")
-                .trim()
-                .to_string())
-        }
+        None => Err(failure_reason(&stderr, output.status.code())),
+    }
+}
+
+/// What to show for a listing that did not happen: the updater's own last
+/// word, or the exit status when it said nothing at all.
+///
+/// "no output" was what this used to say in both cases, which told a reader
+/// nothing they could act on -- and on the page it is the only sentence they
+/// get.
+fn failure_reason(stderr: &str, code: Option<i32>) -> String {
+    let last = stderr.lines().last().unwrap_or_default().trim();
+    if !last.is_empty() {
+        return last.to_string();
+    }
+    match code {
+        Some(code) => format!("{SELFUPDATE} exited {code} without saying why"),
+        None => format!("{SELFUPDATE} was killed by a signal"),
     }
 }
 
@@ -675,6 +703,31 @@ pub async fn get(force: bool) -> Catalog {
 
 #[cfg(test)]
 mod tests {
+    use super::failure_reason;
+
+    /// The page shows this sentence and nothing else, so it has to be the
+    /// updater's own words when it has any.
+    #[test]
+    fn a_failed_listing_is_explained_by_the_updater_when_it_said_anything() {
+        assert_eq!(
+            failure_reason(
+                "tpi-selfupdate: cannot reach the GitHub API\ncurl: (6) Could not resolve host: api.github.com\n",
+                Some(6)
+            ),
+            "curl: (6) Could not resolve host: api.github.com"
+        );
+    }
+
+    /// And when it said nothing, the status is all there is -- but "no
+    /// output" was not something a reader could act on.
+    #[test]
+    fn a_silent_failure_names_the_exit_code_rather_than_saying_no_output() {
+        let said = failure_reason("", Some(2));
+        assert!(said.contains("exited 2"), "{said}");
+        assert!(!said.contains("no output"), "{said}");
+        assert!(failure_reason("", None).contains("signal"));
+    }
+
     use super::*;
     use tempdir::TempDir;
 
