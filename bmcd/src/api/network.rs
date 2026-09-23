@@ -343,6 +343,64 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::test::TestRequest;
 
+    /// BMC-Firmware#59: a document with one VLAN name was refused by
+    /// `validate` and by `PUT` as "did not match any variant of untagged
+    /// enum Proposal", while the same document with `names: {}` passed.
+    /// `Proposal` is `untagged`, so serde buffers the body, and in the
+    /// buffered form a map key `"1"` does not become a `u16`. The names are
+    /// now parsed from their wire form, so this reads the same by either
+    /// path. Against the old code this test fails with exactly the
+    /// reporter's message.
+    #[test]
+    fn a_named_vlan_reads_through_the_untagged_proposal() {
+        let json = r#"{
+            "vlan_filtering": true, "stp": false,
+            "ports": {
+                "node1": {"untagged": 1, "tagged": []},
+                "node2": {"untagged": 50, "tagged": []},
+                "node3": {"untagged": 50, "tagged": []},
+                "node4": {"untagged": 1, "tagged": []},
+                "bmc":   {"untagged": 1, "tagged": []},
+                "ge0":   {"untagged": 1, "tagged": [50]},
+                "ge1":   {"untagged": 1, "tagged": []}
+            },
+            "names": {"1": "test", "50": "lab"}
+        }"#;
+        let proposal: Proposal =
+            serde_json::from_str(json).expect("a named document is a Document");
+        let Proposal::Document(document) = proposal else {
+            panic!("a document, not a preset");
+        };
+        assert_eq!(document.names.get(&1).map(String::as_str), Some("test"));
+        assert_eq!(document.names.get(&50).map(String::as_str), Some("lab"));
+        // The rules ran over a parsed document. Whatever they say about the
+        // layout, none of it is about the names, which are all well-formed.
+        if let Some(refusal) = document.refusal() {
+            assert!(!refusal.reason.contains("name"), "{}", refusal.reason);
+        }
+
+        // And through the apply body: the same enum, flattened, so the
+        // document's own fields sit beside `window_s` at the top level.
+        let wrapped = format!(
+            r#"{}, "window_s": 30}}"#,
+            json.trim_end().trim_end_matches('}')
+        );
+        let apply: ApplyRequest = serde_json::from_str(&wrapped).expect("PUT reads it too");
+        let Proposal::Document(document) = apply.proposal else {
+            panic!("a document, not a preset");
+        };
+        assert_eq!(document.names.len(), 2);
+    }
+
+    /// A key that is not a VLAN id is named for what it is, not hidden
+    /// behind "did not match any variant".
+    #[test]
+    fn a_name_keyed_by_a_word_is_refused_by_name() {
+        let json = r#"{"vlan_filtering": false, "stp": false, "ports": {}, "names": {"lab": "x"}}"#;
+        let err = serde_json::from_str::<SwitchDocument>(json).expect_err("not a VLAN id");
+        assert!(err.to_string().contains("keyed by VLAN id"), "{err}");
+    }
+
     fn request_from(actor: Option<Actor>) -> HttpRequest {
         let request = TestRequest::default().to_http_request();
         if let Some(actor) = actor {

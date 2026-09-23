@@ -10,6 +10,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.38.3] — 2026-09-23
+
+### Fixed
+
+- **A switch document with a VLAN name was refused by `validate` and by
+  `PUT`, as "did not match any variant of untagged enum Proposal".** The
+  same document with `names: {}` passed. Both endpoints accept either a
+  preset or a whole document, and the type that says "either" is
+  `#[serde(untagged)]`, which buffers the body before choosing; in the
+  buffered form a map key `"50"` is a string that never becomes the `u16`
+  the names table is keyed by — while a direct read of the struct converts
+  it, which is why every unit test of the document passed. From the day
+  names existed. Reported as
+  [BMC-Firmware#59](https://github.com/excavador-turing/BMC-Firmware/issues/59)
+  by a reader whose interface greyed out *Try it* and *Apply* and told him
+  his board could not check a layout; reproduced on a board with the same
+  document twice.
+
+  Names are now read from their wire form — string keys, parsed here — so
+  both paths agree, and a key that is not a VLAN id is refused by name
+  rather than as "no variant matched". A test feeds a named document through
+  `Proposal` and through the flattened `PUT` body; on the old code it fails
+  with the reporter's exact message.
+
 ## [2.38.2] — 2026-09-22
 
 ### Fixed
