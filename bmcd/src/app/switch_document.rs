@@ -196,8 +196,42 @@ pub struct SwitchDocument {
     ///
     /// Naming a VLAN nobody is in yet is allowed: people name a layout while
     /// they are building it.
-    #[serde(default)]
+    ///
+    /// Read by [`names_from_wire`], not by serde's own map handling. In JSON
+    /// a key is always a string, and serde_json turns `"50"` into a `u16`
+    /// when it reads this struct directly -- but `validate` and `PUT` read
+    /// it through an `#[serde(untagged)]` enum, which buffers the input
+    /// first, and the buffered form does not do that conversion. So a
+    /// document with an empty `names` was accepted and a document with one
+    /// name was refused as "did not match any variant", on both endpoints,
+    /// from the day names existed until BMC-Firmware#59 reported it. Parsing
+    /// the keys here works the same by either path.
+    #[serde(default, deserialize_with = "names_from_wire")]
     pub names: BTreeMap<u16, String>,
+}
+
+/// `names` as it is on the wire: an object whose keys are VLAN ids written as
+/// strings. Parsed here so it reads the same whether serde got here directly
+/// or through a buffering (`untagged`) path. A key that is not a number is a
+/// client plainly confused about what it is sending, and is named as such;
+/// the range check stays in [`SwitchDocument::refusal`] with the other rules.
+fn names_from_wire<'de, D>(deserializer: D) -> Result<BTreeMap<u16, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(key, name)| {
+            key.trim()
+                .parse::<u16>()
+                .map(|vid| (vid, name))
+                .map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        "VLAN names are keyed by VLAN id; {key:?} is not one"
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// Which uplink arrangement `Trunk` uses for ge1.
