@@ -178,4 +178,37 @@ mod tests {
         assert_eq!(body, "pong");
         assert_eq!(cc, None);
     }
+
+    /// A repeat load: the browser sends the ETag back and must get a 304 that
+    /// still says how long it may be kept.
+    async fn revalidate(path: &str) -> (StatusCode, Option<String>) {
+        let dir = www();
+        let app = test::init_service(App::new().configure(config(dir.path()))).await;
+        let first = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+        let etag = first.headers().get("etag").expect("etag").clone();
+        let req = test::TestRequest::get()
+            .uri(path)
+            .insert_header(("if-none-match", etag))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let cc = res
+            .headers()
+            .get(CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_owned());
+        (res.status(), cc)
+    }
+
+    #[actix_web::test]
+    async fn index_304_keeps_no_cache() {
+        let (status, cc) = revalidate("/").await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(cc.as_deref(), Some("no-cache"));
+    }
+
+    #[actix_web::test]
+    async fn hashed_asset_304_keeps_immutable() {
+        let (status, cc) = revalidate("/assets/app-abc123.js").await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(cc.as_deref(), Some("public, max-age=31536000, immutable"));
+    }
 }
