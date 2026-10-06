@@ -10,6 +10,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.38.4] — 2026-10-06
+
+### Fixed
+
+- **After an upgrade the browser could keep running the old interface, and
+  the page then broke: a password-change page, nodes shown as off, a failed
+  upgrade flow, until the browser cache was cleared.** The daemon sent
+  `index.html` with no cache instruction, so browsers guessed how long to
+  keep it (a fraction of its age, hours or days) and never asked again. The
+  old page then asked for script files the new firmware no longer has, and
+  was answered with the web page itself instead of a script, which the
+  browser refuses to run. Now `index.html` is always checked again (a cheap
+  "unchanged" answer when it is), the built files under `/assets/` are kept
+  for a year because their names change with their content, and a file under
+  `/assets/` that does not exist answers 404 rather than the web page. Pages
+  such as `/power-control` still open the interface on a reload, and the API
+  is untouched. Reported by a reader on the Turing Pi Discord.
+
 ## [2.38.3] — 2026-09-23
 
 ### Fixed

@@ -23,6 +23,7 @@ mod streaming_data_service;
 mod tls_store;
 mod usb_boot;
 mod utils;
+mod web_ui;
 
 use crate::api::paths;
 use crate::config::Config;
@@ -31,7 +32,6 @@ use crate::{
     api::legacy, api::metrics, authentication::linux_authenticator::LinuxAuthenticator,
     streaming_data_service::StreamingDataService,
 };
-use actix_files::{Files, NamedFile};
 use actix_http::HttpService;
 use actix_service::map_config;
 use actix_tls::accept::openssl::TlsStream;
@@ -228,7 +228,6 @@ async fn main() -> anyhow::Result<()> {
     let run_server = Server::build()
         .workers(2)
         .bind("bmcd", (config.host.clone(), config.port), move || {
-            let www_root = config.www.clone();
             let app = App::new()
                 .service(
                     web::scope("/api/bmc")
@@ -257,12 +256,9 @@ async fn main() -> anyhow::Result<()> {
                         .configure(crate::api::network::config)
                         .configure(crate::api::address::config),
                 )
-                // Serve a static tree of files of the web UI. Must be the last item.
-                .service(Files::new("/", &config.www).index_file("index.html"))
-                .default_service(web::to(move || {
-                    let www_index = www_root.join("index.html");
-                    NamedFile::open_async(www_index)
-                }));
+                // The web UI. Must be the last item; see `web_ui` for what the
+                // browser may cache.
+                .configure(web_ui::config(&config.www));
 
             HttpService::build()
                 .keep_alive(KeepAlive::Os)
