@@ -15,6 +15,19 @@
 use std::collections::HashMap;
 const NODE_COUNT: u8 = 4;
 
+/// What a Turing Pi 2 v2.4 board showed for one node at start of the daemon,
+/// before the daemon drove anything. `Err` carries why a signal could not be
+/// read.
+///
+/// * `regulator`   `nodeN-power/state` of the `regulator-output` device.
+/// * `enable`      physical level of the `nodeN-en` line, high = asserted (the
+///   same sense [`crate::hal::PowerController::get_power_node`] uses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyNodeReading {
+    pub regulator: Result<bool, String>,
+    pub enable: Result<bool, String>,
+}
+
 /// small helper macro which handles the code duplication of declaring gpio lines.
 #[macro_export]
 macro_rules! gpio_output_lines {

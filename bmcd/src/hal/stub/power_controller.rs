@@ -11,7 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::hal::{helpers::bit_iterator, NodeId};
+use crate::hal::{
+    helpers::{bit_iterator, LegacyNodeReading},
+    NodeId,
+};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -45,9 +48,9 @@ pub struct PowerController {
 }
 
 impl PowerController {
-    pub fn new(is_latching_system: bool) -> anyhow::Result<Self> {
+    pub fn new(is_legacy_dts: bool) -> anyhow::Result<Self> {
         debug!(
-            "stub: power controller, latching system: {is_latching_system}. \
+            "stub: power controller, v2.4 board: {is_legacy_dts}. \
              All node state is in memory and is lost when this process exits."
         );
         Ok(PowerController {
@@ -81,6 +84,11 @@ impl PowerController {
     /// only report what this process has set since it started.
     pub fn get_power_node(&self) -> anyhow::Result<u8> {
         Ok(self.enable.load(Ordering::SeqCst))
+    }
+
+    /// The stub has no v2.4 hardware to read.
+    pub fn legacy_startup_readings(&self) -> Option<&[LegacyNodeReading; 4]> {
+        None
     }
 
     /// Reset a given node by setting the reset pin logically high for 1 second

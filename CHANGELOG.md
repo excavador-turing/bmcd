@@ -10,6 +10,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Experimental, Turing Pi 2 v2.4 only: the daemon now reads node power
+  before it touches it.** A v2.4 board has no latch ICs, and the daemon
+  requested the node enable lines as outputs before reading them, so it only
+  ever read back what it had just driven, never saw a running node, and
+  always took the cold-boot path (every node power-cycled after a BMC
+  reboot). Now the enable lines are read as inputs first and then driven to
+  the level that was read. A node is taken as already running only if its
+  `nodeN-power` regulator state says `enabled` AND its enable line reads
+  asserted. If any node's two signals disagree, a read fails, or all nodes
+  read off, the saved state is restored exactly as before. One new log line
+  prints the raw readings per node and the rule applied, next to the existing
+  `adopted live power state` / `cold boot` lines. The regulator state is a
+  software cache that starts as `disabled`, so on a board whose device tree
+  does not say otherwise this will still fall back to the saved state; it
+  needs a measurement on a v2.4 board before it can be relied on. The v2.5
+  path is unchanged.
+
 ## [2.38.4] — 2026-10-06
 
 ### Fixed

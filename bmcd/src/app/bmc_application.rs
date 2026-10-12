@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::hal::helpers::bit_iterator;
+use crate::hal::{helpers::LegacyNodeReading, PowerController, UsbArchitecture};
 use crate::hal::{NodeId, PinController, UsbMode, UsbRoute};
-use crate::hal::{PowerController, UsbArchitecture};
 use crate::persistency::app_persistency::ApplicationPersistency;
 use crate::persistency::app_persistency::PersistencyBuilder;
 use crate::usb_boot::NodeDrivers;
@@ -118,6 +118,92 @@ fn startup_power_state(live: u8, persisted: u8) -> StartupPowerState {
     } else {
         StartupPowerState::Persisted(persisted)
     }
+}
+
+/// What the two signals of a v2.4 board say about node power at start of the
+/// daemon, boiled down to one decision.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyDecision {
+    /// Every node's regulator and enable line agree. Bit(n) is set for the
+    /// nodes both report on; at least one is.
+    Adopt(u8),
+    /// Every node's regulator and enable line agree that it is off.
+    AllOff,
+    /// At least one node's two signals disagree (1-based node numbers).
+    Disagree(Vec<usize>),
+    /// At least one signal could not be read (1-based node numbers).
+    ReadError(Vec<usize>),
+}
+
+/// Decides, on a v2.4 board, whether the nodes are live.
+///
+/// A node counts as on only if its regulator reports `enabled` AND its enable
+/// line reads asserted. Anything other than a clean agreement on at least one
+/// node being on is not adopted, and the caller restores the persisted state
+/// as it did before this existed:
+///
+/// * a failed read: the reading cannot be trusted,
+/// * disagreement: one signal is stale or the rail was dropped,
+/// * everything off: nothing to preserve.
+fn legacy_power_decision(readings: &[LegacyNodeReading; 4]) -> LegacyDecision {
+    let nodes_where = |pred: &dyn Fn(&LegacyNodeReading) -> bool| -> Vec<usize> {
+        readings
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, r)| pred(r).then_some(idx + 1))
+            .collect()
+    };
+
+    let unreadable = nodes_where(&|r| r.regulator.is_err() || r.enable.is_err());
+    if !unreadable.is_empty() {
+        return LegacyDecision::ReadError(unreadable);
+    }
+    let disagree = nodes_where(&|r| r.regulator != r.enable);
+    if !disagree.is_empty() {
+        return LegacyDecision::Disagree(disagree);
+    }
+    let live = readings
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.enable == Ok(true))
+        .fold(0u8, |acc, (idx, _)| acc | (1 << idx));
+    if live == 0 {
+        LegacyDecision::AllOff
+    } else {
+        LegacyDecision::Adopt(live)
+    }
+}
+
+/// One log line with the raw v2.4 readings and the rule that applied, for a
+/// tester to paste.
+fn legacy_readings_log(readings: &[LegacyNodeReading; 4], decision: &LegacyDecision) -> String {
+    fn show(v: &Result<bool, String>) -> String {
+        match v {
+            Ok(true) => "on".to_string(),
+            Ok(false) => "off".to_string(),
+            Err(e) => format!("error({e})"),
+        }
+    }
+    let nodes = readings
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            format!(
+                "node{}: regulator={} enable={}",
+                idx + 1,
+                show(&r.regulator),
+                show(&r.enable)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rule = match decision {
+        LegacyDecision::Adopt(_) => "regulator and enable agree, nodes on: adopt live state",
+        LegacyDecision::AllOff => "all nodes off: restore persisted state",
+        LegacyDecision::Disagree(_) => "regulator and enable disagree: restore persisted state",
+        LegacyDecision::ReadError(_) => "read failed: restore persisted state",
+    };
+    format!("v2.4 power readings before driving any line: {nodes}; rule: {rule}")
 }
 
 /// Lists the node numbers (1-based) set in the given bit-field, for logging.
@@ -234,10 +320,23 @@ impl BmcApplication {
     /// (a cold boot) the persisted state is restored.
     async fn initialize_power(&self) -> anyhow::Result<()> {
         let persisted = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
-        let live = self.power_controller.get_power_node().unwrap_or_else(|e| {
-            tracing::warn!("cannot read node power state, assuming cold boot: {:#}", e);
-            0
-        });
+        let live = match self.power_controller.legacy_startup_readings() {
+            // v2.4: no latch, the lines were read before being driven and are
+            // now driven to what was read, so reading them again would only
+            // echo that. Use the readings taken then.
+            Some(readings) => {
+                let decision = legacy_power_decision(readings);
+                info!("{}", legacy_readings_log(readings, &decision));
+                match decision {
+                    LegacyDecision::Adopt(state) => state,
+                    _ => 0,
+                }
+            }
+            None => self.power_controller.get_power_node().unwrap_or_else(|e| {
+                tracing::warn!("cannot read node power state, assuming cold boot: {:#}", e);
+                0
+            }),
+        };
 
         let node_states = match startup_power_state(live, persisted) {
             StartupPowerState::Live(state) => {
@@ -604,6 +703,79 @@ impl BmcApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reading(regulator: Result<bool, &str>, enable: Result<bool, &str>) -> LegacyNodeReading {
+        LegacyNodeReading {
+            regulator: regulator.map_err(str::to_string),
+            enable: enable.map_err(str::to_string),
+        }
+    }
+
+    fn all(on: bool) -> [LegacyNodeReading; 4] {
+        std::array::from_fn(|_| reading(Ok(on), Ok(on)))
+    }
+
+    #[test]
+    fn legacy_all_on_and_consistent_is_adopted() {
+        assert_eq!(
+            legacy_power_decision(&all(true)),
+            LegacyDecision::Adopt(0b1111)
+        );
+    }
+
+    #[test]
+    fn legacy_partial_but_consistent_is_adopted() {
+        let mut r = all(false);
+        r[1] = reading(Ok(true), Ok(true));
+        r[3] = reading(Ok(true), Ok(true));
+        assert_eq!(legacy_power_decision(&r), LegacyDecision::Adopt(0b1010));
+    }
+
+    #[test]
+    fn legacy_all_off_is_not_adopted() {
+        assert_eq!(legacy_power_decision(&all(false)), LegacyDecision::AllOff);
+    }
+
+    #[test]
+    fn legacy_disagreement_is_not_adopted() {
+        // Line asserted but regulator says disabled: what a board with an
+        // as-is rail and a stale regulator cache looks like.
+        let mut r = all(true);
+        r[2] = reading(Ok(false), Ok(true));
+        assert_eq!(legacy_power_decision(&r), LegacyDecision::Disagree(vec![3]));
+
+        let mut r = all(false);
+        r[0] = reading(Ok(true), Ok(false));
+        assert_eq!(legacy_power_decision(&r), LegacyDecision::Disagree(vec![1]));
+    }
+
+    #[test]
+    fn legacy_read_error_is_not_adopted() {
+        let mut r = all(true);
+        r[0] = reading(Err("no such file"), Ok(true));
+        r[3] = reading(Ok(true), Err("EBUSY"));
+        assert_eq!(
+            legacy_power_decision(&r),
+            LegacyDecision::ReadError(vec![1, 4])
+        );
+    }
+
+    #[test]
+    fn legacy_log_line_has_raw_readings_and_rule() {
+        let mut r = all(true);
+        r[1] = reading(Err("boom"), Ok(false));
+        let d = legacy_power_decision(&r);
+        let line = legacy_readings_log(&r, &d);
+        assert!(line.contains("node1: regulator=on enable=on"), "{line}");
+        assert!(
+            line.contains("node2: regulator=error(boom) enable=off"),
+            "{line}"
+        );
+        assert!(
+            line.contains("read failed: restore persisted state"),
+            "{line}"
+        );
+    }
 
     #[test]
     fn startup_adopts_live_state_when_any_node_is_on() {
