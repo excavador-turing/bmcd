@@ -4,10 +4,11 @@
 # That is the point: a recipe that only approximates CI tells you nothing when
 # it passes. If CI changes, these change with it.
 #
-# The toolchain is pinned to 1.85.0 to match that workflow, NOT the 1.98.1 the
-# firmware builds with. They differ on purpose: clippy gains lints every
-# release and `-D warnings` would turn this red without anyone touching the
-# code. devbox.json installs the pinned one.
+# The toolchain is pinned to 1.98.1 in rust-toolchain.toml, the same version
+# that workflow installs and the firmware builds with. It is pinned because
+# clippy gains lints every release and `-D warnings` would turn this red
+# without anyone touching the code. devbox.json installs rustup, which reads
+# the pin.
 
 default:
     @just --list
