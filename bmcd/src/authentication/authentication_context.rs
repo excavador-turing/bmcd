@@ -88,12 +88,15 @@ where
     ) -> Result<String, AuthenticationError> {
         self.ban_patrol.patrole_ban(peer)?;
 
+        // An unknown token is refused but not penalised. The store is in
+        // memory, so a restart forgets every session, and an expired token is
+        // removed from it below -- a client still holding either is not
+        // guessing, and a page sends several requests at once. Counting those
+        // banned the operator's address, and their correct password with it.
+        // A token is 64 random alphanumerics; the ban buys nothing against
+        // guessing one. A ban that already stands still applies, above.
         let Some((username, last_access)) = self.token_store.get_mut(token) else {
-            return Err(self
-                .ban_patrol
-                .penalize(peer)
-                .err()
-                .unwrap_or(AuthenticationError::NoMatch(token.to_string())));
+            return Err(AuthenticationError::NoMatch(token.to_string()));
         };
 
         let instant = *last_access;

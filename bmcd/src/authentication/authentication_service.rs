@@ -777,6 +777,74 @@ mod tests {
         }
     }
 
+    /// A token this daemon no longer knows is not a guessed password. The
+    /// store is in memory, so every restart -- every firmware upgrade, every
+    /// power cut -- forgets every session, and an expired token is dropped
+    /// from it too. The browser tab or script still holding one sends it on
+    /// every request until it is told otherwise, and a page fires several of
+    /// those at once.
+    ///
+    /// Those were counted against the peer like wrong passwords, so the tab
+    /// alone could walk its owner up the ban ladder, and the correct password
+    /// typed from the same machine was then refused with a 429. A token is 64
+    /// random alphanumerics, which no one is going to guess, so counting them
+    /// protected nothing.
+    #[actix_web::test]
+    async fn a_token_the_daemon_forgot_does_not_ban_its_owner() {
+        let service = service();
+
+        for attempt in 1..=ATTEMPTS * 2 {
+            let refused = service
+                .call(
+                    rest_call_from(PEER)
+                        .insert_header((
+                            header::AUTHORIZATION,
+                            "Bearer issued-before-the-daemon-restarted",
+                        ))
+                        .to_srv_request(),
+                )
+                .await
+                .expect("the middleware always answers");
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNAUTHORIZED,
+                "stale token, attempt {attempt}"
+            );
+            assert!(challenge(&refused).starts_with("Bearer "));
+        }
+
+        let correct = service
+            .call(
+                rest_call_from(PEER)
+                    .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                    .to_srv_request(),
+            )
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(correct.status(), StatusCode::OK);
+    }
+
+    /// The ban itself is not loosened by that: a peer already banned for wrong
+    /// passwords is refused with a 429 whatever it offers, a token included.
+    #[actix_web::test]
+    async fn a_banned_peer_is_still_refused_with_a_token() {
+        let service = service();
+
+        for _ in 0..ATTEMPTS {
+            let _ = service.call(wrong_password(PEER)).await;
+        }
+
+        let banned = service
+            .call(
+                rest_call_from(PEER)
+                    .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                    .to_srv_request(),
+            )
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(banned.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
     fn retry_after<B>(response: &ServiceResponse<B>) -> u64 {
         response
             .headers()

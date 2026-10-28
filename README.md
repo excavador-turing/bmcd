@@ -214,6 +214,12 @@ ban lapses, not the retries during it. One success clears the peer's counter
 outright. The bookkeeping is in memory only: restarting the daemon forgives
 everyone.
 
+What counts is a wrong password, on `POST /api/bmc/authenticate` or in a
+`Basic` header. A bearer token the daemon does not know is refused with a 401
+but does not count. The token store is in memory too, so after a restart every
+client still holds a token the daemon has forgotten. That is not a guess, and
+a 64-character random token cannot be guessed anyway.
+
 **A ban is answered as a ban, not as a wrong password.** Every other
 authentication failure is the 401 (or, on `POST /api/bmc/authenticate`, the
 403) it has always been; `ExceededAllowedAttempts` is **429 Too Many

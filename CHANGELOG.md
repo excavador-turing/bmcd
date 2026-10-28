@@ -10,6 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session token the daemon had forgotten counted as a wrong password.**
+  Tokens live in memory, so a restart forgets all of them, and an expired
+  token is dropped from the store. A browser tab or script still sending one
+  got a 401 for each request, and each 401 counted toward the peer's ban
+  exactly like a wrong password. A page that fires several requests at once
+  could therefore ban its own address after a BMC reboot, and the correct
+  password typed from that machine was then refused with a 429. An unknown
+  token is still refused with the same 401 and `Bearer` challenge, but no
+  longer counts. A 64-character random token cannot be guessed, so counting
+  it gave no protection. A ban that already stands still refuses tokens.
+
 ## [2.40.0] — 2026-10-15
 
 ### Changed
