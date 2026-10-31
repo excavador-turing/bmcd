@@ -1076,7 +1076,9 @@ pub fn document() -> Value {
                             Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
                             which older clients speak and which is not going away.\n\n\
                             **A board still on its factory password answers 403 to everything here** except \
-                            `/authenticate`, `/access` and `/access/password`. Boards ship as `root` / \
+                            `/authenticate`, `/access`, `/access/password`, `GET /storage` and \
+                            `POST /storage/repair` (a board in safe mode is always on the factory \
+                            password, and these are how its owner is told and can fix it). Boards ship as `root` / \
                             `turing`, which is printed in the quick-start guide and is the same on every \
                             board, so until it is changed the only thing the board will do is let you change \
                             it. The refusal is `application/problem+json` and says so. Requests from the \

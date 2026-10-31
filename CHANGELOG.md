@@ -55,6 +55,17 @@ damaged UBIFS journal; what repaired it was removing the volume with
   sentence and runs nothing. A failed `ubirmvol` is a 500 with what it
   printed, and nothing is rebooted. A second request while one is under way
   is refused.
+- **The two storage endpoints answer on a board still on its factory password.**
+  Everything else is still refused with 403 there. A board that could not
+  mount its settings volume is always on the factory password, because every
+  reboot is a factory reset, so the page that has to tell its owner so is the
+  one the gate shows; making them set a password first would have them set
+  one that is lost at the next reboot. `GET /api/bmc/storage` and `POST
+  /api/bmc/storage/repair` (each for its own method only) are therefore let
+  through the gate. They are still authenticated, and the repair is still
+  refused with 409 unless the board's own facts say it is on offer. The
+  password is public, so anyone holding it could already change it and do
+  everything; this adds no exposure.
 - **The log says it at startup.** One warning when the board is on the
   temporary layer, with the reason, so it is in the log even if nobody opens
   the interface.
