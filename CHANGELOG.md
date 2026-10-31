@@ -10,6 +10,55 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.42.0] — 2026-10-31
+
+When the settings volume (the UBI volume `overlay`, mounted at
+`/mnt/overlay`) cannot be mounted, `/sbin/preinit` does not stop: it boots on
+a writable layer in RAM (`/tmp/safemode`). Every reboot is then a factory
+reset (password `turing`, a new certificate) and nothing says so. The same
+layer is used on purpose when KEY1 is held at power-on. A user hit it with a
+damaged UBIFS journal; what repaired it was removing the volume with
+`ubirmvol /dev/ubi0 -N overlay` and rebooting, so that preinit recreated it.
+
+### Added
+
+- **`GET /api/bmc/storage` says whether the board is keeping its settings.**
+  It answers `{state, reason, detail, backing, repairable, repair_blocker}`.
+  `state` is `persistent`, `temporary` or `unknown`, and it comes from
+  `/proc/mounts`, which is the authority: `temporary` is an overlay on `/`
+  whose upper directory is under `/tmp/safemode/`, `persistent` is an overlay
+  with any other upper directory (normally `/mnt/overlay/upper`). `reason`,
+  only when `temporary`, is `requested` (KEY1), `mount_failed`, or
+  `unrecorded`. Firmware 2.46.0 and later write the reason to
+  `/etc/safemode.reason` (line 1 `reason=...`, the rest free text, which is
+  returned as `detail`, trimmed and cut to 8 KiB); on older firmware, or when
+  the file is missing or unreadable, the reason is `requested` if the kernel
+  command line carries `safemode` and `unrecorded` otherwise. `backing` is
+  `ubi` (the built-in flash), `mmc` (the SD card) or `unknown`, from the
+  device under the read-only root.
+- **`POST /api/bmc/storage/repair` removes the settings volume and reboots.**
+  The body must be `{"confirm": true}` (400 otherwise). It runs `ubirmvol
+  /dev/ubi0 -N overlay` and answers 202 `{"rebooting": true}`; about two
+  seconds later it reboots the BMC the way `tpi reboot` does, and preinit
+  creates a fresh volume on the way up. **This erases the saved settings**
+  (they were not loading, so nothing that worked is lost), and **it reboots
+  the BMC, which on a v2.4 board also power-cycles the four compute
+  modules.** The board comes back as a factory unit: password `turing`, a
+  new certificate. Same authentication as the other mutating endpoints.
+- **Repair is offered only where it is safe, and decided again on every
+  request.** `repairable` is true only when the state is `temporary`, the
+  reason is `mount_failed` or `unrecorded`, the backing is `ubi`, a volume
+  named exactly `overlay` exists under `ubi0`, and nothing is mounted at
+  `/mnt/overlay`. Otherwise `repair_blocker` says why in a sentence (KEY1 was
+  held: reboot without it to use the saved settings; the settings are on the
+  SD card; there is no volume to remove), and `POST` answers 409 with the same
+  sentence and runs nothing. A failed `ubirmvol` is a 500 with what it
+  printed, and nothing is rebooted. A second request while one is under way
+  is refused.
+- **The log says it at startup.** One warning when the board is on the
+  temporary layer, with the reason, so it is in the log even if nobody opens
+  the interface.
+
 ## [2.41.0] — 2026-10-31
 
 The network page assumed the board's only bridge is `br0`. A user report on

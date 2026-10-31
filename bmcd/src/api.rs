@@ -20,6 +20,7 @@ pub mod network;
 pub mod openapi;
 pub mod paths;
 pub mod responses;
+pub mod storage;
 pub mod tls;
 use self::into_legacy_response::{LegacyResponse, LegacyResult};
 use crate::hal::NodeId;
