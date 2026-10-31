@@ -170,7 +170,11 @@ async fn get_presets() -> HttpResponse {
 /// A refusal here is a **200 with a refusal in it**, not a 400. The caller
 /// asked a question and got an answer; it did not make a bad request. The
 /// apply path is where the same refusal becomes a rejection.
-async fn post_validate(body: web::Json<Proposal>) -> Result<HttpResponse, LegacyResponse> {
+async fn post_validate(
+    switch: web::Data<SwitchService>,
+    body: web::Json<Proposal>,
+) -> Result<HttpResponse, LegacyResponse> {
+    switch.bridge_check().map_err(refuse)?;
     let document = match body.into_inner() {
         Proposal::Preset(preset) => preset.expand(),
         Proposal::Document(document) => document,
@@ -231,6 +235,9 @@ const CONFIRM_FROM_THE_BOARD: &str =
 fn refuse(e: SwitchError) -> LegacyResponse {
     match e {
         SwitchError::Change(_) => LegacyResponse::bad_request(e.to_string()),
+        SwitchError::NoBridge(_) => {
+            LegacyResponse::Error(actix_web::http::StatusCode::CONFLICT, e.to_string().into())
+        }
         other => LegacyResponse::from(anyhow::anyhow!("{other}")),
     }
 }

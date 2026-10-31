@@ -14,23 +14,39 @@
 
 use std::path::Path;
 
+use crate::app::address_applier::SystemExec;
+use crate::app::network_interfaces::{self, Snapshot};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-pub fn get_ipv4_address() -> Option<String> {
-    for interface in if_addrs::get_if_addrs().ok()? {
-        // NOTE: for compatibility reasons, only IPv4 of br0 is returned. Ideally, both IPv4 and
-        // IPv6 addresses of all non-loopback interfaces should be returned.
-        if interface.is_loopback() || interface.name != "br0" {
-            continue;
-        }
+/// The IPv4 address and MAC `tpi info` and `/api/bmc?opt=info` report: those
+/// of the board's primary interface.
+///
+/// That is the device of the IPv4 default route, or failing that the first up
+/// interface with a global IPv4 address -- `br0` on a stock board, and
+/// whichever bridge carries the default route on one whose
+/// `/etc/network/interfaces` was split by hand. It used to be `br0` only, so
+/// a board without one reported "Unknown".
+pub fn primary_info(snapshot: &Snapshot) -> (Option<String>, Option<String>) {
+    let mac = snapshot
+        .primary()
+        .map(|i| i.mac.clone())
+        .filter(|m| !m.is_empty());
+    (snapshot.primary_ipv4(), mac)
+}
 
-        let std::net::IpAddr::V4(ip) = interface.ip() else {
-            continue;
-        };
-        return Some(format!("{}", ip));
-    }
-    None
+/// [`primary_info`] for the board as it is now. The MAC falls back to what
+/// the kernel says `br0` has when `ip` had nothing to say.
+pub async fn get_primary_info() -> (Option<String>, String) {
+    let snapshot = tokio::task::spawn_blocking(|| network_interfaces::snapshot(&SystemExec))
+        .await
+        .unwrap_or_default();
+    let (ip, mac) = primary_info(&snapshot);
+    let mac = match mac {
+        Some(mac) => mac,
+        None => get_mac_address(network_interfaces::MANAGED).await,
+    };
+    (ip, mac)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -104,4 +120,34 @@ pub fn get_storage_info() -> Vec<StorageInfo> {
         }
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::network_interfaces::parse_snapshot;
+    use crate::app::network_interfaces::tests::{ADDR_SPLIT, ADDR_STOCK, ROUTE_SPLIT, ROUTE_STOCK};
+
+    #[test]
+    fn tpi_info_on_a_stock_board_is_br0s_address_and_mac() {
+        let (ip, mac) = primary_info(&parse_snapshot(ADDR_STOCK, ROUTE_STOCK));
+        assert_eq!(ip.as_deref(), Some("192.168.77.30"));
+        assert_eq!(mac.as_deref(), Some("aa:bb:cc:00:00:10"));
+    }
+
+    /// The report this exists for: no `br0`, and `tpi info` said "Unknown".
+    #[test]
+    fn tpi_info_on_a_split_board_is_the_default_routes_bridge() {
+        let (ip, mac) = primary_info(&parse_snapshot(ADDR_SPLIT, ROUTE_SPLIT));
+        assert_eq!(ip.as_deref(), Some("10.20.0.5"));
+        assert_eq!(mac.as_deref(), Some("aa:bb:cc:00:00:30"));
+        // Even with no default route there is an address to report.
+        let (ip, _) = primary_info(&parse_snapshot(ADDR_SPLIT, "[]"));
+        assert_eq!(ip.as_deref(), Some("192.168.1.10"));
+    }
+
+    #[test]
+    fn a_board_with_no_address_reports_none() {
+        assert_eq!(primary_info(&Snapshot::default()), (None, None));
+    }
 }

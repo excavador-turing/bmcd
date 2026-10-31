@@ -23,6 +23,7 @@ use crate::api::into_legacy_response::LegacyResponse;
 use crate::app::address_change::{DEFAULT_WINDOW, MAX_WINDOW, MIN_WINDOW};
 use crate::app::address_document::{AddressDocument, Refusal, Warning, MAX_PREFIX, MIN_PREFIX};
 use crate::app::address_service::{AddressError, AddressService};
+use actix_web::http::StatusCode;
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -44,6 +45,10 @@ struct ApplyRequest {
     #[serde(flatten)]
     document: AddressDocument,
     window_s: Option<u64>,
+    /// Say yes to replacing an `interfaces` file somebody wrote by hand. The
+    /// confirmed change keeps a copy of it first.
+    #[serde(default)]
+    replace_hand_written: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,10 +92,18 @@ fn from_the_board_itself(request: &HttpRequest) -> bool {
     matches!(request.extensions().get::<Actor>(), Some(Actor::Loopback))
 }
 
+/// The body is always this daemon's own sentence -- for a failed command it
+/// names the command and what it printed -- in the legacy
+/// `{"response":[{"result": ...}]}` shape every refusal on this API has.
 fn refuse(e: AddressError) -> LegacyResponse {
     match e {
         AddressError::Change(_) => LegacyResponse::bad_request(e.to_string()),
-        other => LegacyResponse::from(anyhow::anyhow!("{other}")),
+        AddressError::NoManagedBridge(_) | AddressError::HandWritten(_) => {
+            LegacyResponse::Error(StatusCode::CONFLICT, e.to_string().into())
+        }
+        AddressError::Apply(_) | AddressError::Io(_) => {
+            LegacyResponse::Error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().into())
+        }
     }
 }
 
@@ -132,7 +145,10 @@ async fn put_address(
         .window_s
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_WINDOW);
-    let pending = address.apply(body.document, window).await.map_err(refuse)?;
+    let pending = address
+        .apply(body.document, window, body.replace_hand_written)
+        .await
+        .map_err(refuse)?;
     tracing::info!(
         "address applied by {}, awaiting confirmation within {}s",
         actor_name(&request),
@@ -173,7 +189,6 @@ async fn post_revert(
 mod tests {
     use super::*;
     use crate::authentication::authentication_context::Actor;
-    use actix_web::http::StatusCode;
     use actix_web::test::TestRequest;
 
     fn request_from(actor: Option<Actor>) -> HttpRequest {
@@ -257,5 +272,119 @@ mod tests {
         let limits: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(limits["window_default_s"], 30);
         assert_eq!(limits["prefix_max"], 30);
+    }
+
+    // --- what the interface reads -----------------------------------------
+
+    use crate::app::address_applier::testing::FakeExec;
+    use crate::app::address_applier::Applier;
+    use crate::app::network_interfaces::tests::{ADDR_SPLIT, ROUTE_SPLIT};
+    use actix_web::ResponseError;
+
+    fn put_body(extra: &str) -> web::Json<ApplyRequest> {
+        let json = format!(r#"{{"mode":"dhcp"{extra}}}"#);
+        web::Json(serde_json::from_str(&json).unwrap())
+    }
+
+    /// The legacy body every refusal on this API has, which is what the
+    /// interface's message helper reads.
+    async fn legacy_body(error: LegacyResponse) -> (StatusCode, String) {
+        let response = error.error_response();
+        let status = response.status();
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            status,
+            body["response"][0]["result"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[actix_web::test]
+    async fn a_change_on_a_board_without_br0_is_a_409_in_the_legacy_shape() {
+        let dir = tempdir::TempDir::new("address-409").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        std::fs::write(&path, "auto br-wan\niface br-wan inet dhcp\n").unwrap();
+        let exec = FakeExec::board(ADDR_SPLIT, ROUTE_SPLIT);
+        let service = web::Data::new(AddressService::load_with(
+            &path,
+            Applier::with(exec.clone(), dir.path()),
+        ));
+        let error = put_address(
+            request_from(None),
+            service.clone(),
+            put_body(r#","replace_hand_written":true"#),
+        )
+        .await
+        .expect_err("no br0");
+        let (status, message) = legacy_body(error).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            message,
+            "This board has no br0 bridge (it has: br-wan, br-lan). The address page manages \
+             br0 only; edit /etc/network/interfaces over SSH, or restore the default layout."
+        );
+        assert!(service.view().await.last_revert.is_none());
+        assert!(exec.changes().is_empty());
+    }
+
+    #[actix_web::test]
+    async fn a_hand_written_file_is_a_409_until_the_request_says_replace_hand_written() {
+        let dir = tempdir::TempDir::new("address-409-hand").expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("net/br0")).unwrap();
+        let path = dir.path().join("interfaces");
+        std::fs::write(
+            &path,
+            "auto br0\niface br0 inet static\n  address 10.1.2.3/16\n",
+        )
+        .unwrap();
+        let exec = FakeExec::board(ADDR_SPLIT, ROUTE_SPLIT);
+        let service = web::Data::new(AddressService::load_with(
+            &path,
+            Applier::with(exec.clone(), dir.path()),
+        ));
+        let error = put_address(request_from(None), service.clone(), put_body(""))
+            .await
+            .expect_err("written by hand");
+        let (status, message) = legacy_body(error).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("was written by hand"), "{message}");
+        assert!(
+            message.contains("Send replace_hand_written to proceed."),
+            "{message}"
+        );
+        assert!(exec.changes().is_empty());
+
+        let ok = put_address(
+            request_from(None),
+            service,
+            put_body(r#","replace_hand_written":true"#),
+        )
+        .await
+        .expect("opted in");
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Any other failure stays a 500, and its body is the daemon's own
+    /// sentence -- the command and what it printed -- not a wrapped copy.
+    #[actix_web::test]
+    async fn a_failed_command_is_a_500_carrying_the_commands_own_message() {
+        let dir = tempdir::TempDir::new("address-500").expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("net/br0")).unwrap();
+        let path = dir.path().join("interfaces");
+        let exec = FakeExec::failing(ADDR_SPLIT, ROUTE_SPLIT, "/sbin/udhcpc");
+        let service = web::Data::new(AddressService::load_with(
+            &path,
+            Applier::with(exec, dir.path()),
+        ));
+        let error = put_address(request_from(None), service, put_body(""))
+            .await
+            .expect_err("udhcpc fails");
+        let (status, message) = legacy_body(error).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(message.starts_with("`/sbin/udhcpc "), "{message}");
+        assert!(message.contains("Cannot find device"), "{message}");
+        assert!(!message.contains("Failed to"), "{message}");
     }
 }
