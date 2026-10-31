@@ -78,7 +78,7 @@ const CONFIRM_FROM_THE_BOARD: &str =
      one came from the board itself, which never used the address at all. Confirm from the \
      interface, or from `tpi` on another machine.";
 
-fn actor_name(request: &HttpRequest) -> String {
+pub(crate) fn actor_name(request: &HttpRequest) -> String {
     use crate::authentication::authentication_context::Actor;
     match request.extensions().get::<Actor>() {
         Some(Actor::User { name, .. }) => name.clone(),

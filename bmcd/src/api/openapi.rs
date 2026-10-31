@@ -686,6 +686,98 @@ fn access_paths() -> Vec<(String, Value)> {
             }),
         ),
         (
+            "/api/bmc/storage".to_string(),
+            json!({
+                "get": {
+                    "summary": "Whether the board is keeping its settings",
+                    "operationId": "getStorage",
+                    "description": "A board that cannot mount its settings volume boots anyway, \
+                                    on a temporary layer in RAM, so every reboot is a factory \
+                                    reset (password `turing`, a new certificate). The same layer \
+                                    is used on purpose when KEY1 is held at power-on. This says \
+                                    which the board is in.\n\n\
+                                    `state` is read from the mount table, which is the authority: \
+                                    `temporary` when `/` is an overlay whose upper directory is \
+                                    under `/tmp/safemode/`, `persistent` for an overlay with any \
+                                    other upper directory (normally `/mnt/overlay/upper`), \
+                                    `unknown` otherwise. `reason`, only when `temporary`, is \
+                                    `requested` (the kernel command line contains `safemode`, \
+                                    i.e. KEY1 was held; this wins over the reason file), \
+                                    `mount_failed`, or `unrecorded` (the firmware before 2.46.0 \
+                                    writes no reason and the key was not held); it is `null` \
+                                    otherwise. `detail` is the free text \
+                                    firmware 2.46.0 and later records with the reason, trimmed and \
+                                    cut to 8 KiB, or `null`. `backing` is what the read-only root \
+                                    is on: `ubi` (the built-in flash), `mmc` (the SD card) or \
+                                    `unknown`.\n\n\
+                                    `repairable` is true only when the state is `temporary`, the \
+                                    reason is `mount_failed` or `unrecorded`, the backing is \
+                                    `ubi`, a UBI volume named `overlay` exists, and nothing is \
+                                    mounted at `/mnt/overlay`. Otherwise `repair_blocker` says \
+                                    why in one sentence.",
+                    "responses": {
+                        "200": { "description": "What the board is running on.",
+                                 "content": { "application/json": { "schema": component_ref("StorageStatus") } } },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/storage/repair".to_string(),
+            json!({
+                "post": {
+                    "summary": "Remove the settings volume that will not mount, and reboot",
+                    "operationId": "repairStorage",
+                    "description": "Runs `ubirmvol /dev/ubi0 -N overlay`, then reboots the BMC \
+                                    about two seconds later so this response can arrive. On the \
+                                    next boot the firmware's preinit finds no settings volume and \
+                                    creates a fresh one.\n\n\
+                                    **This permanently erases what is on the settings volume**: \
+                                    network configuration, certificates, node names, application \
+                                    data. It is not being loaded now, but it cannot be recovered \
+                                    afterwards. A mount failure can be transient, so try a plain \
+                                    reboot first. **It also reboots the BMC**, which on a v2.4 \
+                                    board power-cycles the four compute modules. The board is a \
+                                    factory unit afterwards: password `turing`, a new \
+                                    certificate.\n\n\
+                                    The body must be sent as `Content-Type: application/json`; \
+                                    any other type is a 415. The removal (60 s at most) and the \
+                                    reboot are one piece of work that does not depend on this \
+                                    request staying connected.\n\n\
+                                    Whether repair is on offer is worked out again from the board \
+                                    for every request, from the same facts as `GET \
+                                    /api/bmc/storage`; an earlier answer is never trusted. When it \
+                                    is not, the answer is 409 and the message is that \
+                                    `repair_blocker`, and nothing is run. A failed `ubirmvol` is a \
+                                    500 carrying what it printed; nothing is rebooted.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "properties": { "confirm": { "type": "boolean",
+                            "description": "Must be `true`; anything else is a 400." } },
+                        "required": ["confirm"]
+                    })}}},
+                    "responses": {
+                        "202": { "description": "The volume is removed and the board reboots shortly.",
+                                 "content": { "application/json": { "schema": json!({
+                                     "type": "object",
+                                     "properties": { "rebooting": { "type": "boolean" } },
+                                     "required": ["rebooting"]
+                                 })}}},
+                        "400": { "description": "`confirm` was not `true`, or the body was not the request.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "415": { "description": "The content type was not `application/json`.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "409": { "description": "Repair is not on offer; the message is `repair_blocker`.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "500": { "description": "`ubirmvol` failed or did not finish in 60 s; the message carries what it printed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
             "/api/bmc/tls/certificate".to_string(),
             json!({
                 "get": {
@@ -914,6 +1006,25 @@ pub fn document() -> Value {
         }),
     );
     schema_components.insert(
+        "StorageStatus".to_string(),
+        json!({
+            "type": "object",
+            "description": "Whether the board keeps its settings. See GET /api/bmc/storage.",
+            "properties": {
+                "state": { "type": "string", "enum": ["persistent", "temporary", "unknown"] },
+                "reason": { "type": ["string", "null"], "enum": ["requested", "mount_failed", "unrecorded", null],
+                            "description": "Only when `state` is `temporary`." },
+                "detail": { "type": ["string", "null"], "maxLength": 8192,
+                            "description": "Free text recorded with the reason by firmware 2.46.0 and later." },
+                "backing": { "type": "string", "enum": ["ubi", "mmc", "unknown"] },
+                "repairable": { "type": "boolean" },
+                "repair_blocker": { "type": ["string", "null"],
+                                    "description": "One sentence on why repair is not offered; null when it is." }
+            },
+            "required": ["state", "reason", "detail", "backing", "repairable", "repair_blocker"]
+        }),
+    );
+    schema_components.insert(
         "AccessState".to_string(),
         json!({
             "type": "object",
@@ -977,7 +1088,12 @@ pub fn document() -> Value {
                             Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
                             which older clients speak and which is not going away.\n\n\
                             **A board still on its factory password answers 403 to everything here** except \
-                            `/authenticate`, `/access` and `/access/password`. Boards ship as `root` / \
+                            `/authenticate`, `/access`, `/access/password`, `GET /storage` and \
+                            `POST /storage/repair` (a board in safe mode is always on the factory \
+                            password, and these are how its owner is told and can fix it; this \
+                            opens nothing new, because the stock firmware's sshd already lets \
+                            `root` / `turing` in with a shell, and it must be revisited if SSH is \
+                            ever hardened). Boards ship as `root` / \
                             `turing`, which is printed in the quick-start guide and is the same on every \
                             board, so until it is changed the only thing the board will do is let you change \
                             it. The refusal is `application/problem+json` and says so. Requests from the \
@@ -1067,6 +1183,8 @@ mod tests {
         ("/api/bmc/network/address/revert", "post"),
         ("/api/bmc/network/address/validate", "post"),
         ("/api/bmc/network/address/limits", "get"),
+        ("/api/bmc/storage", "get"),
+        ("/api/bmc/storage/repair", "post"),
     ];
 
     #[test]
@@ -1267,6 +1385,31 @@ mod tests {
     ///
     /// So: build what the board would send, and hold it against what the
     /// document promises.
+    #[test]
+    fn what_the_storage_report_serialises_matches_its_schema() {
+        use crate::app::storage_status::tests::{board_mounts, SAFEMODE_LINE};
+        use crate::app::storage_status::{assess, parse_mounts, Facts};
+        // The null-heavy answer, and one with every field filled.
+        let mut facts = Facts {
+            mounts: parse_mounts(&board_mounts(SAFEMODE_LINE, false)),
+            ..Facts::default()
+        };
+        facts.ubi_volumes = vec!["overlay".to_string()];
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&facts)).unwrap(),
+        );
+        facts.reason_file = Some("reason=mount_failed\nUBIFS error\n".to_string());
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&facts)).unwrap(),
+        );
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&Facts::default())).unwrap(),
+        );
+    }
+
     #[test]
     fn a_board_with_no_promotion_log_still_matches_the_firmware_slots_schema() {
         // `promotion_history` carries skip_serializing_if, so this instance

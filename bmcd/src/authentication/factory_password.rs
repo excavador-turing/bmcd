@@ -21,8 +21,27 @@
 //! the same on every board anyone has ever bought.
 //!
 //! So until it is changed, the daemon answers **403 to everything** except
-//! logging in and changing it. Not a warning banner: a banner is a thing
-//! people close.
+//! logging in and changing it, and the two storage endpoints below. Not a
+//! warning banner: a banner is a thing people close.
+//!
+//! ## The storage endpoints are open on purpose
+//!
+//! A board that could not mount its settings volume runs on a layer in RAM,
+//! and a board on that layer is *always* on the factory password: every
+//! reboot is a factory reset. The page that has to tell its owner so is the
+//! very page this gate shows, and the repair is the only thing that helps.
+//! Making the owner set a password first would have them set one that is
+//! lost at the next reboot, just to reach the button.
+//!
+//! It opens nothing new, and that is the whole argument. The password is
+//! public, and the stock firmware's sshd has `PermitRootLogin yes` and
+//! `PasswordAuthentication yes`, so `root` / `turing` already gives a root
+//! shell and with it `ubirmvol` and `reboot`. **If SSH is ever hardened this
+//! exemption has to be revisited**: it would then be a way to erase the
+//! settings that SSH is not. The repair is still authenticated and still
+//! refused unless the board's own facts say it is on offer. Exactly two
+//! operations are opened, `GET /api/bmc/storage` and `POST
+//! /api/bmc/storage/repair`, each for its own method only.
 //!
 //! ## The factory password, not the first login
 //!
@@ -70,6 +89,7 @@
 //! reason that does not hold is worse than one with a thin reason: the next
 //! person to read it inherits the confidence without the fact.
 
+use actix_web::http::Method;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
@@ -95,14 +115,21 @@ pub const REFUSAL: &str =
 /// obviously. And reading the access card, because that is the page doing the
 /// changing and it needs to know which account it is changing.
 ///
+/// And the two storage operations, each for its own method (see the module
+/// documentation for why they, and only they, are open).
+///
 /// Nothing else, and in particular nothing that reads the board's state: a
 /// stranger who knows the published password should not be able to inventory
-/// somebody's cluster before deciding whether to bother with it.
-fn is_permitted(path: &str) -> bool {
-    matches!(
-        path,
-        "/api/bmc/authenticate" | "/api/bmc/access/password" | "/api/bmc/access"
-    )
+/// somebody's cluster before deciding whether to bother with it. What the
+/// storage report tells such a stranger is whether the board is in safe mode
+/// and why, which a board in that state has no way to keep private anyway.
+fn is_permitted(method: &Method, path: &str) -> bool {
+    match path {
+        "/api/bmc/authenticate" | "/api/bmc/access/password" | "/api/bmc/access" => true,
+        "/api/bmc/storage" => method == Method::GET,
+        "/api/bmc/storage/repair" => method == Method::POST,
+        _ => false,
+    }
 }
 
 /// Whether the board is still on its factory password, cached against the
@@ -127,8 +154,8 @@ impl FactoryPassword {
     }
 
     /// Is this request allowed through?
-    pub fn permits(&self, path: &str) -> bool {
-        is_permitted(path) || !self.still_set()
+    pub fn permits(&self, method: &Method, path: &str) -> bool {
+        is_permitted(method, path) || !self.still_set()
     }
 
     pub fn still_set(&self) -> bool {
@@ -257,9 +284,9 @@ mod tests {
         let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
         let gate = FactoryPassword::new(path);
 
-        assert!(gate.permits("/api/bmc/authenticate"));
-        assert!(gate.permits("/api/bmc/access"));
-        assert!(gate.permits("/api/bmc/access/password"));
+        assert!(gate.permits(&Method::POST, "/api/bmc/authenticate"));
+        assert!(gate.permits(&Method::GET, "/api/bmc/access"));
+        assert!(gate.permits(&Method::POST, "/api/bmc/access/password"));
 
         for refused in [
             "/api/bmc",
@@ -268,7 +295,66 @@ mod tests {
             "/api/bmc/access/client-ca",
             "/api/bmc/serial/status",
         ] {
-            assert!(!gate.permits(refused), "{refused} should be refused");
+            for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                assert!(
+                    !gate.permits(&method, refused),
+                    "{method} {refused} should be refused"
+                );
+            }
+        }
+    }
+
+    /// The storage report and the repair are open on a factory board, each
+    /// for its own method and for nothing else: a board in safe mode is
+    /// always on the factory password, and the repair is the way out.
+    #[test]
+    fn exactly_the_storage_report_and_the_storage_repair_are_opened() {
+        let dir = tempdir::TempDir::new("storage-gate").expect("temp dir");
+        let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
+        let gate = FactoryPassword::new(path);
+
+        assert!(gate.permits(&Method::GET, "/api/bmc/storage"));
+        assert!(gate.permits(&Method::POST, "/api/bmc/storage/repair"));
+
+        // Not the other verb on either, and nothing nearby.
+        for (method, refused) in [
+            (Method::POST, "/api/bmc/storage"),
+            (Method::PUT, "/api/bmc/storage"),
+            (Method::DELETE, "/api/bmc/storage"),
+            (Method::GET, "/api/bmc/storage/repair"),
+            (Method::PUT, "/api/bmc/storage/repair"),
+            (Method::POST, "/api/bmc/storage/other"),
+            (Method::POST, "/api/bmc/storage/repair/x"),
+            (Method::POST, "/api/bmc/storage/"),
+        ] {
+            assert!(
+                !gate.permits(&method, refused),
+                "{method} {refused} should be refused"
+            );
+        }
+
+        // No other mutating endpoint was opened with them.
+        for refused in [
+            "/api/bmc/network/switch",
+            "/api/bmc/network/switch/confirm",
+            "/api/bmc/network/address",
+            "/api/bmc/network/address/confirm",
+            "/api/bmc/tls/certificate",
+            "/api/bmc/access/client-ca",
+            "/api/bmc/reboot",
+            "/api/bmc/firmware/install",
+            "/api/bmc/hostname",
+            "/api/bmc/network/reset",
+            "/api/bmc/usb",
+            "/api/bmc/power",
+            "/api/bmc",
+        ] {
+            for method in [Method::POST, Method::PUT, Method::DELETE] {
+                assert!(
+                    !gate.permits(&method, refused),
+                    "{method} {refused} should be refused"
+                );
+            }
         }
     }
 
@@ -279,7 +365,7 @@ mod tests {
         let dir = tempdir::TempDir::new("open").expect("temp dir");
         let path = shadow(dir.path(), &hash_of("a much better password"));
         let gate = FactoryPassword::new(path);
-        assert!(gate.permits("/api/bmc"));
-        assert!(gate.permits("/api/bmc/network/switch"));
+        assert!(gate.permits(&Method::GET, "/api/bmc"));
+        assert!(gate.permits(&Method::PUT, "/api/bmc/network/switch"));
     }
 }

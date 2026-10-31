@@ -28,6 +28,7 @@ pub mod hostname;
 pub mod network_interfaces;
 pub mod ntp;
 pub mod sdcard_files;
+pub mod storage_status;
 pub mod switch_applier;
 pub mod switch_change;
 pub mod switch_document;

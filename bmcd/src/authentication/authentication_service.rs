@@ -164,7 +164,10 @@ where
             // A factory board cannot be driven from the fleet either. The
             // gateway vouching for a person says nothing about whether this
             // board has been set up.
-            if !self.factory.permits(request.request().uri().path()) {
+            if !self
+                .factory
+                .permits(request.request().method(), request.request().uri().path())
+            {
                 tracing::warn!(
                     "refused {} for {}: this board is still on its factory password",
                     request.request().uri().path(),
@@ -219,7 +222,8 @@ where
                     // now, so that a wrong password is still a wrong password
                     // rather than this message -- which would otherwise tell
                     // a stranger the account name is right.
-                    if !factory.permits(request.request().uri().path()) {
+                    if !factory.permits(request.request().method(), request.request().uri().path())
+                    {
                         tracing::warn!(
                             "refused {}: this board is still on its factory password",
                             request.request().uri().path()
@@ -869,6 +873,96 @@ mod tests {
                 call_on_factory_board(allowed, &shadow).await,
                 StatusCode::OK,
                 "{path} must stay open on a factory board"
+            );
+        }
+    }
+
+    /// A board in safe mode is always on the factory password, and the page
+    /// that says so needs the storage report and the repair. Those two, each
+    /// for its own method, are reachable with a correct credential; still
+    /// authenticated; and nothing else that changes the board was opened.
+    #[actix_web::test]
+    async fn a_factory_board_still_answers_the_storage_report_and_the_repair() {
+        let dir = tempdir::TempDir::new("gate-storage").expect("temp dir");
+        let shadow = factory_shadow(dir.path());
+        let call_as = |request: TestRequest, credential: Option<String>| {
+            let request = request.peer_addr(PEER.parse().expect("a peer address"));
+            match credential {
+                Some(c) => request.insert_header((header::AUTHORIZATION, c)),
+                None => request,
+            }
+            .to_srv_request()
+        };
+        let root = || Some(basic("root", PASSWORD));
+
+        // Open, with a credential.
+        assert_eq!(
+            call_on_factory_board(
+                call_as(TestRequest::get().uri("/api/bmc/storage"), root()),
+                &shadow
+            )
+            .await,
+            StatusCode::OK,
+            "GET /api/bmc/storage must be reachable on a factory board"
+        );
+        assert_eq!(
+            call_on_factory_board(
+                call_as(TestRequest::post().uri("/api/bmc/storage/repair"), root()),
+                &shadow
+            )
+            .await,
+            StatusCode::OK,
+            "POST /api/bmc/storage/repair must be reachable on a factory board"
+        );
+
+        // Without a credential it is a 401, not a way round authentication;
+        // with a wrong one, the same.
+        assert_eq!(
+            call_on_factory_board(
+                call_as(TestRequest::get().uri("/api/bmc/storage"), None),
+                &shadow
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call_on_factory_board(
+                call_as(
+                    TestRequest::post().uri("/api/bmc/storage/repair"),
+                    Some(basic("root", "not the password"))
+                ),
+                &shadow
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Closed: the other verb on each, and the other mutating endpoints.
+        let closed = [
+            TestRequest::post().uri("/api/bmc/storage"),
+            TestRequest::get().uri("/api/bmc/storage/repair"),
+            TestRequest::put().uri("/api/bmc/network/switch"),
+            TestRequest::post().uri("/api/bmc/network/switch/confirm"),
+            TestRequest::put().uri("/api/bmc/network/address"),
+            TestRequest::post().uri("/api/bmc/network/address/confirm"),
+            TestRequest::put().uri("/api/bmc/tls/certificate"),
+            TestRequest::delete().uri("/api/bmc/tls/certificate"),
+            TestRequest::put().uri("/api/bmc/access/client-ca"),
+            TestRequest::post().uri("/api/bmc/firmware/install"),
+            TestRequest::post().uri("/api/bmc/hostname"),
+            TestRequest::post().uri("/api/bmc?opt=set&type=reboot"),
+            TestRequest::get().uri("/api/bmc?opt=set&type=reboot"),
+        ];
+        for request in closed {
+            let request = request.peer_addr(PEER.parse().expect("a peer address"));
+            let request = request
+                .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                .to_srv_request();
+            let (method, uri) = (request.method().clone(), request.uri().clone());
+            assert_eq!(
+                call_on_factory_board(request, &shadow).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must stay closed on a factory board"
             );
         }
     }
