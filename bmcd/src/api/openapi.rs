@@ -701,9 +701,11 @@ fn access_paths() -> Vec<(String, Value)> {
                                     under `/tmp/safemode/`, `persistent` for an overlay with any \
                                     other upper directory (normally `/mnt/overlay/upper`), \
                                     `unknown` otherwise. `reason`, only when `temporary`, is \
-                                    `requested` (KEY1), `mount_failed`, or `unrecorded` (the \
-                                    firmware before 2.46.0 writes no reason and the key was not \
-                                    held); it is `null` otherwise. `detail` is the free text \
+                                    `requested` (the kernel command line contains `safemode`, \
+                                    i.e. KEY1 was held; this wins over the reason file), \
+                                    `mount_failed`, or `unrecorded` (the firmware before 2.46.0 \
+                                    writes no reason and the key was not held); it is `null` \
+                                    otherwise. `detail` is the free text \
                                     firmware 2.46.0 and later records with the reason, trimmed and \
                                     cut to 8 KiB, or `null`. `backing` is what the read-only root \
                                     is on: `ubi` (the built-in flash), `mmc` (the SD card) or \
@@ -731,10 +733,18 @@ fn access_paths() -> Vec<(String, Value)> {
                                     about two seconds later so this response can arrive. On the \
                                     next boot the firmware's preinit finds no settings volume and \
                                     creates a fresh one.\n\n\
-                                    **This erases the saved settings** (they were not loading), \
-                                    and **it reboots the BMC**, which on a v2.4 board also \
-                                    power-cycles the four compute modules. The board is a factory \
-                                    unit afterwards: password `turing`, a new certificate.\n\n\
+                                    **This permanently erases what is on the settings volume**: \
+                                    network configuration, certificates, node names, application \
+                                    data. It is not being loaded now, but it cannot be recovered \
+                                    afterwards. A mount failure can be transient, so try a plain \
+                                    reboot first. **It also reboots the BMC**, which on a v2.4 \
+                                    board power-cycles the four compute modules. The board is a \
+                                    factory unit afterwards: password `turing`, a new \
+                                    certificate.\n\n\
+                                    The body must be sent as `Content-Type: application/json`; \
+                                    any other type is a 415. The removal (60 s at most) and the \
+                                    reboot are one piece of work that does not depend on this \
+                                    request staying connected.\n\n\
                                     Whether repair is on offer is worked out again from the board \
                                     for every request, from the same facts as `GET \
                                     /api/bmc/storage`; an earlier answer is never trusted. When it \
@@ -754,11 +764,13 @@ fn access_paths() -> Vec<(String, Value)> {
                                      "properties": { "rebooting": { "type": "boolean" } },
                                      "required": ["rebooting"]
                                  })}}},
-                        "400": { "description": "`confirm` was not `true`.",
+                        "400": { "description": "`confirm` was not `true`, or the body was not the request.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "415": { "description": "The content type was not `application/json`.",
                                  "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "409": { "description": "Repair is not on offer; the message is `repair_blocker`.",
                                  "content": { "application/json": { "schema": legacy_error.clone() } } },
-                        "500": { "description": "`ubirmvol` failed; the message carries what it printed.",
+                        "500": { "description": "`ubirmvol` failed or did not finish in 60 s; the message carries what it printed.",
                                  "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
@@ -1078,7 +1090,10 @@ pub fn document() -> Value {
                             **A board still on its factory password answers 403 to everything here** except \
                             `/authenticate`, `/access`, `/access/password`, `GET /storage` and \
                             `POST /storage/repair` (a board in safe mode is always on the factory \
-                            password, and these are how its owner is told and can fix it). Boards ship as `root` / \
+                            password, and these are how its owner is told and can fix it; this \
+                            opens nothing new, because the stock firmware's sshd already lets \
+                            `root` / `turing` in with a shell, and it must be revisited if SSH is \
+                            ever hardened). Boards ship as `root` / \
                             `turing`, which is printed in the quick-start guide and is the same on every \
                             board, so until it is changed the only thing the board will do is let you change \
                             it. The refusal is `application/problem+json` and says so. Requests from the \

@@ -33,9 +33,12 @@
 //! Making the owner set a password first would have them set one that is
 //! lost at the next reboot, just to reach the button.
 //!
-//! It adds no exposure. The password is public, so whoever holds it can
-//! already change it and then do everything; the repair removes a volume
-//! that was not loading and reboots, and it is still authenticated and still
+//! It opens nothing new, and that is the whole argument. The password is
+//! public, and the stock firmware's sshd has `PermitRootLogin yes` and
+//! `PasswordAuthentication yes`, so `root` / `turing` already gives a root
+//! shell and with it `ubirmvol` and `reboot`. **If SSH is ever hardened this
+//! exemption has to be revisited**: it would then be a way to erase the
+//! settings that SSH is not. The repair is still authenticated and still
 //! refused unless the board's own facts say it is on offer. Exactly two
 //! operations are opened, `GET /api/bmc/storage` and `POST
 //! /api/bmc/storage/repair`, each for its own method only.

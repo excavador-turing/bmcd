@@ -37,12 +37,21 @@
 //!
 //! ## The repair
 //!
-//! A damaged UBIFS journal makes the volume unmountable and nothing in
-//! preinit repairs it. Removing the volume does: `ubirmvol /dev/ubi0 -N
-//! overlay`, and on the next boot preinit's `mount_overlay` finds no volume
-//! and recreates it with `ubimkvol` and `mkfs.ubifs`. What was on the volume
-//! is gone, which is no loss to speak of -- it was not loading -- and the
-//! board has to reboot to recreate it.
+//! A volume that cannot be mounted (a UBIFS journal that will not replay,
+//! say) stays that way, and nothing in preinit repairs it. Removing the
+//! volume does: `ubirmvol /dev/ubi0 -N overlay`, and on the next boot
+//! preinit's `mount_overlay` finds no volume and recreates it with `ubimkvol`
+//! and `mkfs.ubifs`. **What was on the volume is erased for good** -- network
+//! configuration, certificates, node names, application data. It is not being
+//! loaded now, but it is not recoverable afterwards, and a mount failure can
+//! be transient: a plain reboot is the first thing to try.
+//!
+//! ## KEY1 always wins
+//!
+//! `requested` is decided by the kernel command line before anything else,
+//! whatever the reason file says. Preinit decides safe mode by `grep -q
+//! 'safemode' /proc/cmdline`, a substring match, and so does this: the
+//! conservative direction is the one that blocks the repair.
 //!
 //! All the parsing is pure and takes the text of the file, so it is tested
 //! with captured ones.
@@ -52,6 +61,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 const PROC_MOUNTS: &str = "/proc/mounts";
 const PROC_CMDLINE: &str = "/proc/cmdline";
@@ -68,6 +78,9 @@ const OVERLAY_VOLUME: &str = "overlay";
 const UBI_DEVICE: &str = "/dev/ubi0";
 /// Where preinit puts the writable layer when it cannot use the volume.
 const SAFEMODE_UPPER: &str = "/tmp/safemode";
+/// How long `ubirmvol` gets. It takes a second or two on a healthy volume; a
+/// device that hangs must not hold the repair, and the guard, forever.
+pub const REMOVE_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the free-text part of the reason file is cut to.
 pub const MAX_DETAIL_BYTES: usize = 8 * 1024;
 
@@ -263,10 +276,14 @@ fn cap(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Whether the kernel command line carries the word `safemode`, which is how
-/// preinit learns that KEY1 was held.
+/// Whether the kernel command line mentions `safemode`, which is how preinit
+/// learns that KEY1 was held.
+///
+/// A substring, exactly as preinit tests it (`grep -q 'safemode'
+/// /proc/cmdline`), so `safemode=1` and `x=safemode` count too. Where the two
+/// could disagree, this one errs towards "requested", which blocks the repair.
 pub fn cmdline_requests_safemode(cmdline: &str) -> bool {
-    cmdline.split_whitespace().any(|word| word == "safemode")
+    cmdline.contains("safemode")
 }
 
 /// Whether one of the UBI volumes is named exactly `overlay`.
@@ -359,7 +376,7 @@ pub fn repair_blocker(
     }
     if !volume_present {
         return Some(
-            "There is no settings volume to remove; a normal reboot recreates it.".to_string(),
+            "There is no settings volume to remove; reboot the BMC to recreate it.".to_string(),
         );
     }
     if overlay_is_mounted {
@@ -382,11 +399,13 @@ pub fn assess(facts: &Facts) -> StorageStatus {
             .as_deref()
             .map(parse_reason_file)
             .unwrap_or((None, None));
-        let reason = from_file.unwrap_or(if cmdline_requests_safemode(&facts.cmdline) {
+        // KEY1 wins over whatever the file says: the key is what preinit
+        // acted on, and "requested" is the answer that blocks the repair.
+        let reason = if cmdline_requests_safemode(&facts.cmdline) {
             Reason::Requested
         } else {
-            Reason::Unrecorded
-        });
+            from_file.unwrap_or(Reason::Unrecorded)
+        };
         (Some(reason), detail)
     } else {
         (None, None)
@@ -470,6 +489,8 @@ pub enum RepairError {
     Blocked(String),
     /// `ubirmvol` failed.
     Command(ApplyError),
+    /// `ubirmvol` did not finish in time.
+    Timeout(Duration),
     Join(String),
 }
 
@@ -478,6 +499,11 @@ impl std::fmt::Display for RepairError {
         match self {
             RepairError::Blocked(why) => write!(f, "{why}"),
             RepairError::Command(e) => write!(f, "{e}"),
+            RepairError::Timeout(after) => write!(
+                f,
+                "`ubirmvol` did not finish within {}s; the board was not rebooted",
+                after.as_secs()
+            ),
             RepairError::Join(e) => write!(f, "the repair did not finish: {e}"),
         }
     }
@@ -493,6 +519,7 @@ pub struct StorageService {
     /// Set once the volume has been removed (or is being), so a second
     /// request cannot start a second repair before the board goes down.
     repairing: Arc<AtomicBool>,
+    remove_timeout: Duration,
 }
 
 impl StorageService {
@@ -505,7 +532,14 @@ impl StorageService {
             exec,
             paths,
             repairing: Arc::new(AtomicBool::new(false)),
+            remove_timeout: REMOVE_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_timeout(mut self, remove_timeout: Duration) -> Self {
+        self.remove_timeout = remove_timeout;
+        self
     }
 
     pub fn status(&self) -> StorageStatus {
@@ -523,15 +557,24 @@ impl StorageService {
 
     /// Remove the settings volume. Decided again from the board as it is now,
     /// never from an earlier answer.
+    ///
+    /// The blockers come first, so a request that is refused never touches
+    /// the guard; only a request that is about to run `ubirmvol` takes it.
+    /// After a success it stays taken, on purpose: the board is about to
+    /// reboot and a second repair has nothing to remove. Every failure
+    /// gives it back.
     pub fn repair(&self) -> Result<(), RepairError> {
-        if self.repairing.swap(true, Ordering::SeqCst) {
+        if let Some(why) = self.status().repair_blocker {
+            return Err(RepairError::Blocked(why));
+        }
+        if self
+            .repairing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(RepairError::Blocked(
                 "A repair is already under way; the board is about to reboot.".to_string(),
             ));
-        }
-        if let Some(why) = self.status().repair_blocker {
-            self.repairing.store(false, Ordering::SeqCst);
-            return Err(RepairError::Blocked(why));
         }
         self.exec
             .run("ubirmvol", &[UBI_DEVICE, "-N", OVERLAY_VOLUME])
@@ -542,11 +585,24 @@ impl StorageService {
             })
     }
 
+    /// [`repair`](Self::repair) off the async workers, and not for longer
+    /// than the removal timeout. A timeout gives the guard back (the command
+    /// may still finish in the background; a repair asked for again is
+    /// decided from the board as it is then).
     pub async fn repair_async(&self) -> Result<(), RepairError> {
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.repair())
-            .await
-            .map_err(|e| RepairError::Join(e.to_string()))?
+        let task = tokio::task::spawn_blocking(move || service.repair());
+        match tokio::time::timeout(self.remove_timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                self.repairing.store(false, Ordering::SeqCst);
+                Err(RepairError::Join(e.to_string()))
+            }
+            Err(_) => {
+                self.repairing.store(false, Ordering::SeqCst);
+                Err(RepairError::Timeout(self.remove_timeout))
+            }
+        }
     }
 
     /// One warning at startup when the board is not keeping its settings, so
@@ -775,16 +831,19 @@ pub mod tests {
     }
 
     #[test]
-    fn cmdline_safemode_is_a_whole_word() {
-        assert!(cmdline_requests_safemode("console=ttyS0 safemode ro"));
-        assert!(cmdline_requests_safemode("safemode\n"));
-        assert!(!cmdline_requests_safemode(
-            "console=ttyS0 root=/dev/ubiblock0_0 ro"
-        ));
-        assert!(!cmdline_requests_safemode(
-            "nosafemode safemode=1 mysafemode"
-        ));
-        assert!(!cmdline_requests_safemode(""));
+    fn cmdline_safemode_is_a_substring_match_like_preinits_grep() {
+        for yes in [
+            "console=ttyS0 safemode ro",
+            "safemode\n",
+            "console=ttyS0 safemode=1 ro",
+            "x=safemode",
+            "nosafemode",
+        ] {
+            assert!(cmdline_requests_safemode(yes), "{yes:?}");
+        }
+        for no in ["console=ttyS0 root=/dev/ubiblock0_0 ro", "safe mode", ""] {
+            assert!(!cmdline_requests_safemode(no), "{no:?}");
+        }
     }
 
     // --- ubi volumes -----------------------------------------------------
@@ -871,11 +930,32 @@ pub mod tests {
     }
 
     #[test]
-    fn the_file_wins_over_the_command_line_when_it_parses() {
+    fn key1_wins_over_the_reason_file_but_the_file_still_gives_the_detail() {
+        let mut f = facts(SAFEMODE_LINE);
+        f.reason_file = Some("reason=mount_failed\nUBIFS error\n".to_string());
+        f.cmdline.push_str(" safemode");
+        let status = assess(&f);
+        assert_eq!(status.reason, Some(Reason::Requested));
+        assert_eq!(status.detail.as_deref(), Some("UBIFS error"));
+        assert!(!status.repairable);
+        assert!(status
+            .repair_blocker
+            .unwrap()
+            .starts_with("Safemode was requested"));
+
+        // Requested beats mount_failed, never the reverse: a file that says
+        // requested with no key on the command line is still requested.
+        let mut f = facts(SAFEMODE_LINE);
+        f.reason_file = Some("reason=requested\n".to_string());
+        assert_eq!(assess(&f).reason, Some(Reason::Requested));
+    }
+
+    #[test]
+    fn a_safemode_assignment_on_the_command_line_blocks_the_repair() {
         let mut f = facts(SAFEMODE_LINE);
         f.reason_file = Some("reason=mount_failed\n".to_string());
-        f.cmdline.push_str(" safemode");
-        assert_eq!(assess(&f).reason, Some(Reason::MountFailed));
+        f.cmdline.push_str(" safemode=1");
+        assert_eq!(assess(&f).reason, Some(Reason::Requested));
     }
 
     #[test]
@@ -933,7 +1013,7 @@ pub mod tests {
         // no volume
         assert_eq!(
             blocker(Temporary, Some(MountFailed), Ubi, false, false).unwrap(),
-            "There is no settings volume to remove; a normal reboot recreates it."
+            "There is no settings volume to remove; reboot the BMC to recreate it."
         );
 
         // mounted
@@ -1047,6 +1127,11 @@ pub mod tests {
             }
         }
 
+        /// The same files, run by another `Exec`.
+        pub fn service_with(&self, exec: Arc<dyn Exec>) -> StorageService {
+            StorageService::with(exec, StoragePaths::under(self._dir.path()))
+        }
+
         /// A board whose settings volume would not mount.
         pub fn broken() -> Board {
             Board::new(
@@ -1056,6 +1141,88 @@ pub mod tests {
                 &["rootfs", "overlay"],
             )
         }
+    }
+
+    /// An `Exec` that takes its time, to stand in for a hung `ubirmvol`.
+    pub struct SlowExec {
+        pub delay: Duration,
+        pub calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SlowExec {
+        pub fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(SlowExec {
+                delay,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Exec for SlowExec {
+        fn run(&self, program: &str, args: &[&str]) -> Result<String, ApplyError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            std::thread::sleep(self.delay);
+            Ok(String::new())
+        }
+    }
+
+    fn guard_is_taken(service: &StorageService) -> bool {
+        service.repairing.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_refused_repair_never_takes_the_guard() {
+        // Healthy, KEY1, no volume: each refused before the flag is touched,
+        // so a later repair of a board that does need one is not locked out.
+        for board in [
+            Board::new(PERSISTENT_LINE, None, "ro", &["rootfs", "overlay"]),
+            Board::new(SAFEMODE_LINE, None, "ro safemode", &["rootfs", "overlay"]),
+            Board::new(SAFEMODE_LINE, None, "ro", &["rootfs"]),
+        ] {
+            assert!(matches!(
+                board.service.repair(),
+                Err(RepairError::Blocked(_))
+            ));
+            assert!(!guard_is_taken(&board.service));
+            assert!(board.exec.changes().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_removal_gives_the_guard_back_and_a_successful_one_keeps_it() {
+        let board = Board::broken();
+        *board.exec.fail_prefix.lock().unwrap() = Some("ubirmvol".to_string());
+        assert!(board.service.repair().is_err());
+        assert!(!guard_is_taken(&board.service));
+        board.exec.heal();
+        board.service.repair().unwrap();
+        assert!(guard_is_taken(&board.service));
+    }
+
+    #[actix_web::test]
+    async fn a_hung_ubirmvol_times_out_and_gives_the_guard_back() {
+        let board = Board::broken();
+        let exec = SlowExec::new(Duration::from_millis(400));
+        let service = board
+            .service_with(exec.clone())
+            .with_timeout(Duration::from_millis(50));
+        let Err(RepairError::Timeout(_)) = service.repair_async().await else {
+            panic!("ubirmvol hung");
+        };
+        assert!(!guard_is_taken(&service));
+        assert_eq!(exec.calls.lock().unwrap().len(), 1);
+        let message = RepairError::Timeout(Duration::from_secs(60)).to_string();
+        assert!(message.contains("within 60s"), "{message}");
+    }
+
+    #[actix_web::test]
+    async fn a_successful_async_repair_keeps_the_guard() {
+        let board = Board::broken();
+        board.service.repair_async().await.unwrap();
+        assert!(guard_is_taken(&board.service));
     }
 
     #[test]
