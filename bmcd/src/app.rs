@@ -25,6 +25,7 @@ pub mod firmware_info;
 pub mod firmware_sources;
 pub mod health_info;
 pub mod hostname;
+pub mod network_interfaces;
 pub mod ntp;
 pub mod sdcard_files;
 pub mod switch_applier;

@@ -55,6 +55,9 @@ pub enum RevertReason {
 pub struct RevertRecord {
     pub at: SystemTime,
     pub reason: RevertReason,
+    /// The error text when the apply failed (the command and what it said),
+    /// otherwise one plain sentence about why the change was put back.
+    pub detail: String,
     pub document: AddressDocument,
 }
 
@@ -151,6 +154,17 @@ impl AddressState {
         self.confirmed = Some(document);
     }
 
+    /// The file was read again: what it says now is what a reboot comes back
+    /// to, including "nothing this daemon can read".
+    pub fn set_persisted(&mut self, document: Option<AddressDocument>) {
+        self.confirmed = document;
+    }
+
+    /// A change went through, so an earlier one's failure is no longer news.
+    pub fn clear_last_revert(&mut self) {
+        self.last_revert = None;
+    }
+
     pub fn apply(
         &mut self,
         document: AddressDocument,
@@ -179,19 +193,30 @@ impl AddressState {
     /// The apply did not complete: forget the pending change and put the
     /// snapshot back now. The window is not the recovery for a half-applied
     /// address; the caller's error message is.
-    pub fn apply_failed(&mut self, now: SystemTime) -> Effect {
+    pub fn apply_failed(&mut self, now: SystemTime, detail: String) -> Effect {
         let Some(pending) = self.pending.take() else {
             return Effect::None;
         };
         self.last_revert = Some(RevertRecord {
             at: now,
             reason: RevertReason::ApplyFailed,
+            detail,
             document: pending.document,
         });
         Effect::Apply(pending.snapshot)
     }
 
-    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+    /// What a confirmation with this token would persist, changing nothing.
+    ///
+    /// Confirming is two steps for a caller that must write a file: check,
+    /// write, and only then [`confirm`](Self::confirm). A write that fails
+    /// between the two leaves the change pending, to be confirmed again or
+    /// put back by its window.
+    pub fn check_confirm(
+        &self,
+        token: &str,
+        now: SystemTime,
+    ) -> Result<AddressDocument, ChangeError> {
         let Some(pending) = self.pending.as_ref() else {
             return Err(ChangeError::NothingPending);
         };
@@ -203,9 +228,14 @@ impl AddressState {
             // pending one would write down something that is not running.
             return Err(ChangeError::NothingPending);
         }
-        let document = pending.document.clone();
+        Ok(pending.document.clone())
+    }
+
+    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+        let document = self.check_confirm(token, now)?;
         self.confirmed = Some(document.clone());
         self.pending = None;
+        self.last_revert = None;
         Ok(Effect::Persist(document))
     }
 
@@ -216,6 +246,7 @@ impl AddressState {
         self.last_revert = Some(RevertRecord {
             at: now,
             reason: RevertReason::Requested,
+            detail: "reverted on request before it was confirmed".to_string(),
             document: pending.document,
         });
         Ok(Effect::Apply(pending.snapshot))
@@ -233,6 +264,7 @@ impl AddressState {
         self.last_revert = Some(RevertRecord {
             at: now,
             reason: RevertReason::NotConfirmed,
+            detail: "not confirmed within the window".to_string(),
             document: pending.document,
         });
         Effect::Apply(pending.snapshot)
@@ -339,14 +371,25 @@ mod tests {
         let mut state = AddressState::default();
         applied(&mut state);
         assert_eq!(
-            state.apply_failed(t0()),
+            state.apply_failed(t0(), "`ip` failed: boom".into()),
             Effect::Apply(AddressDocument::Dhcp)
         );
         assert!(state.pending().is_none());
-        assert_eq!(
-            state.last_revert().unwrap().reason,
-            RevertReason::ApplyFailed
-        );
+        let record = state.last_revert().unwrap();
+        assert_eq!(record.reason, RevertReason::ApplyFailed);
+        assert_eq!(record.detail, "`ip` failed: boom");
+        assert_eq!(record.at, t0());
+    }
+
+    #[test]
+    fn a_confirmed_change_clears_the_last_revert() {
+        let mut state = AddressState::default();
+        applied(&mut state);
+        state.apply_failed(t0(), "boom".into());
+        assert!(state.last_revert().is_some());
+        let pending = applied(&mut state);
+        state.confirm(&pending.token, t0()).unwrap();
+        assert!(state.last_revert().is_none());
     }
 
     #[test]

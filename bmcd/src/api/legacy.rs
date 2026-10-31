@@ -16,9 +16,7 @@ use crate::api::into_legacy_response::LegacyResponse;
 use crate::api::into_legacy_response::{LegacyResult, Null};
 use crate::app::bmc_application::NodeInfo;
 use crate::app::bmc_application::{BmcApplication, UsbConfig};
-use crate::app::bmc_info::{
-    get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
-};
+use crate::app::bmc_info::{get_fs_stat, get_net_interfaces, get_primary_info, get_storage_info};
 use crate::app::firmware_catalog;
 use crate::app::firmware_info::get_firmware_slots;
 use crate::app::firmware_sources;
@@ -267,7 +265,7 @@ async fn dispatch_inner(
         ("firmware_slots", false) => get_firmware_slot_info().await.into(),
         ("health", false) => get_health_info().await.into(),
         ("network", false) => get_network_info().await.into(),
-        ("network", true) => reset_network(bmc).await.into(),
+        ("network", true) => reset_network(bmc).await,
         ("nodeinfo", true) => set_node_info().into(),
         ("nodeinfo", false) => get_node_info(bmc).into(),
         ("node_info", false) => get_node_aux_info(bmc).await.into(),
@@ -708,8 +706,17 @@ fn clear_usb_boot(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
     bmc.clear_usb_boot().context("clear USB boot mode")
 }
 
-async fn reset_network(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    bmc.rtl_reset().await.context("reset network switch")
+async fn reset_network(bmc: &BmcApplication) -> LegacyResponse {
+    // Restarting br0 on a board that has none would run `ifdown` on nothing
+    // and report a failure nobody can act on. Say what is wrong instead.
+    let applier = crate::app::address_applier::Applier::system();
+    if let Some(message) = applier.missing_message(
+        "The network restart brings br0 down and up; there is nothing to restart here. Edit \
+         /etc/network/interfaces over SSH, or restore the default layout.",
+    ) {
+        return LegacyResponse::Error(StatusCode::CONFLICT, message.into());
+    }
+    bmc.rtl_reset().await.context("reset network switch").into()
 }
 
 fn set_node_info() -> impl Into<LegacyResponse> {
@@ -839,8 +846,8 @@ fn trim_eeprom_field(value: String) -> Option<String> {
 /// function is here for backwards compliance. Data is mostly a duplication of [`get_about`]
 async fn get_system_information() -> impl Into<LegacyResponse> {
     let build_time = build_time::build_time_utc!("%Y-%m-%d %H:%M:%S-00:00");
-    let ipv4 = get_ipv4_address().unwrap_or("Unknown".to_owned());
-    let mac = get_mac_address("br0").await;
+    let (ipv4, mac) = get_primary_info().await;
+    let ipv4 = ipv4.unwrap_or("Unknown".to_owned());
 
     let mut info = json!(
         {

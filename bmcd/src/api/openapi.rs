@@ -340,6 +340,14 @@ fn access_paths() -> Vec<(String, Value)> {
         "description": "A refusal, RFC 9457.",
         "content": { "application/problem+json": { "schema": component_ref("Problem") } }
     });
+    // The legacy refusal: `{"response":[{"result":"<message>"}]}`.
+    let legacy_error = json!({
+        "type": "object",
+        "properties": { "response": { "type": "array", "items": {
+            "type": "object",
+            "properties": { "result": { "type": "string" } }
+        }}}
+    });
 
     vec![
         (
@@ -420,6 +428,8 @@ fn access_paths() -> Vec<(String, Value)> {
                     })}}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "409": { "description": "The board has no br0, the bridge over the switch ports. Nothing was changed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -505,6 +515,8 @@ fn access_paths() -> Vec<(String, Value)> {
                     })}}},
                     "responses": {
                         "200": { "description": "The verdict: document, refusal, warnings." },
+                        "409": { "description": "The board has no br0, the bridge over the switch ports, so there is nothing to validate against.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -521,7 +533,28 @@ fn access_paths() -> Vec<(String, Value)> {
                                     comes back to, what the bridge actually has right now, any \
                                     change still waiting to be confirmed, and the last revert \
                                     with its reason. `file` says whether the daemon wrote the \
-                                    file, a person did, or the daemon could not read it.",
+                                    file (`bmcd`), a person did (`hand_edited`), or the daemon \
+                                    could not read it (`unreadable`); the file is read again \
+                                    whenever its modification time changes, so a file restored \
+                                    by hand is noticed without a restart.\n\n\
+                                    `live` is the **primary interface**: the device of the \
+                                    IPv4 default route, or failing that the first up, \
+                                    non-loopback interface with a global IPv4 address. \
+                                    `live.interface` is its name (`br0` on a stock board, \
+                                    `br-wan` on one whose `interfaces` file was split by hand) \
+                                    and `live.address` its first global, non-alias address in \
+                                    CIDR form. `interfaces` lists every up, non-loopback \
+                                    interface with at least one global IPv4 address as \
+                                    `{name, addresses[], mac, default_route}`, the default \
+                                    route's first and the rest by name. \
+                                    `managed_interface` is `br0`, the only interface this page \
+                                    can change, and `managed_interface_present` says whether \
+                                    it exists: when it does not, `PUT` answers 409. \
+                                    `last_revert` is `{at, reason, detail, document}`, where \
+                                    `detail` is the error text of a failed apply; a later \
+                                    successful apply or a confirm clears it. `file_backup` is \
+                                    the path of the copy a confirmed change made of a \
+                                    hand-written file, or `null`.",
                     "responses": {
                         "200": { "description": "The address, as the daemon sees it." },
                         "default": problem
@@ -537,13 +570,38 @@ fn access_paths() -> Vec<(String, Value)> {
                                     the window, at the new address, or the board puts the previous \
                                     one back by itself. The bridge and the modules' ports are never \
                                     brought down; only the address on top of them changes. Only a \
-                                    confirmed document is written to `/etc/network/interfaces`.",
+                                    confirmed document is written to `/etc/network/interfaces`.\n\n\
+                                    Two refusals answer **409** before anything is touched, with \
+                                    no pending change and no `last_revert`: the board has no \
+                                    `br0` (the message lists the bridges it does have), or \
+                                    `/etc/network/interfaces` was written by hand and the request \
+                                    does not carry `\"replace_hand_written\": true`. A confirmed \
+                                    change replaces that whole file and first keeps a copy as \
+                                    `/etc/network/interfaces.hand-written.<unix seconds>`; the \
+                                    path is `file_backup` in the view that confirm answers with. \
+                                    (Before 2.41.0 the file was overwritten without a copy.) The \
+                                    image's own default file is not counted as hand-written. \
+                                    Any other failure is a 500 whose message is the command that \
+                                    failed and what it printed.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object",
-                        "description": "An address document, plus an optional window_s."
+                        "description": "An address document, plus an optional window_s and an \
+                                        optional replace_hand_written.",
+                        "properties": {
+                            "window_s": { "type": "integer" },
+                            "replace_hand_written": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Agree to replace a hand-written \
+                                                /etc/network/interfaces on confirm. A copy is \
+                                                kept."
+                            }
+                        }
                     })}}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "409": { "description": "There is no br0 to change, or the interfaces file was written by hand and replace_hand_written was not sent. Nothing was changed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -559,7 +617,10 @@ fn access_paths() -> Vec<(String, Value)> {
                                     apply the old one is gone, so reaching the daemon at all is the \
                                     proof. A confirmation from the board itself never used the \
                                     address and is refused with 403. Writes the document to \
-                                    `/etc/network/interfaces`.",
+                                    `/etc/network/interfaces`; when that file was not written \
+                                    by the daemon, a copy of it is kept first as \
+                                    `/etc/network/interfaces.hand-written.<unix seconds>` and \
+                                    reported as `file_backup`.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object",
                         "properties": { "token": { "type": "string" } },

@@ -86,6 +86,9 @@ pub enum SwitchError {
         detail: String,
     },
     Io(std::io::Error),
+    /// `br0`, the bridge over the switch ports, is not there. Nothing was
+    /// changed.
+    NoBridge(String),
 }
 
 impl std::fmt::Display for SwitchError {
@@ -96,6 +99,7 @@ impl std::fmt::Display for SwitchError {
                 write!(f, "`{command}` failed: {detail}")
             }
             SwitchError::Io(e) => write!(f, "{e}"),
+            SwitchError::NoBridge(m) => write!(f, "{m}"),
         }
     }
 }
@@ -109,6 +113,8 @@ impl From<ChangeError> for SwitchError {
 pub struct SwitchService {
     inner: Mutex<Inner>,
     path: PathBuf,
+    /// Where to look for `br0`; the kernel's, unless a test says otherwise.
+    net_class: PathBuf,
 }
 
 struct Inner {
@@ -143,7 +149,33 @@ impl SwitchService {
                 running: Preset::Flat.expand(),
             }),
             path,
+            net_class: NET_CLASS.into(),
         }
+    }
+
+    /// Look for `br0` somewhere other than the kernel's `/sys/class/net`.
+    #[cfg(test)]
+    pub fn with_net_class(mut self, net_class: impl Into<PathBuf>) -> Self {
+        self.net_class = net_class.into();
+        self
+    }
+
+    /// The switch is configured through `br0`. On a board whose
+    /// `/etc/network/interfaces` has no such bridge there is nothing to
+    /// configure, and the commands would fail one by one with the kernel's
+    /// "Cannot find device"; this says so once, with what the board has.
+    pub fn bridge_check(&self) -> Result<(), SwitchError> {
+        if crate::app::network_interfaces::managed_present(&self.net_class) {
+            return Ok(());
+        }
+        Err(SwitchError::NoBridge(
+            crate::app::network_interfaces::missing_message(
+                &self.net_class,
+                &crate::app::network_interfaces::snapshot(&crate::app::address_applier::SystemExec),
+                "The switch settings apply to br0, the bridge over the switch ports; edit \
+                 /etc/network/interfaces over SSH, or restore the default layout.",
+            ),
+        ))
     }
 
     /// Put the confirmed document on the switch at boot.
@@ -197,6 +229,7 @@ impl SwitchService {
         document: SwitchDocument,
         window: Duration,
     ) -> Result<Pending, SwitchError> {
+        self.bridge_check()?;
         let mut inner = self.inner.lock().await;
         let running = inner.running.clone();
         let token = new_token();
@@ -531,6 +564,32 @@ mod tests {
     #[test]
     fn an_unreadable_command_line_is_not_safe_mode() {
         assert!(!is_safemode(Path::new("/nonexistent/cmdline")));
+    }
+
+    /// A board with no `br0` is told so, once, and nothing is run.
+    #[tokio::test]
+    async fn without_br0_an_apply_is_refused_before_anything_is_run() {
+        let dir = tempdir::TempDir::new("switch-nobridge").expect("temp dir");
+        let net = dir.path().join("net");
+        std::fs::create_dir_all(net.join("br-wan/bridge")).unwrap();
+        let service = SwitchService::load(dir.path().join("switch.json")).with_net_class(&net);
+        let error = service
+            .apply(Preset::Split.expand(), DEFAULT_WINDOW)
+            .await
+            .expect_err("no br0");
+        let SwitchError::NoBridge(message) = error else {
+            panic!("expected NoBridge, got {error}");
+        };
+        assert!(
+            message.starts_with("This board has no br0 bridge (it has:"),
+            "{message}"
+        );
+        assert!(message.contains("br-wan"), "{message}");
+        assert!(service.view().await.pending.is_none());
+        assert!(service.view().await.last_revert.is_none());
+
+        std::fs::create_dir_all(net.join("br0")).unwrap();
+        assert!(service.bridge_check().is_ok());
     }
 
     #[test]
