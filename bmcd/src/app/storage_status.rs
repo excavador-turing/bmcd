@@ -69,6 +69,7 @@ const PROC_CMDLINE: &str = "/proc/cmdline";
 /// `reason=mount_failed`; the rest is free text for a person.
 const REASON_FILE: &str = "/etc/safemode.reason";
 const SYS_CLASS_UBI: &str = "/sys/class/ubi";
+const SYS_CLASS_BLOCK: &str = "/sys/class/block";
 /// Where preinit mounts the settings volume.
 const OVERLAY_MOUNT: &str = "/mnt/overlay";
 /// The name of the UBI volume preinit mounts there and recreates when it is
@@ -219,17 +220,59 @@ fn is_safemode_upper(dir: &str) -> bool {
     dir == SAFEMODE_UPPER || dir.starts_with("/tmp/safemode/")
 }
 
-/// What the read-only root file system is on: `/mnt/rom` when preinit mounted
-/// the image there, otherwise `/`. A root that is itself the overlay has no
-/// block device behind it and reads as unknown.
-pub fn backing_from_mounts(mounts: &[MountEntry]) -> Backing {
-    let root = ["/mnt/rom", "/"]
-        .iter()
-        .find_map(|point| mounts.iter().rev().find(|m| m.mountpoint == *point));
-    let Some(root) = root else {
-        return Backing::Unknown;
-    };
-    let name = root.device.strip_prefix("/dev/").unwrap_or(&root.device);
+/// A block device the kernel knows, as `/sys/class/block/<name>/dev` says:
+/// its name and its `MAJOR:MINOR`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockDevice {
+    pub name: String,
+    pub dev: String,
+}
+
+/// The kernel's `root=` argument, if the command line has one. The last wins,
+/// as it does for the kernel.
+pub fn cmdline_root(cmdline: &str) -> Option<&str> {
+    cmdline
+        .split_whitespace()
+        .rev()
+        .find_map(|word| word.strip_prefix("root="))
+}
+
+/// The device name a kernel `root=` value stands for, or `None` when it does
+/// not say (or cannot be worked out here).
+///
+/// - `254:0` is `MAJOR:MINOR`, looked up among `devices`;
+/// - `/dev/mmcblk0p2` (or the bare `mmcblk0p2`) is its own name;
+/// - `PARTUUID=`, `PARTLABEL=`, `UUID=`, `LABEL=`, `ubi0:rootfs` and the like
+///   are not resolved: they stay unknown, which blocks the repair.
+pub fn root_device_name(root: &str, devices: &[BlockDevice]) -> Option<String> {
+    let root = root.trim();
+    if let Some((major, minor)) = root.split_once(':') {
+        let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if !(numeric(major) && numeric(minor)) {
+            return None;
+        }
+        // 254:0 and 254:00 are the same device.
+        let canonical = format!(
+            "{}:{}",
+            major.trim_start_matches('0').parse::<u32>().ok()?,
+            minor.trim_start_matches('0').parse::<u32>().unwrap_or(0)
+        );
+        return devices
+            .iter()
+            .find(|d| d.dev == canonical)
+            .map(|d| d.name.clone());
+    }
+    if root.contains('=') {
+        return None;
+    }
+    let name = root.strip_prefix("/dev/").unwrap_or(root);
+    if name.is_empty() || name == "root" || name.contains('/') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn classify_device(name: &str) -> Backing {
     if name.starts_with("ubiblock") {
         Backing::Ubi
     } else if name.starts_with("mmcblk") {
@@ -237,6 +280,37 @@ pub fn backing_from_mounts(mounts: &[MountEntry]) -> Backing {
     } else {
         Backing::Unknown
     }
+}
+
+/// What the read-only root file system is on: `/mnt/rom` when preinit mounted
+/// the image there, otherwise `/`.
+///
+/// The mount source is the device when it names one (`/dev/ubiblock0_1`). On a
+/// board whose kernel mounted the root itself it is the pseudo-name
+/// `/dev/root`, which is not a node and says nothing; then the kernel's own
+/// `root=` argument is resolved instead, a `MAJOR:MINOR` through the block
+/// devices in sysfs. A root that is itself the overlay has no device behind it
+/// and is treated the same way. Anything that cannot be resolved is
+/// `unknown`, which does not offer the repair.
+pub fn backing_from_mounts(
+    mounts: &[MountEntry],
+    cmdline: &str,
+    devices: &[BlockDevice],
+) -> Backing {
+    let root = ["/mnt/rom", "/"]
+        .iter()
+        .find_map(|point| mounts.iter().rev().find(|m| m.mountpoint == *point));
+    let Some(root) = root else {
+        return Backing::Unknown;
+    };
+    let telling = root.device.starts_with("/dev/") && root.device != "/dev/root";
+    if telling {
+        return classify_device(root.device.strip_prefix("/dev/").unwrap_or(&root.device));
+    }
+    cmdline_root(cmdline)
+        .and_then(|value| root_device_name(value, devices))
+        .map(|name| classify_device(&name))
+        .unwrap_or(Backing::Unknown)
 }
 
 /// Whether anything is mounted at `/mnt/overlay`.
@@ -307,6 +381,26 @@ pub fn read_ubi_volume_names(sys_class_ubi: &Path) -> Vec<String> {
     names
 }
 
+/// The block devices under `<sys>/class/block/<name>/dev`, which holds
+/// `MAJOR:MINOR`. A device whose file cannot be read is left out.
+pub fn read_block_devices(sys_class_block: &Path) -> Vec<BlockDevice> {
+    let Ok(dir) = std::fs::read_dir(sys_class_block) else {
+        return Vec::new();
+    };
+    let mut devices: Vec<BlockDevice> = dir
+        .flatten()
+        .filter_map(|e| {
+            let dev = std::fs::read_to_string(e.path().join("dev")).ok()?;
+            Some(BlockDevice {
+                name: e.file_name().into_string().ok()?,
+                dev: dev.trim().to_string(),
+            })
+        })
+        .collect();
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    devices
+}
+
 // --- the decision --------------------------------------------------------
 
 /// What the board is, as read; [`assess`] turns it into an answer.
@@ -317,6 +411,9 @@ pub struct Facts {
     pub reason_file: Option<String>,
     pub cmdline: String,
     pub ubi_volumes: Vec<String>,
+    /// The block devices in sysfs, to resolve a `root=` given as
+    /// `MAJOR:MINOR`.
+    pub block_devices: Vec<BlockDevice>,
 }
 
 /// Why repair is not offered, or `None` when it is.
@@ -392,7 +489,7 @@ pub fn repair_blocker(
 /// The answer, from what was read.
 pub fn assess(facts: &Facts) -> StorageStatus {
     let state = state_from_mounts(&facts.mounts);
-    let backing = backing_from_mounts(&facts.mounts);
+    let backing = backing_from_mounts(&facts.mounts, &facts.cmdline, &facts.block_devices);
     let (reason, detail) = if state == State::Temporary {
         let (from_file, detail) = facts
             .reason_file
@@ -437,6 +534,7 @@ pub struct StoragePaths {
     cmdline: PathBuf,
     reason: PathBuf,
     ubi: PathBuf,
+    block: PathBuf,
 }
 
 impl StoragePaths {
@@ -446,6 +544,7 @@ impl StoragePaths {
             cmdline: PROC_CMDLINE.into(),
             reason: REASON_FILE.into(),
             ubi: SYS_CLASS_UBI.into(),
+            block: SYS_CLASS_BLOCK.into(),
         }
     }
 
@@ -456,6 +555,7 @@ impl StoragePaths {
             cmdline: root.join("cmdline"),
             reason: root.join("safemode.reason"),
             ubi: root.join("ubi"),
+            block: root.join("block"),
         }
     }
 
@@ -467,6 +567,7 @@ impl StoragePaths {
             reason_file: read_capped(&self.reason),
             cmdline: std::fs::read_to_string(&self.cmdline).unwrap_or_default(),
             ubi_volumes: read_ubi_volume_names(&self.ubi),
+            block_devices: read_block_devices(&self.block),
         }
     }
 }
@@ -658,6 +759,7 @@ pub mod tests {
             reason_file: None,
             cmdline: "console=ttyS0,115200 root=/dev/ubiblock0_0 ro".to_string(),
             ubi_volumes: vec!["overlay".to_string(), "rootfs".to_string()],
+            block_devices: Vec::new(),
         }
     }
 
@@ -729,32 +831,35 @@ pub mod tests {
     #[test]
     fn backing_follows_the_read_only_root() {
         let ubi = parse_mounts(&board_mounts(SAFEMODE_LINE, false));
-        assert_eq!(backing_from_mounts(&ubi), Backing::Ubi);
+        assert_eq!(backing_from_mounts(&ubi, "", &[]), Backing::Ubi);
 
         let mmc = parse_mounts(
             "/dev/mmcblk0p2 /mnt/rom ext4 ro,relatime 0 0\n\
              overlay / overlay rw,upperdir=/tmp/safemode/upper,workdir=/w 0 0\n",
         );
-        assert_eq!(backing_from_mounts(&mmc), Backing::Mmc);
+        assert_eq!(backing_from_mounts(&mmc, "", &[]), Backing::Mmc);
 
         // No /mnt/rom: the root itself, when it is a block device.
         let direct = parse_mounts("/dev/ubiblock0_0 / squashfs ro 0 0\n");
-        assert_eq!(backing_from_mounts(&direct), Backing::Ubi);
+        assert_eq!(backing_from_mounts(&direct, "", &[]), Backing::Ubi);
         let direct = parse_mounts("/dev/mmcblk1p1 / ext4 rw 0 0\n");
-        assert_eq!(backing_from_mounts(&direct), Backing::Mmc);
+        assert_eq!(backing_from_mounts(&direct, "", &[]), Backing::Mmc);
 
         // /mnt/rom wins over /.
         let both = parse_mounts(
             "/dev/mmcblk0p1 / ext4 rw 0 0\n/dev/ubiblock0_0 /mnt/rom squashfs ro 0 0\n",
         );
-        assert_eq!(backing_from_mounts(&both), Backing::Ubi);
+        assert_eq!(backing_from_mounts(&both, "", &[]), Backing::Ubi);
 
         // An overlay root with no /mnt/rom has no device behind it.
         let overlay_only = parse_mounts(SAFEMODE_LINE);
-        assert_eq!(backing_from_mounts(&overlay_only), Backing::Unknown);
-        assert_eq!(backing_from_mounts(&[]), Backing::Unknown);
+        assert_eq!(
+            backing_from_mounts(&overlay_only, "", &[]),
+            Backing::Unknown
+        );
+        assert_eq!(backing_from_mounts(&[], "", &[]), Backing::Unknown);
         let other = parse_mounts("/dev/sda1 / ext4 rw 0 0\n");
-        assert_eq!(backing_from_mounts(&other), Backing::Unknown);
+        assert_eq!(backing_from_mounts(&other, "", &[]), Backing::Unknown);
     }
 
     #[test]
@@ -844,6 +949,203 @@ pub mod tests {
         for no in ["console=ttyS0 root=/dev/ubiblock0_0 ro", "safe mode", ""] {
             assert!(!cmdline_requests_safemode(no), "{no:?}");
         }
+    }
+
+    // --- a real board: the root is /dev/root -----------------------------
+
+    /// Board B, firmware v2.46.0, as it is: the root device is the kernel's
+    /// pseudo-name `/dev/root`, which is not a node.
+    const REAL_MOUNTS: &str = "\
+/dev/root /mnt/rom erofs ro,relatime,user_xattr,acl,cache_strategy=readaround 0 0
+/dev/ubi0_2 /mnt/overlay ubifs rw,relatime,assert=read-only,ubi=0,vol=2 0 0
+overlay / overlay rw,relatime,lowerdir=/,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work 0 0
+/dev/mmcblk0p1 /mnt/sdcard ext4 rw,relatime 0 0
+";
+    const REAL_CMDLINE: &str = "loglevel=4 cma=8M init=/sbin/preinit rootwait=5 ubi.mtd=ubi ubi.block=0,rootfs_new root=254:0 postupdate";
+
+    fn real_block_devices() -> Vec<BlockDevice> {
+        [
+            ("mmcblk0", "179:0"),
+            ("mmcblk0p1", "179:1"),
+            ("ubiblock0_1", "254:0"),
+            ("loop0", "7:0"),
+        ]
+        .iter()
+        .map(|(name, dev)| BlockDevice {
+            name: name.to_string(),
+            dev: dev.to_string(),
+        })
+        .collect()
+    }
+
+    fn real_facts() -> Facts {
+        Facts {
+            mounts: parse_mounts(REAL_MOUNTS),
+            reason_file: None,
+            cmdline: REAL_CMDLINE.to_string(),
+            ubi_volumes: vec!["rootfs_new".to_string(), "overlay".to_string()],
+            block_devices: real_block_devices(),
+        }
+    }
+
+    #[test]
+    fn the_kernels_root_argument_is_found() {
+        assert_eq!(cmdline_root(REAL_CMDLINE), Some("254:0"));
+        assert_eq!(cmdline_root("a root=/dev/x root=254:0 b"), Some("254:0"));
+        assert_eq!(cmdline_root("rootwait=5 console=ttyS0"), None);
+        assert_eq!(cmdline_root(""), None);
+    }
+
+    #[test]
+    fn a_root_argument_is_resolved_to_a_device_name() {
+        let devices = real_block_devices();
+        assert_eq!(
+            root_device_name("254:0", &devices).as_deref(),
+            Some("ubiblock0_1")
+        );
+        assert_eq!(
+            root_device_name("254:00", &devices).as_deref(),
+            Some("ubiblock0_1")
+        );
+        assert_eq!(
+            root_device_name("179:1", &devices).as_deref(),
+            Some("mmcblk0p1")
+        );
+        assert_eq!(
+            root_device_name("/dev/mmcblk0p2", &devices).as_deref(),
+            Some("mmcblk0p2")
+        );
+        assert_eq!(
+            root_device_name("mmcblk0p2", &devices).as_deref(),
+            Some("mmcblk0p2")
+        );
+        // Not resolvable here: fail closed.
+        for unresolvable in [
+            "254:1",
+            "8:abc",
+            ":0",
+            "PARTUUID=0a1b2c3d-02",
+            "PARTLABEL=rootfs",
+            "UUID=1234",
+            "LABEL=root",
+            "ubi0:rootfs",
+            "/dev/root",
+            "/dev/disk/by-label/x",
+            "",
+        ] {
+            assert_eq!(
+                root_device_name(unresolvable, &devices),
+                None,
+                "{unresolvable:?}"
+            );
+        }
+        assert_eq!(root_device_name("254:0", &[]), None);
+    }
+
+    #[test]
+    fn the_real_board_backs_on_ubi() {
+        let mounts = parse_mounts(REAL_MOUNTS);
+        assert_eq!(
+            backing_from_mounts(&mounts, REAL_CMDLINE, &real_block_devices()),
+            Backing::Ubi
+        );
+        // The same board with an SD-card root.
+        let sd = REAL_CMDLINE.replace("root=254:0", "root=179:1");
+        assert_eq!(
+            backing_from_mounts(&mounts, &sd, &real_block_devices()),
+            Backing::Mmc
+        );
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_resolved_stays_unknown() {
+        let mounts = parse_mounts(REAL_MOUNTS);
+        let devices = real_block_devices();
+        // sysfs unreadable, no root=, an unresolvable root=, a root= that is
+        // some other device.
+        assert_eq!(
+            backing_from_mounts(&mounts, REAL_CMDLINE, &[]),
+            Backing::Unknown
+        );
+        assert_eq!(
+            backing_from_mounts(&mounts, "loglevel=4 postupdate", &devices),
+            Backing::Unknown
+        );
+        for root in ["PARTUUID=0a1b2c3d-02", "254:9", "7:0", "/dev/sda1"] {
+            let cmdline = format!("loglevel=4 root={root}");
+            assert_eq!(
+                backing_from_mounts(&mounts, &cmdline, &devices),
+                Backing::Unknown,
+                "{root}"
+            );
+        }
+        // A mount source that is a real node that is neither is not
+        // second-guessed by the command line.
+        let sda = parse_mounts("/dev/sda1 /mnt/rom ext4 ro 0 0\n");
+        assert_eq!(
+            backing_from_mounts(&sda, REAL_CMDLINE, &devices),
+            Backing::Unknown
+        );
+    }
+
+    #[test]
+    fn the_real_persistent_board_is_ubi_and_has_nothing_to_repair() {
+        let status = assess(&real_facts());
+        assert_eq!(status.state, State::Persistent);
+        assert_eq!(status.backing, Backing::Ubi);
+        assert!(!status.repairable);
+        assert!(status.repair_blocker.unwrap().contains("nothing to repair"));
+    }
+
+    #[test]
+    fn the_real_board_in_safemode_is_repairable() {
+        let mut f = real_facts();
+        // preinit could not mount the volume: the root is the tmpfs layer
+        // and nothing is at /mnt/overlay.
+        f.mounts = parse_mounts(
+            "/dev/root /mnt/rom erofs ro,relatime,user_xattr,acl,cache_strategy=readaround 0 0\n\
+             overlay / overlay rw,relatime,lowerdir=/,upperdir=/tmp/safemode/upper,workdir=/tmp/safemode/work 0 0\n\
+             /dev/mmcblk0p1 /mnt/sdcard ext4 rw,relatime 0 0\n",
+        );
+        for reason_file in [None, Some("reason=mount_failed\nUBIFS error\n".to_string())] {
+            f.reason_file = reason_file;
+            let status = assess(&f);
+            assert_eq!(status.state, State::Temporary);
+            assert_eq!(status.backing, Backing::Ubi);
+            assert!(status.repairable, "{status:?}");
+            assert_eq!(status.repair_blocker, None);
+        }
+        assert_eq!(assess(&f).reason, Some(Reason::MountFailed));
+
+        // ... but not with KEY1 held, nor with nothing resolvable.
+        f.cmdline.push_str(" safemode");
+        assert!(!assess(&f).repairable);
+        f.cmdline = REAL_CMDLINE.to_string();
+        f.block_devices.clear();
+        let status = assess(&f);
+        assert_eq!(status.backing, Backing::Unknown);
+        assert!(!status.repairable);
+    }
+
+    #[test]
+    fn the_service_resolves_the_root_through_sysfs_files() {
+        let dir = tempdir::TempDir::new("real-board").unwrap();
+        std::fs::write(dir.path().join("mounts"), REAL_MOUNTS).unwrap();
+        std::fs::write(dir.path().join("cmdline"), format!("{REAL_CMDLINE}\n")).unwrap();
+        for (name, dev) in [("ubiblock0_1", "254:0"), ("mmcblk0", "179:0")] {
+            let path = dir.path().join("block").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("dev"), format!("{dev}\n")).unwrap();
+        }
+        // A directory without a dev file is left out, not an error.
+        std::fs::create_dir_all(dir.path().join("block/odd")).unwrap();
+        let service =
+            StorageService::with(FakeExec::board("", ""), StoragePaths::under(dir.path()));
+        let status = service.status();
+        assert_eq!(status.backing, Backing::Ubi);
+        assert_eq!(status.state, State::Persistent);
+        assert_eq!(read_block_devices(&dir.path().join("block")).len(), 2);
+        assert!(read_block_devices(&dir.path().join("missing")).is_empty());
     }
 
     // --- ubi volumes -----------------------------------------------------
