@@ -22,9 +22,10 @@
 //! address" asks here, so a stock board and a split one give the same kind
 //! of answer.
 //!
-//! The *primary* interface is the device of the IPv4 default route, or, with
-//! no default route, the first up non-loopback interface that has a global
-//! IPv4 address. Its address is the first global (`scope global`) one that is
+//! The *primary* interface is `br0` when it exists and has a global IPv4
+//! address; otherwise the device of the IPv4 default route, or, with no
+//! default route, the first up non-loopback interface that has a global IPv4
+//! address. Its address is the first global (`scope global`) one that is
 //! not an alias (`br0:1`) -- a secondary address never wins over the main one.
 //!
 //! The parsing is pure and takes the JSON `ip -j -4 addr show` and `ip -j -4
@@ -61,15 +62,22 @@ pub struct DefaultRoute {
 pub struct Snapshot {
     /// Default route first, then by name.
     pub interfaces: Vec<InterfaceInfo>,
-    /// The gateway of the route that made an interface primary, else of the
-    /// best default route.
+    /// The gateway of the default route that leaves through the primary
+    /// interface. A default route through some other device is not this
+    /// interface's gateway; with no interface at all, the best route's.
     pub gateway: Option<Ipv4Addr>,
 }
 
 impl Snapshot {
-    /// The board's own interface: the default route's, else the first.
+    /// The board's own interface: `br0` when it exists and has an address
+    /// (so a USB modem, a VPN or a late DHCP lease elsewhere never takes the
+    /// page away from the bridge it manages), otherwise the default route's
+    /// device, otherwise the first.
     pub fn primary(&self) -> Option<&InterfaceInfo> {
-        self.interfaces.first()
+        self.interfaces
+            .iter()
+            .find(|i| i.name == MANAGED)
+            .or_else(|| self.interfaces.first())
     }
 
     /// The primary address without its prefix length.
@@ -183,16 +191,18 @@ pub fn parse_interfaces(addr_json: &str, routes: &[DefaultRoute]) -> Vec<Interfa
 pub fn parse_snapshot(addr_json: &str, route_json: &str) -> Snapshot {
     let routes = parse_default_routes(route_json);
     let interfaces = parse_interfaces(addr_json, &routes);
-    let gateway = interfaces
-        .first()
-        .filter(|i| i.default_route)
-        .and_then(|i| routes.iter().find(|r| r.dev == i.name))
-        .or_else(|| routes.first())
-        .and_then(|r| r.gateway);
-    Snapshot {
+    let mut snapshot = Snapshot {
         interfaces,
-        gateway,
-    }
+        gateway: None,
+    };
+    snapshot.gateway = match snapshot.primary() {
+        Some(primary) => routes
+            .iter()
+            .find(|r| r.dev == primary.name)
+            .and_then(|r| r.gateway),
+        None => routes.first().and_then(|r| r.gateway),
+    };
+    snapshot
 }
 
 /// Ask the kernel. A failed `ip` is an empty answer, the same as a board with
@@ -349,6 +359,52 @@ pub mod tests {
         assert_eq!(primary.addresses[0], "192.168.77.30/24");
         assert_eq!(primary.addresses.len(), 3, "link-local is not listed");
         assert_eq!(snapshot.primary_ipv4().as_deref(), Some("192.168.77.30"));
+    }
+
+    /// A USB modem or a VPN holds the default route; the bridge the page
+    /// manages is still the board's own interface.
+    #[test]
+    fn br0_stays_primary_when_another_interface_holds_the_default_route() {
+        let addr = r#"[
+          {"ifindex":6,"ifname":"br0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"address":"aa:bb:cc:00:00:10",
+           "addr_info":[{"family":"inet","local":"192.168.77.30","prefixlen":24,"scope":"global","label":"br0"}]},
+          {"ifindex":9,"ifname":"usb0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"address":"aa:bb:cc:00:00:40",
+           "addr_info":[{"family":"inet","local":"192.168.8.2","prefixlen":24,"scope":"global","label":"usb0"}]}
+        ]"#;
+        let route = r#"[{"dst":"default","gateway":"192.168.8.1","dev":"usb0","metric":10}]"#;
+        let snapshot = parse_snapshot(addr, route);
+        assert_eq!(snapshot.primary().unwrap().name, "br0");
+        assert_eq!(snapshot.primary_ipv4().as_deref(), Some("192.168.77.30"));
+        // The list still says who holds the default route, and the modem's
+        // gateway is not br0's.
+        assert_eq!(snapshot.interfaces[0].name, "usb0");
+        assert!(snapshot.interfaces[0].default_route);
+        assert_eq!(snapshot.gateway, None);
+    }
+
+    #[test]
+    fn br0_without_an_address_yields_to_the_default_routes_device() {
+        let addr = r#"[
+          {"ifindex":6,"ifname":"br0","flags":["BROADCAST","MULTICAST","UP"],"address":"aa:bb:cc:00:00:10","addr_info":[]},
+          {"ifindex":9,"ifname":"usb0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"address":"aa:bb:cc:00:00:40",
+           "addr_info":[{"family":"inet","local":"192.168.8.2","prefixlen":24,"scope":"global","label":"usb0"}]}
+        ]"#;
+        let route = r#"[{"dst":"default","gateway":"192.168.8.1","dev":"usb0","metric":10}]"#;
+        let snapshot = parse_snapshot(addr, route);
+        assert_eq!(snapshot.primary().unwrap().name, "usb0");
+        assert_eq!(snapshot.gateway, Some("192.168.8.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_gateway_through_a_device_with_no_address_is_not_reported() {
+        let route = r#"[{"dst":"default","gateway":"1.2.3.4","dev":"wg0","metric":5}]"#;
+        let snapshot = parse_snapshot(ADDR_SPLIT, route);
+        assert_eq!(snapshot.gateway, None);
+        // With no address anywhere, the route is all there is to report.
+        assert_eq!(
+            parse_snapshot("[]", route).gateway,
+            Some("1.2.3.4".parse().unwrap())
+        );
     }
 
     #[test]

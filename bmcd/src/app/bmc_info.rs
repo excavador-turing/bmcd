@@ -35,16 +35,54 @@ pub fn primary_info(snapshot: &Snapshot) -> (Option<String>, Option<String>) {
     (snapshot.primary_ipv4(), mac)
 }
 
-/// [`primary_info`] for the board as it is now. The MAC falls back to what
-/// the kernel says `br0` has when `ip` had nothing to say.
+/// What `tpi info` used to read, for when `ip` has nothing to say: the
+/// IPv4 of `br0` -- link-local included, which a board that has not got a
+/// lease yet still shows -- else the first other non-loopback IPv4 by name.
+pub fn fallback_ipv4(addresses: &[(String, std::net::Ipv4Addr)]) -> Option<(String, String)> {
+    let mut sorted: Vec<&(String, std::net::Ipv4Addr)> = addresses.iter().collect();
+    sorted.sort_by(|a, b| {
+        (a.0 != network_interfaces::MANAGED, &a.0).cmp(&(b.0 != network_interfaces::MANAGED, &b.0))
+    });
+    sorted
+        .first()
+        .map(|(name, ip)| (name.clone(), ip.to_string()))
+}
+
+/// [`primary_info`] for the board as it is now. When `ip` is missing or the
+/// board has no global IPv4 address, the IP is read the way it used to be
+/// (through the kernel's address list), so `tpi info` does not turn into
+/// "Unknown" on a board that has an address of some kind. The MAC falls back
+/// to what the kernel says the interface has.
 pub async fn get_primary_info() -> (Option<String>, String) {
     let snapshot = tokio::task::spawn_blocking(|| network_interfaces::snapshot(&SystemExec))
         .await
         .unwrap_or_default();
     let (ip, mac) = primary_info(&snapshot);
+    if let (Some(ip), Some(mac)) = (&ip, &mac) {
+        return (Some(ip.clone()), mac.clone());
+    }
+    let mut device = snapshot.primary().map(|i| i.name.clone());
+    let ip = match ip {
+        Some(ip) => Some(ip),
+        None => {
+            let addresses: Vec<(String, std::net::Ipv4Addr)> = if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| !i.is_loopback())
+                .filter_map(|i| match i.ip() {
+                    std::net::IpAddr::V4(ip) => Some((i.name, ip)),
+                    _ => None,
+                })
+                .collect();
+            fallback_ipv4(&addresses).map(|(name, ip)| {
+                device = Some(name);
+                ip
+            })
+        }
+    };
     let mac = match mac {
         Some(mac) => mac,
-        None => get_mac_address(network_interfaces::MANAGED).await,
+        None => get_mac_address(device.as_deref().unwrap_or(network_interfaces::MANAGED)).await,
     };
     (ip, mac)
 }
@@ -144,6 +182,20 @@ mod tests {
         // Even with no default route there is an address to report.
         let (ip, _) = primary_info(&parse_snapshot(ADDR_SPLIT, "[]"));
         assert_eq!(ip.as_deref(), Some("192.168.1.10"));
+    }
+
+    #[test]
+    fn the_fallback_prefers_br0_including_link_local_then_the_first_by_name() {
+        let a = |n: &str, ip: &str| (n.to_string(), ip.parse().unwrap());
+        assert_eq!(
+            fallback_ipv4(&[a("usb0", "192.168.8.2"), a("br0", "169.254.7.7")]),
+            Some(("br0".to_string(), "169.254.7.7".to_string()))
+        );
+        assert_eq!(
+            fallback_ipv4(&[a("br-wan", "10.0.0.2"), a("br-lan", "169.254.1.1")]),
+            Some(("br-lan".to_string(), "169.254.1.1".to_string()))
+        );
+        assert_eq!(fallback_ipv4(&[]), None);
     }
 
     #[test]

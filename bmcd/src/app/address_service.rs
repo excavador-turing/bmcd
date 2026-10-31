@@ -135,9 +135,9 @@ struct Inner {
     /// Whether replacing the file needs the caller's say-so: it is not ours,
     /// and it is more than the image's own default.
     replaces_hand_written: bool,
-    /// The file's modification time when it was last read. A different one
-    /// means somebody changed it since.
-    stamp: Option<SystemTime>,
+    /// The file's modification time and length when it was last read. A
+    /// different pair means somebody changed it since.
+    stamp: Option<Stamp>,
     file_backup: Option<PathBuf>,
 }
 
@@ -146,11 +146,16 @@ struct FileRead {
     document: Option<AddressDocument>,
     origin: FileOrigin,
     replaces_hand_written: bool,
-    stamp: Option<SystemTime>,
+    stamp: Option<Stamp>,
 }
 
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+type Stamp = (SystemTime, u64);
+
+/// Modification time and length: two edits inside one clock tick still
+/// differ in length more often than not.
+fn modified(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// The lines that mean something: no comments, no blanks.
@@ -163,33 +168,49 @@ fn significant_lines(text: &str) -> Vec<&str> {
 
 fn read_file(path: &Path) -> FileRead {
     let stamp = modified(path);
-    match std::fs::read_to_string(path) {
-        Ok(contents) => {
-            let parsed = parse(&contents);
-            let origin = match (&parsed.document, parsed.ours) {
-                (_, true) => FileOrigin::Bmcd,
-                (Some(_), false) => FileOrigin::HandEdited,
-                (None, false) => FileOrigin::Unreadable,
-            };
-            // The image's own file is not somebody's work: replacing it needs
-            // no ceremony. It is the file this daemon renders for DHCP, minus
-            // the comments.
-            let image_default =
-                significant_lines(&contents) == significant_lines(&AddressDocument::Dhcp.render());
-            FileRead {
-                document: parsed.document,
-                origin,
-                replaces_hand_written: origin != FileOrigin::Bmcd && !image_default,
-                stamp,
-            }
-        }
+    let contents = match std::fs::read(path) {
         // No file at all is the image's own default, which is DHCP.
-        Err(_) => FileRead {
-            document: Some(AddressDocument::Dhcp),
-            origin: FileOrigin::HandEdited,
-            replaces_hand_written: false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return FileRead {
+                document: Some(AddressDocument::Dhcp),
+                origin: FileOrigin::HandEdited,
+                replaces_hand_written: false,
+                stamp,
+            };
+        }
+        Ok(bytes) => String::from_utf8(bytes).ok(),
+        Err(e) => {
+            tracing::warn!("could not read {}: {e}", path.display());
+            None
+        }
+    };
+    let Some(contents) = contents else {
+        // There is a file and this daemon cannot make sense of it -- not
+        // UTF-8, or not readable at all. It is somebody's, so it is treated
+        // as one: a change needs the opt-in and keeps a copy.
+        return FileRead {
+            document: None,
+            origin: FileOrigin::Unreadable,
+            replaces_hand_written: true,
             stamp,
-        },
+        };
+    };
+    let parsed = parse(&contents);
+    let origin = match (&parsed.document, parsed.ours) {
+        (_, true) => FileOrigin::Bmcd,
+        (Some(_), false) => FileOrigin::HandEdited,
+        (None, false) => FileOrigin::Unreadable,
+    };
+    // The image's own file is not somebody's work: replacing it needs no
+    // ceremony and no copy. It is the file this daemon renders for DHCP,
+    // minus the comments.
+    let image_default =
+        significant_lines(&contents) == significant_lines(&AddressDocument::Dhcp.render());
+    FileRead {
+        document: parsed.document,
+        origin,
+        replaces_hand_written: origin != FileOrigin::Bmcd && !image_default,
+        stamp,
     }
 }
 
@@ -313,8 +334,10 @@ impl AddressService {
     }
 
     pub async fn view(&self) -> AddressView {
-        let live = self.applier.live().await;
-        let interfaces = self.applier.interfaces();
+        // One reading of the network serves `live` and `interfaces` both.
+        let snapshot = self.applier.snapshot_async().await;
+        let live = self.applier.live(&snapshot);
+        let interfaces = snapshot.interfaces;
         let mut inner = self.inner.lock().await;
         self.refresh(&mut inner);
         AddressView {
@@ -388,29 +411,52 @@ impl AddressService {
         let mut inner = self.inner.lock().await;
         // Somebody may have edited the file since the apply.
         self.refresh(&mut inner);
-        let effect = inner.state.confirm(token, SystemTime::now())?;
-        if let Effect::Persist(document) = effect {
-            // A file this daemon did not write is replaced whole, so what
-            // was in it is kept first. Never overwritten without the copy.
-            if inner.file != FileOrigin::Bmcd && self.path.exists() {
-                let backup = keep_a_copy(&self.path).map_err(AddressError::Io)?;
-                tracing::warn!(
-                    "{} was not written by this daemon; a copy is kept as {}",
-                    self.path.display(),
-                    backup.display()
-                );
-                inner.file_backup = Some(backup);
-            }
-            write_atomically(&self.path, document.render().as_bytes()).map_err(AddressError::Io)?;
-            inner.file = FileOrigin::Bmcd;
-            inner.replaces_hand_written = false;
-            inner.stamp = modified(&self.path);
-            tracing::info!(
-                "address confirmed and written to {}: {}",
+        // Check first, write, and only then commit. A copy or a write that
+        // fails (a full or read-only overlay) leaves the change pending: it
+        // can be confirmed again, or the window puts the old address back.
+        // Committing first left the new address live with nothing pending,
+        // `configured` claiming a file that was never written, and a reboot
+        // quietly undoing it.
+        let document = inner.state.check_confirm(token, SystemTime::now())?;
+
+        // A file this daemon did not write is replaced whole, so what was in
+        // it is kept first. Never overwritten without the copy. The image's
+        // own file is nobody's work and is not kept.
+        let mut backup = None;
+        if inner.replaces_hand_written && self.path.exists() {
+            let (kept, removed) = keep_a_copy(&self.path).map_err(AddressError::Io)?;
+            tracing::warn!(
+                "{} was not written by this daemon; a copy is kept as {}",
                 self.path.display(),
-                describe(&document)
+                kept.display()
             );
+            for old in removed {
+                tracing::warn!("removed the older copy {}", old.display());
+            }
+            backup = Some(kept);
         }
+        if let Err(e) = write_atomically(&self.path, document.render().as_bytes()) {
+            if let Some(kept) = &backup {
+                let _ = std::fs::remove_file(kept);
+            }
+            return Err(AddressError::Io(e));
+        }
+
+        inner
+            .state
+            .confirm(token, SystemTime::now())
+            .map_err(AddressError::Change)?;
+        if backup.is_some() {
+            inner.file_backup = backup;
+        }
+        inner.file = FileOrigin::Bmcd;
+        inner.replaces_hand_written = false;
+        inner.stamp = modified(&self.path);
+        tracing::info!(
+            "address confirmed and written to {}: {}",
+            self.path.display(),
+            describe(&document)
+        );
         Ok(())
     }
 
@@ -465,22 +511,84 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How many copies of hand-written files are kept.
+const KEEP_COPIES: usize = 5;
+
 /// Copy `path` to `<path>.hand-written.<unix seconds>`, byte for byte, in the
-/// same directory, and return where it went.
-fn keep_a_copy(path: &Path) -> std::io::Result<PathBuf> {
+/// same directory. Returns where it went and which older copies were removed
+/// to stay within [`KEEP_COPIES`].
+fn keep_a_copy(path: &Path) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
     let seconds = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
+    keep_a_copy_at(path, seconds)
+}
+
+fn keep_a_copy_at(path: &Path, seconds: u64) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let backup = path.with_file_name(format!("{name}.hand-written.{seconds}"));
-    let tmp = path.with_file_name(format!("{name}.hand-written.{seconds}.tmp"));
-    std::fs::copy(path, &tmp)?;
-    std::fs::rename(&tmp, &backup)?;
-    Ok(backup)
+    let prefix = format!("{name}.hand-written.");
+    let bytes = std::fs::read(path)?;
+
+    // Written under a name that is not a copy's, then linked to the first
+    // free name: `link` refuses to replace, so a copy made earlier -- on a
+    // board with no clock, the same second comes round on every boot -- is
+    // never overwritten.
+    let tmp = path.with_file_name(format!("{prefix}tmp"));
+    let result = (|| {
+        std::fs::write(&tmp, &bytes)?;
+        for attempt in 0u32.. {
+            let candidate = if attempt == 0 {
+                format!("{prefix}{seconds}")
+            } else {
+                format!("{prefix}{seconds}-{attempt}")
+            };
+            let target = path.with_file_name(candidate);
+            match std::fs::hard_link(&tmp, &target) {
+                Ok(()) => return Ok(target),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("the attempts do not run out")
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let kept = result?;
+
+    let removed = prune_copies(path.parent().unwrap_or(Path::new(".")), &prefix, &kept);
+    Ok((kept, removed))
+}
+
+/// Remove all but the newest [`KEEP_COPIES`] copies, never the one just made.
+/// Newest is by the number in the name, then by its suffix.
+fn prune_copies(dir: &Path, prefix: &str, just_made: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut copies: Vec<((u64, u32), PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let rest = name.strip_prefix(prefix)?;
+            let (seconds, suffix) = match rest.split_once('-') {
+                Some((s, n)) => (s, n.parse().ok()?),
+                None => (rest, 0),
+            };
+            Some(((seconds.parse().ok()?, suffix), e.path()))
+        })
+        .collect();
+    copies.sort();
+    let excess = copies.len().saturating_sub(KEEP_COPIES);
+    let mut removed = Vec::new();
+    for (_, old) in copies.into_iter().take(excess) {
+        if old != just_made && std::fs::remove_file(&old).is_ok() {
+            removed.push(old);
+        }
+    }
+    removed
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -828,6 +936,14 @@ mod tests {
                 .expect("the stock file is not somebody's work");
             rig.service.confirm(&pending.token).await.unwrap();
             assert_eq!(std::fs::read_to_string(&rig.file).unwrap(), lan().render());
+            // Nobody's work was replaced, so there is nothing to keep.
+            assert!(rig.service.view().await.file_backup.is_none());
+            assert_eq!(
+                std::fs::read_dir(rig.file.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
         }
     }
 
@@ -936,5 +1052,186 @@ mod tests {
             .expect("a copy was kept");
         assert_eq!(std::fs::read_to_string(backup).unwrap(), HAND_FILE);
         let _ = &rig.dir;
+    }
+
+    /// The write fails after the address went live. The change must stay
+    /// pending -- confirmable again, or put back by its window -- and the
+    /// view must not claim a file that was never written.
+    #[tokio::test]
+    async fn a_write_that_fails_leaves_the_change_pending_and_the_view_unchanged() {
+        let rig = board(Some(HAND_FILE), true);
+        let pending = rig
+            .service
+            .apply(lan(), DEFAULT_WINDOW, true)
+            .await
+            .unwrap();
+        let before = rig.service.view().await;
+        // Writing goes through `interfaces.tmp`; a directory there stops it.
+        let blocker = rig.file.with_extension("tmp");
+        std::fs::create_dir(&blocker).unwrap();
+
+        let error = rig
+            .service
+            .confirm(&pending.token)
+            .await
+            .expect_err("the write fails");
+        assert!(matches!(error, AddressError::Io(_)), "{error:?}");
+        assert!(!error.to_string().is_empty());
+
+        let after = rig.service.view().await;
+        assert_eq!(
+            after.pending.as_ref().map(|p| &p.token),
+            Some(&pending.token)
+        );
+        assert_eq!(after.configured, before.configured);
+        assert_eq!(after.file, FileOrigin::HandEdited);
+        assert!(after.file_backup.is_none());
+        assert!(after.last_revert.is_none());
+        assert_eq!(std::fs::read_to_string(&rig.file).unwrap(), HAND_FILE);
+        // The copy made before the failed write is not left lying about.
+        let names: Vec<_> = std::fs::read_dir(rig.file.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.starts_with("interfaces.hand-written.")),
+            "{names:?}"
+        );
+
+        // Confirming again, once the disk allows it, works.
+        std::fs::remove_dir(&blocker).unwrap();
+        rig.service.confirm(&pending.token).await.expect("retry");
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.file, FileOrigin::Bmcd);
+        assert_eq!(view.configured, Some(lan()));
+        assert!(view.file_backup.is_some());
+    }
+
+    /// A Latin-1 byte in a comment made the file "not found" and so DHCP:
+    /// hand-written content walked past the opt-in.
+    #[test]
+    fn a_file_that_is_not_utf8_is_unreadable_and_somebodys() {
+        let dir = tempdir::TempDir::new("address-latin1").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        std::fs::write(
+            &path,
+            b"# caf\xe9 uplink\nauto br0\niface br0 inet dhcp\n  bridge-ports ge0\n",
+        )
+        .unwrap();
+        let read = read_file(&path);
+        assert_eq!(read.origin, FileOrigin::Unreadable);
+        assert_eq!(read.document, None);
+        assert!(read.replaces_hand_written);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_utf8_needs_the_opt_in_and_is_kept_byte_for_byte() {
+        let bytes: &[u8] = b"# caf\xe9 uplink\nauto br0\niface br0 inet dhcp\n  bridge-ports ge0\n";
+        let rig = board(None, true);
+        std::fs::write(&rig.file, bytes).unwrap();
+        let service =
+            AddressService::load_with(&rig.file, Applier::with(rig.exec.clone(), rig.dir.path()));
+        let view = service.view().await;
+        assert_eq!(view.file, FileOrigin::Unreadable);
+        assert!(view.configured.is_none());
+        let error = service
+            .apply(lan(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("somebody's file");
+        assert!(matches!(error, AddressError::HandWritten(_)));
+        let pending = service.apply(lan(), DEFAULT_WINDOW, true).await.unwrap();
+        service.confirm(&pending.token).await.unwrap();
+        let backup = service.view().await.file_backup.expect("a copy");
+        assert_eq!(std::fs::read(backup).unwrap(), bytes);
+    }
+
+    #[test]
+    fn two_copies_in_one_second_do_not_overwrite_each_other() {
+        let dir = tempdir::TempDir::new("address-copies").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        let mut kept = Vec::new();
+        for n in 0..3 {
+            std::fs::write(&path, format!("version {n}\n")).unwrap();
+            kept.push(keep_a_copy_at(&path, 1_000).unwrap().0);
+        }
+        let names: Vec<String> = kept
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "interfaces.hand-written.1000",
+                "interfaces.hand-written.1000-1",
+                "interfaces.hand-written.1000-2"
+            ]
+        );
+        for (n, p) in kept.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(p).unwrap(),
+                format!("version {n}\n")
+            );
+        }
+        // No scratch file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn only_the_newest_five_copies_are_kept_and_the_new_one_always_is() {
+        let dir = tempdir::TempDir::new("address-prune").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        std::fs::write(&path, "x\n").unwrap();
+        let mut removed_total = Vec::new();
+        for seconds in [100, 200, 300, 400, 500, 600, 700] {
+            let (_, removed) = keep_a_copy_at(&path, seconds).unwrap();
+            removed_total.extend(removed);
+        }
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("interfaces.hand-written."))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "interfaces.hand-written.300",
+                "interfaces.hand-written.400",
+                "interfaces.hand-written.500",
+                "interfaces.hand-written.600",
+                "interfaces.hand-written.700"
+            ]
+        );
+        assert_eq!(removed_total.len(), 2);
+
+        // A board whose clock went backwards: the copy just made is not the
+        // newest by name, and is still not the one that goes.
+        let (kept, removed) = keep_a_copy_at(&path, 50).unwrap();
+        assert!(kept.exists());
+        assert_eq!(removed.len(), 0, "{removed:?}");
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_made_leaves_nothing_behind() {
+        let dir = tempdir::TempDir::new("address-nocopy").expect("temp dir");
+        let path = dir.path().join("interfaces");
+        assert!(keep_a_copy_at(&path, 1).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Same mtime, different bytes: the length tells.
+    #[tokio::test]
+    async fn an_edit_inside_one_clock_tick_is_noticed_by_its_length() {
+        let rig = split_board();
+        set_mtime(&rig.file, 1_000);
+        assert_eq!(rig.service.view().await.file, FileOrigin::Unreadable);
+        std::fs::write(&rig.file, AddressDocument::Dhcp.render()).unwrap();
+        set_mtime(&rig.file, 1_000);
+        assert_eq!(rig.service.view().await.file, FileOrigin::Bmcd);
     }
 }

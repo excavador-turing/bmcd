@@ -36,7 +36,7 @@
 //! Whether the board is on DHCP is whether udhcpc's pid file names a process
 //! that is still alive.
 use crate::app::address_document::{resolv_conf, AddressDocument, StaticAddress, INTERFACE};
-use crate::app::network_interfaces::{self, InterfaceInfo, Snapshot};
+use crate::app::network_interfaces::{self, Snapshot};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::net::Ipv4Addr;
@@ -161,6 +161,15 @@ impl Applier {
         network_interfaces::snapshot(self.exec.as_ref())
     }
 
+    /// [`snapshot`](Self::snapshot) off the async workers: it runs `ip`
+    /// twice and waits for both.
+    pub async fn snapshot_async(&self) -> Snapshot {
+        let applier = self.clone();
+        tokio::task::spawn_blocking(move || applier.snapshot())
+            .await
+            .unwrap_or_default()
+    }
+
     /// Why the managed interface cannot be changed, or `None` when it can.
     /// `tail` says what the caller manages and what to do instead.
     pub fn missing_message(&self, tail: &str) -> Option<String> {
@@ -273,9 +282,9 @@ impl Applier {
         Ok(())
     }
 
-    /// What the primary interface has right now.
-    pub async fn live(&self) -> LiveAddress {
-        let snapshot = self.snapshot();
+    /// What the primary interface has right now, from a snapshot the caller
+    /// took -- so one `ip` reading serves both this and the interface list.
+    pub fn live(&self, snapshot: &Snapshot) -> LiveAddress {
         let primary = snapshot.primary();
         let (dns, search) = std::fs::read_to_string(&self.resolv_conf)
             .map(|c| parse_resolv(&c))
@@ -293,11 +302,6 @@ impl Applier {
             dns,
             search,
         }
-    }
-
-    /// Every up interface with a global IPv4 address.
-    pub fn interfaces(&self) -> Vec<InterfaceInfo> {
-        self.snapshot().interfaces
     }
 }
 

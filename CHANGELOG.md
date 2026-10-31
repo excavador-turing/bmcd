@@ -21,15 +21,20 @@ for the IP.
 ### Changed
 
 - **The board's address is read from the primary interface, not from `br0`.**
-  The primary interface is the device of the IPv4 default route, or, with no
-  default route, the first up non-loopback interface with a global IPv4
-  address. Its address is the first global, non-alias one (a `br0:1` alias or
+  The primary interface is `br0` when it exists and has a global IPv4
+  address (so a USB modem or a VPN holding the default route does not take the
+  page away from the bridge it manages); otherwise the device of the IPv4
+  default route, or, with no default route, the first up non-loopback
+  interface with a global IPv4 address. Its address is the first global, non-alias one (a `br0:1` alias or
   a secondary address never wins over the main one). `GET
   /api/bmc/network/address` now reports it as `live.address` with the device
   name in the new `live.interface`, plus `interfaces`: every up, non-loopback
   interface with a global IPv4 address as `{name, addresses, mac,
   default_route}`, the default route's first. `tpi info` (and
-  `/api/bmc?opt=info`) use the same interface for `ip` and `mac`.
+  `/api/bmc?opt=info`) use the same interface for `ip` and `mac`, and fall
+  back to the kernel's address list (as before) if `ip` is missing or the
+  board has no global address yet. One reading of `ip` serves a whole `GET`,
+  taken off the web workers.
 - **`PUT /api/bmc/network/address` answers 409 when there is no `br0`.** The
   message lists what the board has ("This board has no br0 bridge (it has:
   br-wan, br-lan). ..."). Nothing is changed: no pending change, no
@@ -64,8 +69,18 @@ for the IP.
   read was replaced just the same. Whenever the file was not written by the
   daemon, confirm now first copies it, byte for byte, to
   `/etc/network/interfaces.hand-written.<unix seconds>` in the same directory
-  and reports the path as `file_backup`. If the copy cannot be made, the file
-  is not touched.
+  (a `-1`, `-2`, ... suffix if that name is taken, as on a board with no
+  clock) and reports the path as `file_backup`. The newest five copies are
+  kept. If the copy cannot be made, the file is not touched. The image's own
+  default file is not kept: it is nobody's work.
+- **A confirm whose file write failed no longer pretends it succeeded.** The
+  copy and the write now happen before the change is committed, so a full or
+  read-only overlay leaves the change pending (confirm it again, or the window
+  puts the old address back) instead of leaving the new address live with
+  nothing pending and a file that still says the old one.
+- **An `interfaces` file that is not valid UTF-8, or cannot be read, is
+  treated as hand-written.** It used to read as "no file", i.e. DHCP, and was
+  replaced without the opt-in.
 
 ## [2.40.0] — 2026-10-15
 

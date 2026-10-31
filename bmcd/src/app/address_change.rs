@@ -206,7 +206,17 @@ impl AddressState {
         Effect::Apply(pending.snapshot)
     }
 
-    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+    /// What a confirmation with this token would persist, changing nothing.
+    ///
+    /// Confirming is two steps for a caller that must write a file: check,
+    /// write, and only then [`confirm`](Self::confirm). A write that fails
+    /// between the two leaves the change pending, to be confirmed again or
+    /// put back by its window.
+    pub fn check_confirm(
+        &self,
+        token: &str,
+        now: SystemTime,
+    ) -> Result<AddressDocument, ChangeError> {
         let Some(pending) = self.pending.as_ref() else {
             return Err(ChangeError::NothingPending);
         };
@@ -218,7 +228,11 @@ impl AddressState {
             // pending one would write down something that is not running.
             return Err(ChangeError::NothingPending);
         }
-        let document = pending.document.clone();
+        Ok(pending.document.clone())
+    }
+
+    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+        let document = self.check_confirm(token, now)?;
         self.confirmed = Some(document.clone());
         self.pending = None;
         self.last_revert = None;
