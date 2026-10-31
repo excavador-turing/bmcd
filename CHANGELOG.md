@@ -10,6 +10,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.42.1] — 2026-10-31
+
+### Fixed
+
+- **The settings-storage repair was never offered on a real board: the root
+  device shows as `/dev/root`, which 2.42.0 did not resolve.** On the board
+  the kernel mounts the read-only image itself, so `/proc/mounts` says
+  `/dev/root /mnt/rom erofs ...` and `/dev/root` is not a device node.
+  `GET /api/bmc/storage` therefore reported `backing: "unknown"`, and with it
+  `repairable: false`, even on a board that had lost its settings. When the
+  mount source of the read-only root is `/dev/root` (or is not a device node
+  at all, as for a root that is the overlay), the kernel's own `root=` from
+  `/proc/cmdline` is resolved instead: a `MAJOR:MINOR` such as `254:0` through
+  `/sys/class/block/*/dev` (which names it `ubiblock0_1`), or a `/dev/<name>`
+  as it stands. `ubiblock*` is `ubi` and `mmcblk*` is `mmc`, as before.
+  Whatever cannot be resolved (`PARTUUID=`, `PARTLABEL=`, a device sysfs does
+  not list, no `root=`) stays `unknown`, and an unknown backing still does not
+  offer the repair.
+
 ## [2.42.0] — 2026-10-31
 
 When the settings volume (the UBI volume `overlay`, mounted at
