@@ -97,7 +97,14 @@ jobs:
 
   cross:
     name: cross-compile for the board
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest. The armhf packages below come from
+    # ports.ubuntu.com for the *same release* as this runner, and multiarch
+    # requires libudev1:amd64 and libudev1:armhf at identical versions. On
+    # 2026-10-31 ubuntu-latest moved to 26.04 (libudev 259.x) while this job
+    # still asked ports for noble (255.4), and apt refused with "Unable to
+    # satisfy dependencies". 24.04 is supported until 2029; move the pin on
+    # purpose, and the sysroot step follows the runner's codename.
+    runs-on: ubuntu-24.04
 
     # Cost one firmware build round trip on 2026-09-09 (SQU-171). bmcd 2.15.0
     # multiplied two `statvfs` counts. They are `u64` on x86-64 and **`u32` on
@@ -123,12 +130,16 @@ jobs:
       - name: armhf sysroot
         run: |
           set -eu
+          # The ports suites must be the runner's own release, or the amd64
+          # and armhf copies of a shared library (libudev1, libc6) come from
+          # different releases and cannot be co-installed.
+          . /etc/os-release
           sudo sed -i 's/^Components: main/Architectures: amd64\nComponents: main/' \
             /etc/apt/sources.list.d/ubuntu.sources
-          sudo tee /etc/apt/sources.list.d/armhf.sources >/dev/null <<'SRC'
+          sudo tee /etc/apt/sources.list.d/armhf.sources >/dev/null <<SRC
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports
-          Suites: noble noble-updates noble-security
+          Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-security
           Components: main universe
           Architectures: armhf
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
