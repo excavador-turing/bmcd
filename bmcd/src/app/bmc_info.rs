@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::app::address_applier::SystemExec;
 use crate::app::network_interfaces::{self, Snapshot};
+use crate::app::sdcard_files::SDCARD_ROOT;
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -135,6 +136,27 @@ pub struct StorageInfo {
     name: String,
     total_bytes: u64,
     bytes_free: u64,
+    /// Whether a card is actually mounted at `/mnt/sdcard`. Only the `SD card`
+    /// entry carries it; the `BMC` entry has no such question and omits it.
+    ///
+    /// `total_bytes` and `bytes_free` of the `SD card` entry are NOT a
+    /// statement about a card when this is false: `statvfs` on the empty mount
+    /// point answers for the volume underneath it, which is the BMC's own, and
+    /// they are left as reported so a client that reads only the sizes behaves
+    /// as it always did. Read this field instead of comparing sizes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mounted: Option<bool>,
+}
+
+/// The `SD card` entry. `mounted` is decided by the caller, from the mount
+/// table's own test, never from the sizes.
+fn sd_card_entry(total: u64, free: u64, mounted: bool) -> StorageInfo {
+    StorageInfo {
+        name: "SD card".to_string(),
+        total_bytes: total,
+        bytes_free: free,
+        mounted: Some(mounted),
+    }
 }
 
 pub fn get_storage_info() -> Vec<StorageInfo> {
@@ -145,16 +167,16 @@ pub fn get_storage_info() -> Vec<StorageInfo> {
             name: "BMC".to_string(),
             total_bytes: total,
             bytes_free: free,
+            mounted: None,
         });
     }
 
+    // The entry's presence rule is unchanged: the device exists and statvfs
+    // answers. Whether a card is in it is the new, separate fact.
     if Path::new("/dev/mmcblk0").exists() {
-        if let Ok((total, free)) = get_fs_stat("/mnt/sdcard") {
-            info.push(StorageInfo {
-                name: "SD card".to_string(),
-                total_bytes: total,
-                bytes_free: free,
-            });
+        if let Ok((total, free)) = get_fs_stat(SDCARD_ROOT) {
+            let mounted = crate::app::upgrade_worker::is_mount_point(Path::new(SDCARD_ROOT));
+            info.push(sd_card_entry(total, free, mounted));
         }
     }
     info
@@ -196,6 +218,36 @@ mod tests {
             Some(("br-lan".to_string(), "169.254.1.1".to_string()))
         );
         assert_eq!(fallback_ipv4(&[]), None);
+    }
+
+    /// The SD card entry says whether a card is in; the BMC entry's shape is
+    /// what it always was. Sizes are untouched when no card is mounted, so an
+    /// older client that compares them with the BMC's keeps working.
+    #[test]
+    fn the_sd_card_entry_carries_mounted_and_the_bmc_entry_does_not() {
+        let card = serde_json::to_value(sd_card_entry(100, 40, true)).unwrap();
+        assert_eq!(
+            card,
+            serde_json::json!({
+                "name": "SD card", "total_bytes": 100, "bytes_free": 40, "mounted": true
+            })
+        );
+
+        let empty = serde_json::to_value(sd_card_entry(100, 40, false)).unwrap();
+        assert_eq!(empty["mounted"], false);
+        assert_eq!(empty["total_bytes"], 100);
+
+        let bmc = serde_json::to_value(StorageInfo {
+            name: "BMC".to_string(),
+            total_bytes: 100,
+            bytes_free: 40,
+            mounted: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bmc,
+            serde_json::json!({"name": "BMC", "total_bytes": 100, "bytes_free": 40})
+        );
     }
 
     #[test]

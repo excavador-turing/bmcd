@@ -50,6 +50,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deadline the whole group (the script and its `curl`) is killed, so hung
   downloads do not pile up on the board. The 10-minute limit on the refresh as
   a whole stays as the outer guard.
+- **`GET /api/bmc/info` (and `opt=get&type=info`) says whether an SD card is
+  mounted.** The `SD card` entry in `storage` gains `mounted`, decided by the
+  same mount-point test the park and staging code use. Before, a client could
+  only guess, by noticing that the entry's sizes equalled the BMC's (`statvfs`
+  on the empty `/mnt/sdcard` answers for the volume underneath). Additive: the
+  `BMC` entry has no `mounted`, the `SD card` entry is present under the same
+  rule as before, and its sizes are reported as before, so an older interface
+  is unaffected. The sizes are not a statement about a card while `mounted` is
+  false; read the new field instead.
 
 ## [2.42.1] — 2026-10-31
 
