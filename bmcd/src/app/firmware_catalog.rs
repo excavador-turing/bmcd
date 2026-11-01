@@ -159,11 +159,99 @@ fn relation_from(value: Option<&str>) -> Relation {
     }
 }
 
+/// How long one source may take before the others stop waiting for it.
+///
+/// The slowest source seen on a real board was the fork listing at 170 s with
+/// the old updater script (5 s once fixed), so 180 s keeps today's firmware
+/// working and still bounds a source that hangs. [`REFRESH_CLAIM`] stays the
+/// outer guard behind it.
+const SOURCE_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Slack for the async side to wait beyond [`SOURCE_DEADLINE`], so that a
+/// remote source reports its own timeout (and has killed its child) before
+/// the caller gives up on it.
+const SOURCE_GRACE: Duration = Duration::from_secs(5);
+
+fn timed_out(deadline: Duration) -> String {
+    format!("timed out after {} s", deadline.as_secs())
+}
+
+/// Runs `command` to completion like `Command::output`, but gives up after
+/// `deadline`. `Ok(None)` means it did, and that nothing of it is left
+/// running.
+///
+/// `spawn_blocking` cannot be cancelled, so a deadline on the task alone would
+/// leave the work behind: `tpi-selfupdate` is a shell script that runs `curl`,
+/// and a `curl` that hangs would otherwise live on for as long as the TCP
+/// connection does, one more for every refresh, on a board with 116 MB of RAM.
+/// So the child is started in its own process group and the whole group is
+/// killed on expiry -- killing only the script would leave its `curl` holding
+/// the pipes.
+fn output_within(
+    mut command: Command,
+    deadline: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+
+    // Drained on threads so a full pipe cannot stall the child while this
+    // waits for it.
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let Some(status) = status else {
+        // The group id is the child's pid (`process_group(0)`). Whatever
+        // fails here, `kill` and `wait` on the child itself still run, so
+        // nothing is left as a zombie. The reader threads are not joined: they
+        // end when the pipes close, and a grandchild that escaped the group
+        // must not be able to hold this one up.
+        let group = nix::unistd::Pid::from_raw(child.id() as i32);
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+
+    Ok(Some(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    }))
+}
+
 /// Runs the updater's listing for one remote source.
 ///
 /// Blocking on purpose, called from `spawn_blocking`; the script bounds its own
 /// network calls with `curl --max-time`.
-fn list_remote(source: &Source) -> Result<Listing, String> {
+fn list_remote(source: &Source, deadline: Duration) -> Result<Listing, String> {
     let mut command = Command::new(SELFUPDATE);
     command.arg("--list");
     match source.kind {
@@ -176,9 +264,11 @@ fn list_remote(source: &Source) -> Result<Listing, String> {
         SourceKind::Local => unreachable!("local sources are read directly"),
     }
 
-    let output = command
-        .output()
-        .map_err(|e| format!("cannot run {SELFUPDATE}: {e}"))?;
+    let output = match output_within(command, deadline) {
+        Ok(Some(output)) => output,
+        Ok(None) => return Err(timed_out(deadline)),
+        Err(e) => return Err(format!("cannot run {SELFUPDATE}: {e}")),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -332,16 +422,17 @@ fn list_local_in(
     Ok(candidates)
 }
 
-fn resolve(
-    source: &Source,
-    running_hint: &str,
-) -> (Vec<Candidate>, Option<String>, Option<String>) {
+/// What one source came to: its candidates, its error, the running version it
+/// reported.
+type Resolved = (Vec<Candidate>, Option<String>, Option<String>);
+
+fn resolve(source: &Source, running_hint: &str, deadline: Duration) -> Resolved {
     match source.kind {
         SourceKind::Local => match list_local(source, running_hint) {
             Ok(c) => (c, None, None),
             Err(e) => (Vec::new(), Some(e), None),
         },
-        SourceKind::Github | SourceKind::Http => match list_remote(source) {
+        SourceKind::Github | SourceKind::Http => match list_remote(source, deadline) {
             Ok(listing) => {
                 let trust = match source.kind {
                     SourceKind::Github => Trust::Verified,
@@ -573,6 +664,70 @@ fn release_refresh() {
     refresh_claim().store(0, AtomicOrdering::Release);
 }
 
+/// Asks each source, all at once, and waits for none of them longer than
+/// `deadline` (plus `grace`).
+///
+/// A source that is still going when its turn is up reports "timed out" as its
+/// own error and the rest are kept. Without the bound one hung source held the
+/// whole fan-out until [`REFRESH_CLAIM`], and the timeout around the fan-out
+/// then threw away the answers of every source that had already finished.
+///
+/// The resolver is a parameter so a test can use a source that sleeps. A
+/// resolver that starts a child process must enforce `deadline` on it itself
+/// (see [`output_within`]): the blocking thread cannot be cancelled from here,
+/// only abandoned, and an in-process read that never returns simply has its
+/// result dropped.
+async fn gather<F>(
+    sources: Vec<Source>,
+    deadline: Duration,
+    grace: Duration,
+    resolver: F,
+) -> Vec<(
+    usize,
+    Source,
+    Vec<Candidate>,
+    Option<String>,
+    Option<String>,
+)>
+where
+    F: Fn(&Source, Duration) -> Resolved + Send + Sync + 'static,
+{
+    let resolver = std::sync::Arc::new(resolver);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, source) in sources.into_iter().enumerate() {
+        let resolver = resolver.clone();
+        tasks.spawn(async move {
+            let for_blocking = source.clone();
+            let work = tokio::task::spawn_blocking(move || resolver(&for_blocking, deadline));
+            let (candidates, error, running) = match tokio::time::timeout(deadline + grace, work)
+                .await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(e)) => {
+                    // A panicking source must not take the others with it,
+                    // and must not be reported as "nothing new" either.
+                    tracing::error!("firmware source {} panicked while listing: {e}", source.id);
+                    (Vec::new(), Some(format!("failed while listing: {e}")), None)
+                }
+                Err(_) => {
+                    tracing::warn!("firmware source {} {}", source.id, timed_out(deadline));
+                    (Vec::new(), Some(timed_out(deadline)), None)
+                }
+            };
+            (index, source, candidates, error, running)
+        });
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(one) => resolved.push(one),
+            Err(e) => tracing::error!("a firmware source task failed: {e}"),
+        }
+    }
+    resolved
+}
+
 /// Asks every enabled source what it offers, all at once.
 ///
 /// One `spawn_blocking` per source rather than one for the lot. Each runs
@@ -598,26 +753,15 @@ async fn fan_out() -> Catalog {
         .unwrap_or_else(|| "unknown".to_string());
 
     let enabled: Vec<Source> = sources.sources.into_iter().filter(|s| s.enabled).collect();
+    let running_hint_for_sources = running_hint.clone();
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, source) in enabled.into_iter().enumerate() {
-        let hint = running_hint.clone();
-        tasks.spawn_blocking(move || {
-            let (candidates, error, running) = resolve(&source, &hint);
-            (index, source, candidates, error, running)
-        });
-    }
-
-    let mut resolved = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(one) => resolved.push(one),
-            // A panicking source must not take the others with it, and must
-            // not be reported as "nothing new" either -- but there is no
-            // source left to attach an error to, so say it in the log.
-            Err(e) => tracing::error!("a firmware source panicked while listing: {e}"),
-        }
-    }
+    let mut resolved = gather(
+        enabled,
+        SOURCE_DEADLINE,
+        SOURCE_GRACE,
+        move |source, deadline| resolve(source, &running_hint_for_sources, deadline),
+    )
+    .await;
     // Answers arrive in whatever order they finish; the page's order is the
     // configured one.
     resolved.sort_by_key(|(index, ..)| *index);
@@ -909,6 +1053,114 @@ mod tests {
         let found = list_local(&source, "local").expect("lists");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relation, Relation::Unknown);
+    }
+
+    /// One source that hangs past the deadline must not cost the others their
+    /// answers: the fast one is kept whole and the slow one says it timed out.
+    #[tokio::test]
+    async fn a_slow_source_times_out_alone() {
+        let source = |id: &str| Source {
+            id: id.into(),
+            label: id.into(),
+            kind: SourceKind::Local,
+            location: format!("/nonexistent/{id}"),
+            enabled: true,
+        };
+        let candidate = Candidate {
+            version: "v2.9.0".into(),
+            relation: Relation::Newer,
+            prerelease: false,
+            trust: Trust::Unverified,
+            file: None,
+            size_bytes: None,
+        };
+        let kept = candidate.clone();
+        let resolved = gather(
+            vec![source("slow"), source("fast")],
+            Duration::from_millis(200),
+            Duration::ZERO,
+            move |source, _| {
+                if source.id == "slow" {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    (Vec::new(), None, None)
+                } else {
+                    (vec![kept.clone()], None, Some("v2.8.0".into()))
+                }
+            },
+        )
+        .await;
+
+        let find = |id: &str| {
+            resolved
+                .iter()
+                .find(|(_, s, ..)| s.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+        let (_, _, fast_candidates, fast_error, fast_running) = find("fast");
+        assert_eq!(fast_candidates, &vec![candidate]);
+        assert_eq!(fast_error, &None);
+        assert_eq!(fast_running.as_deref(), Some("v2.8.0"));
+
+        let (_, _, slow_candidates, slow_error, _) = find("slow");
+        assert!(slow_candidates.is_empty());
+        let message = slow_error.as_deref().unwrap_or_default();
+        assert!(message.starts_with("timed out after"), "{message}");
+    }
+
+    /// The child, not just the wait, ends at the deadline. A shell that runs a
+    /// long `sleep` is the shape of `tpi-selfupdate` running `curl`: killing
+    /// only the shell would leave the `sleep` holding the pipes.
+    #[test]
+    fn a_hung_child_and_its_children_are_killed_at_the_deadline() {
+        let marker = TempDir::new("hung").expect("tempdir");
+        let pidfile = marker.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()));
+
+        let started = Instant::now();
+        let out = output_within(command, Duration::from_millis(500)).expect("spawns");
+        assert!(out.is_none(), "it should have timed out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the shell wrote the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Dead means gone, or a zombie waiting for an init that has not got
+        // to it yet (a container's pid 1 may never). Give the kernel a moment.
+        let running = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.trim_start().chars().next())
+                })
+                .is_some_and(|state| state != 'Z' && state != 'X')
+        };
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = running(pid);
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive, "the grandchild is still running");
+    }
+
+    #[test]
+    fn a_child_that_finishes_in_time_returns_its_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("echo out; echo err >&2; exit 3");
+        let out = output_within(command, Duration::from_secs(10))
+            .expect("spawns")
+            .expect("finishes");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
     }
 
     fn card_source(card: &std::path::Path) -> Source {

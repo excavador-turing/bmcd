@@ -38,6 +38,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   next `GET /firmware/available` starts a refresh. A fan-out already
   running when the park finishes cannot clear the mark, since it may have
   read the card before the image was there.
+- **One hung firmware source discarded every other source's answer.** The
+  catalogue refresh waited for all sources and was cut off as a whole after
+  10 minutes, so a source that hung (a stuck `curl` under
+  `tpi-selfupdate --list`) cost the fast sources their results too: nothing
+  was cached or persisted and the page kept the old listing. Each source now
+  has its own 180 s deadline (the slowest real listing measured 170 s with the
+  old updater script, 5 s with the fixed one). A source that overruns reports
+  `timed out after 180 s` as its own error, and the others are cached and
+  persisted as usual. The updater runs in its own process group, and on the
+  deadline the whole group (the script and its `curl`) is killed, so hung
+  downloads do not pile up on the board. The 10-minute limit on the refresh as
+  a whole stays as the outer guard.
 
 ## [2.42.1] — 2026-10-31
 
