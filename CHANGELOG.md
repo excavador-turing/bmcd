@@ -10,6 +10,77 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.42.2] — 2026-11-01
+
+### Fixed
+
+- **A board with no SD card (or a card with no `firmware` folder) kept
+  retrying the whole firmware check every two minutes and showed a warning
+  for it.** The `SD card` source answered "`/mnt/sdcard/firmware` is not a
+  directory" as an error, and any source error shortens the catalogue's cache
+  from 30 minutes to 2 minutes and keeps it off the overlay, so a card-less
+  board never kept a good catalogue across a reboot and the firmware page
+  carried "SD card: This source returned nothing usable" for ever. A source
+  on the card now reports nothing, and no error, when the card is not
+  mounted (decided as `os_park` and the staging code decide it: the mount
+  point has a different device from its parent) or when the card has no
+  `firmware` folder. A card that is there and unreadable (`firmware` is a
+  file, the folder will not open) is still an error, and so is a missing
+  folder for a local source configured away from the card. So is a card the
+  kernel sees (`/dev/mmcblk0`) that nothing has mounted, which now says "an SD
+  card is inserted but not mounted (unsupported or damaged filesystem?)". A
+  mount point that cannot be inspected at all is an error too, not "no card".
+  The response shape is unchanged.
+- **The message for parking an image with no card said "Insert one, or upload
+  without parking", which is a dead end in the web interface.** It now says
+  the image was not saved because no SD card is mounted (or, when the kernel
+  sees a card that nothing mounted, that it is inserted but not mounted), and
+  that installing directly is `tpi firmware upload` without `--park` or the
+  interface's install option.
+- **An image parked on the card did not appear in the catalogue for up to 30
+  minutes.** A successful park now marks the cached catalogue stale, so the
+  next `GET /firmware/available` starts a refresh. A fan-out already
+  running when the park finishes cannot clear the mark, since it may have
+  read the card before the image was there.
+- **One hung firmware source discarded every other source's answer.** The
+  catalogue refresh waited for all sources and was cut off as a whole after
+  10 minutes, so a source that hung (a stuck `curl` under
+  `tpi-selfupdate --list`) cost the fast sources their results too: nothing
+  was cached or persisted and the page kept the old listing. Each source now
+  has its own 360 s deadline (the slowest fan-out on record is bmc-2 on
+  2026-09-12, about 230 s). A source that overruns reports
+  `timed out after 360 s` as its own error, and the others are cached and
+  persisted as usual. The updater runs in its own process group; on the
+  deadline the whole group (the script and its `curl`) is killed while the
+  script is still unreaped, so hung downloads do not pile up on the board,
+  and output is read until both pipes close or the deadline, so a `curl` that
+  outlives its script cannot hold the check up either. A source whose
+  blocking call never returned (a wedged read of a failing card) is skipped
+  on the next check with "still busy from the previous check", rather than
+  leaving another thread behind each time. When the only errors are such
+  slow sources, or a card that is inserted but not mounted (which a retry in
+  two minutes will not change), the retry waits 15 minutes instead of 2, so a
+  slow but working board does not start its `curl`-heavy listings every few
+  minutes against GitHub's 60 requests an hour. The 10-minute limit on the refresh as
+  a whole stays as the outer guard.
+- **Concurrent requests with nothing cached each started their own firmware
+  check, and a park that landed as a check finished could go unnoticed.** A
+  request that finds the catalogue empty now waits for the one refresh (it
+  does not start another), and answers when it completes as before; if
+  nothing arrives within 10 minutes it answers an empty list with
+  `refreshing: true`. The stale mark and the check's result are now decided
+  under the same lock.
+- **`GET /api/bmc/info` (and `opt=get&type=info`) says whether an SD card is
+  mounted.** The `SD card` entry in `storage` gains `mounted`, decided by the
+  same mount-point test the park and staging code use (a mount point that
+  cannot be inspected reads as not mounted). Before, a client could
+  only guess, by noticing that the entry's sizes equalled the BMC's (`statvfs`
+  on the empty `/mnt/sdcard` answers for the volume underneath). Additive: the
+  `BMC` entry has no `mounted`, the `SD card` entry is present under the same
+  rule as before, and its sizes are reported as before, so an older interface
+  is unaffected. The sizes are not a statement about a card while `mounted` is
+  false; read the new field instead.
+
 ## [2.42.1] — 2026-10-31
 
 ### Fixed

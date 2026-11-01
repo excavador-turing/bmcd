@@ -231,10 +231,15 @@ impl UpgradeWorker {
         // metrics token and the promotion log; a 37 MB image parked there
         // twice is how it fills, and the failure would land on the next
         // update rather than here.
-        if !is_mount_point(std::path::Path::new(PARK_MOUNT)) {
-            bail!(
-                "{PARK_MOUNT} is not mounted, so there is no card to park an image on. Insert one, or upload without parking to install straight away."
-            );
+        match is_mount_point(std::path::Path::new(PARK_MOUNT)) {
+            Ok(true) => {}
+            Ok(false) if card_inserted() => bail!(
+                "the image was not saved: an SD card is inserted but not mounted (unsupported or damaged filesystem?). Install it straight away with `tpi firmware upload` without `--park` (the web interface's install option does the same)."
+            ),
+            Ok(false) => bail!(
+                "the image was not saved: no SD card is mounted at {PARK_MOUNT}. Insert a card and try again, or install it straight away with `tpi firmware upload` without `--park` (the web interface's install option does the same)."
+            ),
+            Err(e) => bail!("the image was not saved: cannot tell whether {PARK_MOUNT} is mounted: {e}"),
         }
         match statvfs(std::path::Path::new(PARK_MOUNT)) {
             Ok(stat) => {
@@ -278,6 +283,9 @@ impl UpgradeWorker {
 
         tokio::fs::rename(&partial_path, &final_path).await?;
         tracing::info!("parked {}", final_path.to_string_lossy());
+        // The catalogue's `local` source was read before this file existed, and
+        // would not read it again for up to half an hour.
+        crate::app::firmware_catalog::invalidate().await;
         Ok(())
     }
 
@@ -396,7 +404,7 @@ fn select_staging_dir(image_size: u64) -> PathBuf {
     for candidate in UPGRADE_STAGING_DIRS {
         let path = Path::new(candidate);
 
-        if !is_mount_point(path) {
+        if !is_mounted_or_false(path) {
             tracing::debug!("staging: {} is not a mount point", candidate);
             continue;
         }
@@ -449,16 +457,42 @@ fn select_staging_dir(image_size: u64) -> PathBuf {
 /// one of the directory it sits in. Both `/mnt/sdcard` and `/mnt/overlay` exist
 /// as empty directories when nothing is mounted on them, and writing an image
 /// there would land on the small root filesystem instead.
-pub(crate) fn is_mount_point(path: &Path) -> bool {
+///
+/// A path that is not there is not a mount point (`Ok(false)`). Anything else
+/// that stops it being read is an `Err`, not a "no": a caller that treated an
+/// I/O error as "no card" would tell the operator to insert one.
+pub(crate) fn is_mount_point(path: &Path) -> std::io::Result<bool> {
     let Some(parent) = path.parent() else {
         // `/` has no parent and is always a mount point.
-        return true;
+        return Ok(true);
     };
 
     match (path.metadata(), parent.metadata()) {
-        (Ok(dir), Ok(parent)) => dir.dev() != parent.dev(),
-        _ => false,
+        (Ok(dir), Ok(parent)) => Ok(dir.dev() != parent.dev()),
+        (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        (Err(e), _) | (_, Err(e)) => Err(e),
     }
+}
+
+/// [`is_mount_point`] for a caller that can only act on a yes or a no: an error
+/// is logged and counts as "not a mount point".
+pub(crate) fn is_mounted_or_false(path: &Path) -> bool {
+    is_mount_point(path).unwrap_or_else(|e| {
+        tracing::warn!(
+            "cannot tell whether {} is a mount point: {e}",
+            path.display()
+        );
+        false
+    })
+}
+
+/// The SD slot's block device. The kernel creates it when it sees a card, so
+/// it is there for a card that nothing has mounted -- an unsupported or damaged
+/// filesystem -- and absent for an empty slot.
+pub(crate) const CARD_DEVICE: &str = "/dev/mmcblk0";
+
+pub(crate) fn card_inserted() -> bool {
+    Path::new(CARD_DEVICE).exists()
 }
 
 /// Copies bytes from `reader` to `writer` until the reader is exhausted. This function
@@ -512,12 +546,12 @@ mod test {
 
     #[test]
     fn mount_point_detection() {
-        assert!(is_mount_point(Path::new("/")));
+        assert!(is_mount_point(Path::new("/")).unwrap());
         // a directory inside a mount shares the device id of its parent.
         let dir = TempDir::new("staging_test").unwrap();
-        assert!(!is_mount_point(dir.path()));
+        assert!(!is_mount_point(dir.path()).unwrap());
         // a directory that is not there cannot be written to either.
-        assert!(!is_mount_point(&dir.path().join("absent")));
+        assert_eq!(is_mount_point(&dir.path().join("absent")).ok(), Some(false));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "bmcd"
-version = "2.42.1"
+version = "2.42.2"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.98.1"
@@ -46,7 +46,7 @@ humansize = "2.1.3"
 humantime = "2.1.0"
 if-addrs = "0.13.3"
 inotify = "0.11.0"
-nix = { version = "0.29.0", features = ["fs", "feature"] }
+nix = { version = "0.29.0", features = ["fs", "feature", "signal"] }
 openssl = "0.10.70"
 pin-project = "1.1.9"
 pwhash = "1.0.0"

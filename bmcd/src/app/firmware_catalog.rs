@@ -27,6 +27,7 @@
 //! never rendered as "nothing new" -- those are different claims and only the
 //! caller knows which one it is about to make.
 use crate::app::firmware_sources::{Source, SourceKind};
+use crate::app::sdcard_files::SDCARD_ROOT;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -51,6 +52,13 @@ const FRESH: Duration = Duration::from_secs(1800);
 /// for as long as it is open. Raising it further trades freshness for calm;
 /// lowering it is how a small board is worn down.
 const FRESH_AFTER_ERROR: Duration = Duration::from_secs(120);
+/// When the only thing wrong is something that a retry in two minutes will not
+/// change -- sources that were slow (a timeout, or one still busy from the last
+/// check), or a card the kernel sees that nothing mounted -- the retry waits
+/// longer. A slow but working board would otherwise start the `curl`-heavy
+/// listings again every couple of minutes, against a GitHub allowance of 60
+/// requests an hour, and a board with an unmountable card would do it for ever.
+const FRESH_AFTER_RETRY_LATER: Duration = Duration::from_secs(900);
 
 /// How a candidate relates to what is running.
 ///
@@ -158,11 +166,152 @@ fn relation_from(value: Option<&str>) -> Relation {
     }
 }
 
+/// How long one source may take before the others stop waiting for it.
+///
+/// The slowest fan-out on record is bmc-2 on 2026-09-12, about 230 s for the
+/// four sources (see [`REFRESH_CLAIM`]), so 360 s leaves that board room to
+/// work and still bounds a source that hangs. With [`SOURCE_GRACE`] it stays
+/// well inside [`REFRESH_CLAIM`], which remains the outer guard.
+const SOURCE_DEADLINE: Duration = Duration::from_secs(360);
+
+/// Slack for the async side to wait beyond [`SOURCE_DEADLINE`], so that a
+/// remote source reports its own timeout (and has killed its child) before
+/// the caller gives up on it.
+const SOURCE_GRACE: Duration = Duration::from_secs(5);
+
+/// The error of a source that was skipped because its previous check never
+/// returned. See [`gather`].
+const STILL_BUSY: &str = "still busy from the previous check";
+
+fn timed_out(deadline: Duration) -> String {
+    format!("timed out after {} s", deadline.as_secs())
+}
+
+/// The error of a card the kernel sees that nothing has mounted.
+const UNMOUNTED_CARD: &str =
+    "an SD card is inserted but not mounted (unsupported or damaged filesystem?)";
+
+/// Is this error one that a quick retry will not change: slowness, or a card
+/// that stays unmountable until somebody acts on it?
+fn is_retry_later(error: &str) -> bool {
+    error.starts_with("timed out after ") || error == STILL_BUSY || error == UNMOUNTED_CARD
+}
+
+/// Runs `command` to completion like `Command::output`, but gives up at
+/// `deadline`. `Ok(None)` means the deadline passed: the child's process
+/// group has been sent SIGKILL and the child reaped.
+///
+/// `spawn_blocking` cannot be cancelled, so a deadline on the task alone would
+/// leave the work behind: `tpi-selfupdate` is a shell script that runs `curl`,
+/// and a `curl` that hangs would otherwise live on for as long as the TCP
+/// connection does, one more for every refresh, on a board with 116 MB of RAM.
+/// So the child is started in its own process group and the whole group is
+/// killed on expiry -- killing only the script would leave its `curl` holding
+/// the pipes.
+///
+/// The order matters in two places. The child is NOT reaped until both pipes
+/// have reached end-of-file or the deadline has passed, because the pipes are
+/// what a grandchild still running keeps open, and a reaped child's group id
+/// can be reused: `killpg` is only ever sent while the child is still a
+/// zombie, which keeps the id reserved. And everything after the pipes closes
+/// is bounded by the same deadline.
+///
+/// What is not covered: a process that left the group on purpose (`setsid`)
+/// and holds the pipes keeps the two reader threads alive until it lets go;
+/// the caller does not wait for them.
+fn output_within(
+    mut command: Command,
+    deadline: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    let remaining = || deadline.saturating_sub(started.elapsed());
+
+    // Drained on threads so a full pipe cannot stall the child, and each
+    // reports once, at end-of-file, so the wait below has a timeout to use.
+    let (done, finished) = channel::<(bool, Vec<u8>)>();
+    fn drain<R: Read + Send + 'static>(
+        is_stdout: bool,
+        pipe: Option<R>,
+        done: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            let _ = done.send((is_stdout, buffer));
+        });
+    }
+    drain(true, child.stdout.take(), done.clone());
+    drain(false, child.stderr.take(), done);
+
+    // The group id is the child's pid (`process_group(0)`). Sent while the
+    // child is unreaped; `kill` and `wait` on the child itself follow whatever
+    // `killpg` said, so nothing is left as a zombie.
+    let kill = |child: &mut std::process::Child| {
+        let group = nix::unistd::Pid::from_raw(child.id() as i32);
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        match finished.recv_timeout(remaining()) {
+            Ok((true, bytes)) => stdout = Some(bytes),
+            Ok((false, bytes)) => stderr = Some(bytes),
+            Err(RecvTimeoutError::Timeout) => {
+                kill(&mut child);
+                return Ok(None);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                kill(&mut child);
+                return Err(std::io::Error::other(
+                    "a reader of the child's output ended without a result",
+                ));
+            }
+        }
+    }
+
+    // Both pipes are closed: the child is finished or about to be.
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Some(std::process::Output {
+                    status,
+                    stdout: stdout.unwrap_or_default(),
+                    stderr: stderr.unwrap_or_default(),
+                }));
+            }
+            Ok(None) if remaining().is_zero() => {
+                kill(&mut child);
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(remaining().min(Duration::from_millis(50))),
+            Err(e) => {
+                kill(&mut child);
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Runs the updater's listing for one remote source.
 ///
 /// Blocking on purpose, called from `spawn_blocking`; the script bounds its own
 /// network calls with `curl --max-time`.
-fn list_remote(source: &Source) -> Result<Listing, String> {
+fn list_remote(source: &Source, deadline: Duration) -> Result<Listing, String> {
     let mut command = Command::new(SELFUPDATE);
     command.arg("--list");
     match source.kind {
@@ -175,9 +324,11 @@ fn list_remote(source: &Source) -> Result<Listing, String> {
         SourceKind::Local => unreachable!("local sources are read directly"),
     }
 
-    let output = command
-        .output()
-        .map_err(|e| format!("cannot run {SELFUPDATE}: {e}"))?;
+    let output = match output_within(command, deadline) {
+        Ok(Some(output)) => output,
+        Ok(None) => return Err(timed_out(deadline)),
+        Err(e) => return Err(format!("cannot run {SELFUPDATE}: {e}")),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -231,9 +382,75 @@ fn failure_reason(stderr: &str, code: Option<i32>) -> String {
 /// on this SoC, which is fine on demand and far too slow for a page that lists
 /// a dozen, so integrity here is reported as unverified rather than computed.
 fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> {
+    let card = std::path::Path::new(SDCARD_ROOT);
+    let state = match crate::app::upgrade_worker::is_mount_point(card) {
+        Ok(true) => Card::Mounted,
+        Ok(false) if crate::app::upgrade_worker::card_inserted() => Card::Unmounted,
+        Ok(false) => Card::Absent,
+        Err(e) => return Err(format!("cannot tell whether {SDCARD_ROOT} is mounted: {e}")),
+    };
+    list_local_in(source, running, card, state)
+}
+
+/// What is in the SD card slot, as far as the daemon can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Card {
+    /// No card: `/mnt/sdcard` is an empty directory of the root filesystem.
+    Absent,
+    /// A card the kernel sees (`/dev/mmcblk0`) that nothing has mounted -- a
+    /// filesystem it does not know, or a damaged one.
+    Unmounted,
+    Mounted,
+}
+
+/// [`list_local`] with the card's root and state passed in, so each state of a
+/// real board can be tested without a mount.
+///
+/// **A source on the card that has nothing to read is not an error.** Without
+/// a card the board has `/mnt/sdcard` as an empty directory on its root
+/// filesystem, and a card that was never given a `firmware` folder has no
+/// such directory either. Both are the ordinary state of a board and both
+/// mean "this source offers nothing" -- which is what an empty list with no
+/// error says. Reporting them as errors made every card-less board show a
+/// warning, retry the whole fan-out every two minutes, and never persist its
+/// catalogue.
+///
+/// What stays an error is a card that IS there and cannot be read: one the
+/// kernel sees but nothing mounted, a `firmware` that is a file, a directory
+/// that will not open. Those are things the operator can act on. A source
+/// outside the card keeps the old rule too, since a location that is missing
+/// there is a typo, not a state.
+fn list_local_in(
+    source: &Source,
+    running: &str,
+    card_root: &std::path::Path,
+    card: Card,
+) -> Result<Vec<Candidate>, String> {
     let dir = std::path::Path::new(&source.location);
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", source.location));
+    let on_card = dir.starts_with(card_root);
+    // A folder left on the mount point's own directory (the root filesystem's)
+    // is not the card's, and listing it would offer images that vanish when a
+    // card is inserted.
+    if on_card {
+        match card {
+            Card::Mounted => {}
+            Card::Absent => return Ok(Vec::new()),
+            Card::Unmounted => {
+                return Err(UNMOUNTED_CARD.to_string());
+            }
+        }
+    }
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a directory", source.location)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if on_card {
+                Ok(Vec::new())
+            } else {
+                Err(format!("{} is not a directory", source.location))
+            };
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", source.location)),
     }
 
     let mut candidates = Vec::new();
@@ -284,16 +501,17 @@ fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> 
     Ok(candidates)
 }
 
-fn resolve(
-    source: &Source,
-    running_hint: &str,
-) -> (Vec<Candidate>, Option<String>, Option<String>) {
+/// What one source came to: its candidates, its error, the running version it
+/// reported.
+type Resolved = (Vec<Candidate>, Option<String>, Option<String>);
+
+fn resolve(source: &Source, running_hint: &str, deadline: Duration) -> Resolved {
     match source.kind {
         SourceKind::Local => match list_local(source, running_hint) {
             Ok(c) => (c, None, None),
             Err(e) => (Vec::new(), Some(e), None),
         },
-        SourceKind::Github | SourceKind::Http => match list_remote(source) {
+        SourceKind::Github | SourceKind::Http => match list_remote(source, deadline) {
             Ok(listing) => {
                 let trust = match source.kind {
                     SourceKind::Github => Trust::Verified,
@@ -367,6 +585,8 @@ async fn restore() -> Option<Cached> {
         // Restored, therefore stale by definition: `get` compares the age
         // against FRESH and starts a refresh behind the answer it serves.
         ok: true,
+        retry_later_only: false,
+        stale: false,
     })
 }
 
@@ -419,6 +639,55 @@ struct Cached {
     at: Instant,
     value: Catalog,
     ok: bool,
+    /// Not `ok`, and every error is one a quick retry will not change. See
+    /// [`FRESH_AFTER_RETRY_LATER`].
+    retry_later_only: bool,
+    /// Something this listing reads has changed since it was taken, so the
+    /// next `get` refreshes whatever its age. See [`invalidate`].
+    stale: bool,
+}
+
+impl Cached {
+    /// How long this answer is good for.
+    fn ttl(&self) -> Duration {
+        if self.ok {
+            FRESH
+        } else if self.retry_later_only {
+            FRESH_AFTER_RETRY_LATER
+        } else {
+            FRESH_AFTER_ERROR
+        }
+    }
+}
+
+/// Is it time to ask the sources again? The one place the rule is written, so
+/// a test of it is a test of `get`.
+fn needs_refresh(force: bool, stale: bool, age: Duration, ttl: Duration) -> bool {
+    force || stale || age >= ttl
+}
+
+/// How many times [`invalidate`] has been called. A fan-out compares the value
+/// it started with against the value when it finishes, so a change made while
+/// it was running -- after it had read the source that changed -- is not
+/// papered over by a result that looks fresh.
+static INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Marks the cached listing as out of date, so the next `get` starts a
+/// refresh.
+///
+/// Called when something the catalogue reads is changed by the daemon itself:
+/// an image parked on the card is invisible until the `local` source is read
+/// again, and without this it stayed so for up to [`FRESH`]. Nothing is
+/// fetched here; the cost is paid by the next reader, as for any other expiry.
+pub async fn invalidate() {
+    // The count moves under the cache lock, and a fan-out reads it under the
+    // same lock when it stores its result, so either the fan-out sees this
+    // change or this sees the fan-out's entry. Neither can miss the other.
+    let mut guard = cache().lock().await;
+    INVALIDATIONS.fetch_add(1, AtomicOrdering::AcqRel);
+    if let Some(cached) = guard.as_mut() {
+        cached.stale = true;
+    }
 }
 
 fn cache() -> &'static Mutex<Option<Cached>> {
@@ -501,6 +770,112 @@ fn release_refresh() {
     refresh_claim().store(0, AtomicOrdering::Release);
 }
 
+/// Sources whose blocking call has not returned, by id.
+///
+/// A blocking thread cannot be cancelled. A remote source's child is killed at
+/// the deadline so its thread returns; an in-process read wedged on a dying
+/// card would not, and without this every refresh would leave one more such
+/// thread behind. A source still in here is skipped, not started again.
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static IN_FLIGHT: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// Removes a source from [`in_flight`] when its blocking call ends, however
+/// it ends.
+struct InFlight(String);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Asks each source, all at once, and waits for none of them longer than
+/// `deadline` (plus `grace`).
+///
+/// A source that is still going when its turn is up reports "timed out" as its
+/// own error and the rest are kept. Without the bound one hung source held the
+/// whole fan-out until [`REFRESH_CLAIM`], and the timeout around the fan-out
+/// then threw away the answers of every source that had already finished.
+///
+/// The resolver is a parameter so a test can use a source that sleeps. A
+/// resolver that starts a child process must enforce `deadline` on it itself
+/// (see [`output_within`]): the blocking thread cannot be cancelled from here,
+/// only abandoned, and an in-process read that never returns simply has its
+/// result dropped.
+async fn gather<F>(
+    sources: Vec<Source>,
+    deadline: Duration,
+    grace: Duration,
+    resolver: F,
+) -> Vec<(
+    usize,
+    Source,
+    Vec<Candidate>,
+    Option<String>,
+    Option<String>,
+)>
+where
+    F: Fn(&Source, Duration) -> Resolved + Send + Sync + 'static,
+{
+    let resolver = std::sync::Arc::new(resolver);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, source) in sources.into_iter().enumerate() {
+        let resolver = resolver.clone();
+        tasks.spawn(async move {
+            let claimed = in_flight()
+                .lock()
+                .map(|mut set| set.insert(source.id.clone()))
+                .unwrap_or(true);
+            if !claimed {
+                tracing::warn!("firmware source {} is {STILL_BUSY}; skipping it", source.id);
+                return (
+                    index,
+                    source,
+                    Vec::new(),
+                    Some(STILL_BUSY.to_string()),
+                    None,
+                );
+            }
+            let guard = InFlight(source.id.clone());
+            let for_blocking = source.clone();
+            let work = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                resolver(&for_blocking, deadline)
+            });
+            let (candidates, error, running) = match tokio::time::timeout(deadline + grace, work)
+                .await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(e)) => {
+                    // A panicking source must not take the others with it,
+                    // and must not be reported as "nothing new" either.
+                    tracing::error!("firmware source {} panicked while listing: {e}", source.id);
+                    (Vec::new(), Some(format!("failed while listing: {e}")), None)
+                }
+                Err(_) => {
+                    tracing::warn!("firmware source {} {}", source.id, timed_out(deadline));
+                    (Vec::new(), Some(timed_out(deadline)), None)
+                }
+            };
+            (index, source, candidates, error, running)
+        });
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(one) => resolved.push(one),
+            Err(e) => tracing::error!("a firmware source task failed: {e}"),
+        }
+    }
+    resolved
+}
+
 /// Asks every enabled source what it offers, all at once.
 ///
 /// One `spawn_blocking` per source rather than one for the lot. Each runs
@@ -517,6 +892,7 @@ fn release_refresh() {
 /// against the larger figure; `tpi` 1.5.1 allows 180 s for exactly this and
 /// has a test pinning that bound to the measurement.
 async fn fan_out() -> Catalog {
+    let invalidations = INVALIDATIONS.load(AtomicOrdering::Acquire);
     let sources = crate::app::firmware_sources::load().await;
     // The api layer already reads /etc/os-release for this; a second reader
     // here could drift from the one the About page uses.
@@ -525,26 +901,15 @@ async fn fan_out() -> Catalog {
         .unwrap_or_else(|| "unknown".to_string());
 
     let enabled: Vec<Source> = sources.sources.into_iter().filter(|s| s.enabled).collect();
+    let running_hint_for_sources = running_hint.clone();
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, source) in enabled.into_iter().enumerate() {
-        let hint = running_hint.clone();
-        tasks.spawn_blocking(move || {
-            let (candidates, error, running) = resolve(&source, &hint);
-            (index, source, candidates, error, running)
-        });
-    }
-
-    let mut resolved = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(one) => resolved.push(one),
-            // A panicking source must not take the others with it, and must
-            // not be reported as "nothing new" either -- but there is no
-            // source left to attach an error to, so say it in the log.
-            Err(e) => tracing::error!("a firmware source panicked while listing: {e}"),
-        }
-    }
+    let mut resolved = gather(
+        enabled,
+        SOURCE_DEADLINE,
+        SOURCE_GRACE,
+        move |source, deadline| resolve(source, &running_hint_for_sources, deadline),
+    )
+    .await;
     // Answers arrive in whatever order they finish; the page's order is the
     // configured one.
     resolved.sort_by_key(|(index, ..)| *index);
@@ -557,11 +922,13 @@ async fn fan_out() -> Catalog {
         .unwrap_or(running_hint);
 
     let mut ok = true;
+    let mut retry_later_only = true;
     let sources = resolved
         .into_iter()
         .map(|(_, source, candidates, error, _)| {
-            if error.is_some() {
+            if let Some(error) = &error {
                 ok = false;
+                retry_later_only &= is_retry_later(error);
             }
             SourceCatalog {
                 id: source.id,
@@ -582,11 +949,20 @@ async fn fan_out() -> Catalog {
         age_seconds: 0,
     };
 
-    *cache().lock().await = Some(Cached {
-        at: Instant::now(),
-        value: value.clone(),
-        ok,
-    });
+    // The guard is taken BEFORE the count is read, and `invalidate` moves the
+    // count under the same lock: a park that lands now is either counted here
+    // or marks the entry this stores, never neither.
+    {
+        let mut guard = cache().lock().await;
+        let stale = INVALIDATIONS.load(AtomicOrdering::Acquire) != invalidations;
+        *guard = Some(Cached {
+            at: Instant::now(),
+            value: value.clone(),
+            ok,
+            retry_later_only: !ok && retry_later_only,
+            stale,
+        });
+    }
 
     // Only a complete answer is kept. A fan-out where one source errored is
     // good enough to show -- the page renders the error beside the others --
@@ -680,25 +1056,62 @@ pub fn prime() {
 /// Only a cold cache waits, and only for one fan-out; `prime()` makes that
 /// rare.
 pub async fn get(force: bool) -> Catalog {
-    let snapshot = {
-        let guard = cache().lock().await;
-        guard
-            .as_ref()
-            .map(|c| (c.value.clone(), c.at.elapsed(), c.ok))
+    let Some((mut value, age, ttl, stale)) = snapshot().await else {
+        return cold().await;
     };
 
-    let Some((mut value, age, ok)) = snapshot else {
-        return fan_out().await;
-    };
-
-    let ttl = if ok { FRESH } else { FRESH_AFTER_ERROR };
-    if force || age >= ttl {
+    if needs_refresh(force, stale, age, ttl) {
         spawn_refresh();
     }
 
     value.age_seconds = age.as_secs();
     value.refreshing = refreshing();
     value
+}
+
+/// The cached answer, how old it is, how long it is good for, and whether it
+/// has been marked stale.
+async fn snapshot() -> Option<(Catalog, Duration, Duration, bool)> {
+    let guard = cache().lock().await;
+    guard
+        .as_ref()
+        .map(|c| (c.value.clone(), c.at.elapsed(), c.ttl(), c.stale))
+}
+
+/// How often a caller with nothing cached looks again.
+const COLD_POLL: Duration = Duration::from_millis(250);
+
+/// A caller that finds nothing cached waits for THE refresh, not one of its own.
+///
+/// This used to run a fan-out directly, bypassing the claim, so every cold
+/// request started another. With a fan-out that can take minutes, a few
+/// requests from an impatient page would be a dozen `curl`s against a GitHub
+/// allowance of sixty an hour. It now joins the refresh that `prime()` started
+/// (or starts the one) and answers when it stores its result, as the direct
+/// call did, so a client that waits for a complete answer -- `tpi firmware
+/// check` -- still gets one.
+///
+/// Bounded by [`REFRESH_CLAIM`]. If nothing has been stored by then, the
+/// answer is an empty list with `refreshing: true`, which is what the web
+/// interface already draws while a refresh runs.
+async fn cold() -> Catalog {
+    let started = Instant::now();
+    while started.elapsed() < REFRESH_CLAIM {
+        spawn_refresh();
+        tokio::time::sleep(COLD_POLL).await;
+        if let Some((mut value, age, _, _)) = snapshot().await {
+            value.age_seconds = age.as_secs();
+            value.refreshing = refreshing();
+            return value;
+        }
+    }
+    Catalog {
+        checked_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        running: "unknown".to_string(),
+        sources: Vec::new(),
+        refreshing: true,
+        age_seconds: 0,
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +1248,376 @@ mod tests {
         let found = list_local(&source, "local").expect("lists");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relation, Relation::Unknown);
+    }
+
+    /// One source that hangs past the deadline must not cost the others their
+    /// answers: the fast one is kept whole and the slow one says it timed out.
+    #[tokio::test]
+    async fn a_slow_source_times_out_alone() {
+        let source = |id: &str| Source {
+            id: id.into(),
+            label: id.into(),
+            kind: SourceKind::Local,
+            location: format!("/nonexistent/{id}"),
+            enabled: true,
+        };
+        let candidate = Candidate {
+            version: "v2.9.0".into(),
+            relation: Relation::Newer,
+            prerelease: false,
+            trust: Trust::Unverified,
+            file: None,
+            size_bytes: None,
+        };
+        let kept = candidate.clone();
+        let resolved = gather(
+            vec![source("slow"), source("fast")],
+            Duration::from_millis(200),
+            Duration::ZERO,
+            move |source, _| {
+                if source.id == "slow" {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    (Vec::new(), None, None)
+                } else {
+                    (vec![kept.clone()], None, Some("v2.8.0".into()))
+                }
+            },
+        )
+        .await;
+
+        let find = |id: &str| {
+            resolved
+                .iter()
+                .find(|(_, s, ..)| s.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+        let (_, _, fast_candidates, fast_error, fast_running) = find("fast");
+        assert_eq!(fast_candidates, &vec![candidate]);
+        assert_eq!(fast_error, &None);
+        assert_eq!(fast_running.as_deref(), Some("v2.8.0"));
+
+        let (_, _, slow_candidates, slow_error, _) = find("slow");
+        assert!(slow_candidates.is_empty());
+        let message = slow_error.as_deref().unwrap_or_default();
+        assert!(message.starts_with("timed out after"), "{message}");
+    }
+
+    /// The pid a shell wrote, waiting (bounded) for it to be there.
+    fn pid_written_to(pidfile: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the shell never wrote {}", pidfile.display());
+    }
+
+    /// Dead means gone, or a zombie waiting for an init that has not got to it
+    /// yet (a container's pid 1 may never). Gives the kernel a moment.
+    fn is_gone(pid: i32) -> bool {
+        let running = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.trim_start().chars().next())
+                })
+                .is_some_and(|state| state != 'Z' && state != 'X')
+        };
+        for _ in 0..50 {
+            if !running(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// The child, not just the wait, ends at the deadline. A shell that runs a
+    /// long `sleep` is the shape of `tpi-selfupdate` running `curl`: killing
+    /// only the shell would leave the `sleep` holding the pipes.
+    #[test]
+    fn a_hung_child_and_its_children_are_killed_at_the_deadline() {
+        let marker = TempDir::new("hung").expect("tempdir");
+        let pidfile = marker.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()));
+
+        let started = Instant::now();
+        let out = output_within(command, Duration::from_secs(2)).expect("spawns");
+        assert!(out.is_none(), "it should have timed out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        assert!(
+            is_gone(pid_written_to(&pidfile)),
+            "the grandchild is still running"
+        );
+    }
+
+    /// The script exits at once and leaves its `curl` holding the pipes. The
+    /// output is not complete until they close, so the wait is bounded by the
+    /// deadline, not by the grandchild, and the group is still killed -- which
+    /// only works because the exited script has not been reaped yet.
+    #[test]
+    fn a_grandchild_holding_the_pipes_after_the_child_exits_is_bounded_and_killed() {
+        let marker = TempDir::new("holder").expect("tempdir");
+        let pidfile = marker.path().join("pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > {}; exit 0",
+            pidfile.display()
+        ));
+
+        let started = Instant::now();
+        let out = output_within(command, Duration::from_secs(2)).expect("spawns");
+        assert!(out.is_none(), "the pipes never closed, so it timed out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        assert!(
+            is_gone(pid_written_to(&pidfile)),
+            "the grandchild is still running"
+        );
+    }
+
+    #[test]
+    fn a_child_that_finishes_in_time_returns_its_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("echo out; echo err >&2; exit 3");
+        let out = output_within(command, Duration::from_secs(10))
+            .expect("spawns")
+            .expect("finishes");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    /// A source whose call never returned is skipped on the next fan-out, not
+    /// started again: no second thread behind the first.
+    #[tokio::test]
+    async fn a_source_still_running_from_the_last_check_is_skipped() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{mpsc, Arc, Mutex as StdMutex};
+
+        let source = Source {
+            id: "wedged-test-source".into(),
+            label: "wedged".into(),
+            kind: SourceKind::Local,
+            location: "/nonexistent/wedged".into(),
+            enabled: true,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Arc::new(StdMutex::new(wait));
+        let resolver = {
+            let calls = calls.clone();
+            let wait = wait.clone();
+            move |_: &Source, _: Duration| -> Resolved {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let _ = wait.lock().unwrap().recv();
+                (Vec::new(), None, None)
+            }
+        };
+
+        let first = gather(
+            vec![source.clone()],
+            Duration::from_millis(100),
+            Duration::ZERO,
+            resolver.clone(),
+        )
+        .await;
+        assert!(first[0]
+            .3
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("timed out"));
+
+        // The first call is still blocked on `wait`.
+        let second = gather(
+            vec![source.clone()],
+            Duration::from_millis(100),
+            Duration::ZERO,
+            resolver,
+        )
+        .await;
+        assert_eq!(second[0].3.as_deref(), Some(STILL_BUSY));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "no second call");
+        assert!(is_retry_later(STILL_BUSY));
+
+        // Let it go; the source can be asked again once it has returned.
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if !in_flight().lock().unwrap().contains(&source.id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!in_flight().lock().unwrap().contains(&source.id));
+    }
+
+    #[test]
+    fn slow_sources_are_retried_later_than_broken_ones() {
+        let cached = |ok, retry_later_only| Cached {
+            at: Instant::now(),
+            value: empty_catalog(false, 0),
+            ok,
+            retry_later_only,
+            stale: false,
+        };
+        assert_eq!(cached(true, false).ttl(), FRESH);
+        assert_eq!(cached(false, false).ttl(), FRESH_AFTER_ERROR);
+        assert_eq!(cached(false, true).ttl(), FRESH_AFTER_RETRY_LATER);
+        assert!(is_retry_later(&timed_out(SOURCE_DEADLINE)));
+        assert!(is_retry_later(UNMOUNTED_CARD));
+        assert!(!is_retry_later("curl: (6) Could not resolve host"));
+        assert!(SOURCE_DEADLINE + SOURCE_GRACE < REFRESH_CLAIM);
+    }
+
+    /// `get` asks this, so a stale mark is honoured at any age and a fresh,
+    /// unmarked answer is left alone.
+    #[test]
+    fn a_stale_answer_is_refreshed_whatever_its_age() {
+        let ttl = Duration::from_secs(1800);
+        assert!(needs_refresh(false, true, Duration::ZERO, ttl));
+        assert!(!needs_refresh(false, false, Duration::ZERO, ttl));
+        assert!(needs_refresh(true, false, Duration::ZERO, ttl));
+        assert!(needs_refresh(false, false, ttl, ttl));
+    }
+
+    fn card_source(card: &std::path::Path) -> Source {
+        Source {
+            id: "local".into(),
+            label: "SD card".into(),
+            kind: SourceKind::Local,
+            location: card.join("firmware").to_string_lossy().to_string(),
+            enabled: true,
+        }
+    }
+
+    /// A board with no card: `/mnt/sdcard` is an empty directory on the root
+    /// filesystem and nothing is mounted on it (`/proc/mounts` has no
+    /// `/dev/mmcblk0p1 /mnt/sdcard vfat` line). The mount check is the shipped
+    /// one -- a temporary directory shares its parent's device, exactly as
+    /// the empty mount point does -- so this is not a stand-in for it.
+    ///
+    /// This used to be an error, which put a warning on every card-less board
+    /// and held the catalogue at the two-minute retry for ever.
+    #[test]
+    fn no_card_is_an_empty_source_not_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        assert_eq!(
+            crate::app::upgrade_worker::is_mount_point(card.path()).ok(),
+            Some(false)
+        );
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), Card::Absent).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+
+        // Whatever sits in the empty mount point's directory is the root
+        // filesystem's, not a card's, and is not offered.
+        std::fs::create_dir_all(card.path().join("firmware")).expect("mkdir");
+        std::fs::write(
+            card.path().join("firmware/tp2-bmc-firmware-ota-v2.9.0.tpu"),
+            b"x",
+        )
+        .expect("write");
+        let found = list_local_in(&source, "v2.8.0", card.path(), Card::Absent).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A card the kernel sees (`/dev/mmcblk0`) that nothing mounted is a
+    /// fault the operator can fix, not an empty source.
+    #[test]
+    fn a_card_that_is_inserted_but_not_mounted_is_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        let source = card_source(card.path());
+        let err =
+            list_local_in(&source, "v2.8.0", card.path(), Card::Unmounted).expect_err("an error");
+        assert!(err.contains("inserted but not mounted"), "{err}");
+        assert!(is_retry_later(&err), "it must not retry every two minutes");
+    }
+
+    /// A card that is mounted and was never given a `firmware` folder. Board B
+    /// on 2026-11-01: `/dev/mmcblk0p1 /mnt/sdcard ext4 rw,relatime` in
+    /// `/proc/mounts`, `/mnt/sdcard/firmware` absent.
+    #[test]
+    fn a_card_without_the_folder_is_an_empty_source_not_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        std::fs::write(card.path().join("talos.img"), b"x").expect("write");
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), Card::Mounted).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_card_with_the_folder_lists_its_images() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        let folder = card.path().join("firmware");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        std::fs::write(folder.join("tp2-bmc-firmware-ota-v2.9.0.tpu"), b"x").expect("write");
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), Card::Mounted).expect("lists");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].version, "v2.9.0");
+        assert_eq!(found[0].relation, Relation::Newer);
+    }
+
+    /// What stays an error: a card that is there and cannot be read as a
+    /// folder of images. Without these the fix would be "never report".
+    #[test]
+    fn a_card_that_is_there_but_unreadable_is_still_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        std::fs::write(card.path().join("firmware"), b"a file, not a folder").expect("write");
+
+        let source = card_source(card.path());
+        let err =
+            list_local_in(&source, "v2.8.0", card.path(), Card::Mounted).expect_err("an error");
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    /// A configured local folder away from the card that does not exist is a
+    /// mistake in the configuration, not the state of a board.
+    #[test]
+    fn a_missing_folder_off_the_card_is_still_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        let elsewhere = TempDir::new("elsewhere").expect("tempdir");
+        let source = Source {
+            id: "usb".into(),
+            label: "Elsewhere".into(),
+            kind: SourceKind::Local,
+            location: elsewhere
+                .path()
+                .join("absent")
+                .to_string_lossy()
+                .to_string(),
+            enabled: true,
+        };
+        assert!(list_local_in(&source, "v2.8.0", card.path(), Card::Absent).is_err());
+        assert!(list_local_in(&source, "v2.8.0", card.path(), Card::Mounted).is_err());
+    }
+
+    /// An image parked after the last fan-out must make the next `get` refresh.
+    #[tokio::test]
+    async fn invalidating_marks_the_cached_listing_stale() {
+        *cache().lock().await = Some(Cached {
+            at: Instant::now(),
+            value: empty_catalog(false, 0),
+            ok: true,
+            retry_later_only: false,
+            stale: false,
+        });
+        invalidate().await;
+        let stale = cache().lock().await.as_ref().map(|c| c.stale);
+        assert_eq!(stale, Some(true));
+        *cache().lock().await = None;
     }
 
     fn empty_catalog(refreshing: bool, age_seconds: u64) -> Catalog {

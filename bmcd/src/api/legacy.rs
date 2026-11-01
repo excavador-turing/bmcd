@@ -1204,7 +1204,7 @@ fn flag(query: &Query, name: &str) -> LegacyResult<bool> {
 
 async fn create_data_transfer(query: &Query) -> LegacyResult<DataTransfer> {
     let root = Path::new(crate::app::sdcard_files::SDCARD_ROOT);
-    let mounted = crate::app::upgrade_worker::is_mount_point(root);
+    let mounted = crate::app::upgrade_worker::is_mounted_or_false(root);
     create_data_transfer_in(query, root, mounted).await
 }
 
