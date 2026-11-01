@@ -233,7 +233,7 @@ impl UpgradeWorker {
         // update rather than here.
         if !is_mount_point(std::path::Path::new(PARK_MOUNT)) {
             bail!(
-                "{PARK_MOUNT} is not mounted, so there is no card to park an image on. Insert one, or upload without parking to install straight away."
+                "the image was not saved: no SD card is mounted at {PARK_MOUNT}. Insert a card and try again, or install it straight away with `tpi firmware upload` without `--park` (the web interface's install option does the same)."
             );
         }
         match statvfs(std::path::Path::new(PARK_MOUNT)) {
@@ -278,6 +278,9 @@ impl UpgradeWorker {
 
         tokio::fs::rename(&partial_path, &final_path).await?;
         tracing::info!("parked {}", final_path.to_string_lossy());
+        // The catalogue's `local` source was read before this file existed, and
+        // would not read it again for up to half an hour.
+        crate::app::firmware_catalog::invalidate().await;
         Ok(())
     }
 

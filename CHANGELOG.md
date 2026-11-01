@@ -10,6 +10,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.42.2] — 2026-11-01
+
+### Fixed
+
+- **A board with no SD card (or a card with no `firmware` folder) kept
+  retrying the whole firmware check every two minutes and showed a warning
+  for it.** The `SD card` source answered "`/mnt/sdcard/firmware` is not a
+  directory" as an error, and any source error shortens the catalogue's cache
+  from 30 minutes to 2 minutes and keeps it off the overlay, so a card-less
+  board never kept a good catalogue across a reboot and the firmware page
+  carried "SD card: This source returned nothing usable" for ever. A source
+  on the card now reports nothing, and no error, when the card is not
+  mounted (decided as `os_park` and the staging code decide it: the mount
+  point has a different device from its parent) or when the card has no
+  `firmware` folder. A card that is there and unreadable (`firmware` is a
+  file, the folder will not open) is still an error, and so is a missing
+  folder for a local source configured away from the card. The response
+  shape is unchanged.
+- **The message for parking an image with no card said "Insert one, or upload
+  without parking", which is a dead end in the web interface.** It now says
+  the image was not saved because no SD card is mounted, and that installing
+  directly is `tpi firmware upload` without `--park` or the interface's
+  install option.
+- **An image parked on the card did not appear in the catalogue for up to 30
+  minutes.** A successful park now marks the cached catalogue stale, so the
+  next `GET /firmware/available` starts a refresh. A fan-out already
+  running when the park finishes cannot clear the mark, since it may have
+  read the card before the image was there.
+
 ## [2.42.1] — 2026-10-31
 
 ### Fixed

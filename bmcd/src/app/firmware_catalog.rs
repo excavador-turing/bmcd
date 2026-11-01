@@ -27,6 +27,7 @@
 //! never rendered as "nothing new" -- those are different claims and only the
 //! caller knows which one it is about to make.
 use crate::app::firmware_sources::{Source, SourceKind};
+use crate::app::sdcard_files::SDCARD_ROOT;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -231,9 +232,56 @@ fn failure_reason(stderr: &str, code: Option<i32>) -> String {
 /// on this SoC, which is fine on demand and far too slow for a page that lists
 /// a dozen, so integrity here is reported as unverified rather than computed.
 fn list_local(source: &Source, running: &str) -> Result<Vec<Candidate>, String> {
+    let card = std::path::Path::new(SDCARD_ROOT);
+    list_local_in(
+        source,
+        running,
+        card,
+        crate::app::upgrade_worker::is_mount_point(card),
+    )
+}
+
+/// [`list_local`] with the card's root and whether it is mounted passed in, so
+/// each state of a real board can be tested without a mount.
+///
+/// **A source on the card that has nothing to read is not an error.** Without
+/// a card the board has `/mnt/sdcard` as an empty directory on its root
+/// filesystem, and a card that was never given a `firmware` folder has no
+/// such directory either. Both are the ordinary state of a board and both
+/// mean "this source offers nothing" -- which is what an empty list with no
+/// error says. Reporting them as errors made every card-less board show a
+/// warning, retry the whole fan-out every two minutes, and never persist its
+/// catalogue.
+///
+/// What stays an error is a card that IS there and cannot be read: a
+/// `firmware` that is a file, a directory that will not open. Those are
+/// things the operator can act on. A source outside the card keeps the old
+/// rule too, since a location that is missing there is a typo, not a state.
+fn list_local_in(
+    source: &Source,
+    running: &str,
+    card_root: &std::path::Path,
+    card_mounted: bool,
+) -> Result<Vec<Candidate>, String> {
     let dir = std::path::Path::new(&source.location);
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", source.location));
+    let on_card = dir.starts_with(card_root);
+    // A folder left on the mount point's own directory (the root filesystem's)
+    // is not the card's, and listing it would offer images that vanish when a
+    // card is inserted.
+    if on_card && !card_mounted {
+        return Ok(Vec::new());
+    }
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a directory", source.location)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if on_card {
+                Ok(Vec::new())
+            } else {
+                Err(format!("{} is not a directory", source.location))
+            };
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", source.location)),
     }
 
     let mut candidates = Vec::new();
@@ -367,6 +415,7 @@ async fn restore() -> Option<Cached> {
         // Restored, therefore stale by definition: `get` compares the age
         // against FRESH and starts a refresh behind the answer it serves.
         ok: true,
+        stale: false,
     })
 }
 
@@ -419,6 +468,29 @@ struct Cached {
     at: Instant,
     value: Catalog,
     ok: bool,
+    /// Something this listing reads has changed since it was taken, so the
+    /// next `get` refreshes whatever its age. See [`invalidate`].
+    stale: bool,
+}
+
+/// How many times [`invalidate`] has been called. A fan-out compares the value
+/// it started with against the value when it finishes, so a change made while
+/// it was running -- after it had read the source that changed -- is not
+/// papered over by a result that looks fresh.
+static INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Marks the cached listing as out of date, so the next `get` starts a
+/// refresh.
+///
+/// Called when something the catalogue reads is changed by the daemon itself:
+/// an image parked on the card is invisible until the `local` source is read
+/// again, and without this it stayed so for up to [`FRESH`]. Nothing is
+/// fetched here; the cost is paid by the next reader, as for any other expiry.
+pub async fn invalidate() {
+    INVALIDATIONS.fetch_add(1, AtomicOrdering::AcqRel);
+    if let Some(cached) = cache().lock().await.as_mut() {
+        cached.stale = true;
+    }
 }
 
 fn cache() -> &'static Mutex<Option<Cached>> {
@@ -517,6 +589,7 @@ fn release_refresh() {
 /// against the larger figure; `tpi` 1.5.1 allows 180 s for exactly this and
 /// has a test pinning that bound to the measurement.
 async fn fan_out() -> Catalog {
+    let invalidations = INVALIDATIONS.load(AtomicOrdering::Acquire);
     let sources = crate::app::firmware_sources::load().await;
     // The api layer already reads /etc/os-release for this; a second reader
     // here could drift from the one the About page uses.
@@ -586,6 +659,7 @@ async fn fan_out() -> Catalog {
         at: Instant::now(),
         value: value.clone(),
         ok,
+        stale: INVALIDATIONS.load(AtomicOrdering::Acquire) != invalidations,
     });
 
     // Only a complete answer is kept. A fan-out where one source errored is
@@ -684,15 +758,15 @@ pub async fn get(force: bool) -> Catalog {
         let guard = cache().lock().await;
         guard
             .as_ref()
-            .map(|c| (c.value.clone(), c.at.elapsed(), c.ok))
+            .map(|c| (c.value.clone(), c.at.elapsed(), c.ok, c.stale))
     };
 
-    let Some((mut value, age, ok)) = snapshot else {
+    let Some((mut value, age, ok, stale)) = snapshot else {
         return fan_out().await;
     };
 
     let ttl = if ok { FRESH } else { FRESH_AFTER_ERROR };
-    if force || age >= ttl {
+    if force || stale || age >= ttl {
         spawn_refresh();
     }
 
@@ -835,6 +909,118 @@ mod tests {
         let found = list_local(&source, "local").expect("lists");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relation, Relation::Unknown);
+    }
+
+    fn card_source(card: &std::path::Path) -> Source {
+        Source {
+            id: "local".into(),
+            label: "SD card".into(),
+            kind: SourceKind::Local,
+            location: card.join("firmware").to_string_lossy().to_string(),
+            enabled: true,
+        }
+    }
+
+    /// A board with no card: `/mnt/sdcard` is an empty directory on the root
+    /// filesystem and nothing is mounted on it (`/proc/mounts` has no
+    /// `/dev/mmcblk0p1 /mnt/sdcard vfat` line). The mount check is the shipped
+    /// one -- a temporary directory shares its parent's device, exactly as
+    /// the empty mount point does -- so this is not a stand-in for it.
+    ///
+    /// This used to be an error, which put a warning on every card-less board
+    /// and held the catalogue at the two-minute retry for ever.
+    #[test]
+    fn no_card_is_an_empty_source_not_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        assert!(!crate::app::upgrade_worker::is_mount_point(card.path()));
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), false).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+
+        // Whatever sits in the empty mount point's directory is the root
+        // filesystem's, not a card's, and is not offered.
+        std::fs::create_dir_all(card.path().join("firmware")).expect("mkdir");
+        std::fs::write(
+            card.path().join("firmware/tp2-bmc-firmware-ota-v2.9.0.tpu"),
+            b"x",
+        )
+        .expect("write");
+        let found = list_local_in(&source, "v2.8.0", card.path(), false).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A card that is mounted and was never given a `firmware` folder.
+    #[test]
+    fn a_card_without_the_folder_is_an_empty_source_not_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        std::fs::write(card.path().join("talos.img"), b"x").expect("write");
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), true).expect("no error");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_card_with_the_folder_lists_its_images() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        let folder = card.path().join("firmware");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        std::fs::write(folder.join("tp2-bmc-firmware-ota-v2.9.0.tpu"), b"x").expect("write");
+
+        let source = card_source(card.path());
+        let found = list_local_in(&source, "v2.8.0", card.path(), true).expect("lists");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].version, "v2.9.0");
+        assert_eq!(found[0].relation, Relation::Newer);
+    }
+
+    /// What stays an error: a card that is there and cannot be read as a
+    /// folder of images. Without these the fix would be "never report".
+    #[test]
+    fn a_card_that_is_there_but_unreadable_is_still_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        std::fs::write(card.path().join("firmware"), b"a file, not a folder").expect("write");
+
+        let source = card_source(card.path());
+        let err = list_local_in(&source, "v2.8.0", card.path(), true).expect_err("an error");
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    /// A configured local folder away from the card that does not exist is a
+    /// mistake in the configuration, not the state of a board.
+    #[test]
+    fn a_missing_folder_off_the_card_is_still_an_error() {
+        let card = TempDir::new("sdcard").expect("tempdir");
+        let elsewhere = TempDir::new("elsewhere").expect("tempdir");
+        let source = Source {
+            id: "usb".into(),
+            label: "Elsewhere".into(),
+            kind: SourceKind::Local,
+            location: elsewhere
+                .path()
+                .join("absent")
+                .to_string_lossy()
+                .to_string(),
+            enabled: true,
+        };
+        assert!(list_local_in(&source, "v2.8.0", card.path(), false).is_err());
+        assert!(list_local_in(&source, "v2.8.0", card.path(), true).is_err());
+    }
+
+    /// An image parked after the last fan-out must make the next `get` refresh.
+    #[tokio::test]
+    async fn invalidating_marks_the_cached_listing_stale() {
+        *cache().lock().await = Some(Cached {
+            at: Instant::now(),
+            value: empty_catalog(false, 0),
+            ok: true,
+            stale: false,
+        });
+        invalidate().await;
+        let stale = cache().lock().await.as_ref().map(|c| c.stale);
+        assert_eq!(stale, Some(true));
+        *cache().lock().await = None;
     }
 
     fn empty_catalog(refreshing: bool, age_seconds: u64) -> Catalog {
