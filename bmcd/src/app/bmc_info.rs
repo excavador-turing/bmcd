@@ -173,9 +173,11 @@ pub fn get_storage_info() -> Vec<StorageInfo> {
 
     // The entry's presence rule is unchanged: the device exists and statvfs
     // answers. Whether a card is in it is the new, separate fact.
-    if Path::new("/dev/mmcblk0").exists() {
+    if crate::app::upgrade_worker::card_inserted() {
         if let Ok((total, free)) = get_fs_stat(SDCARD_ROOT) {
-            let mounted = crate::app::upgrade_worker::is_mount_point(Path::new(SDCARD_ROOT));
+            // An error reads as false (and is logged): the field answers "is a
+            // card mounted", and one that cannot be checked is not known to be.
+            let mounted = crate::app::upgrade_worker::is_mounted_or_false(Path::new(SDCARD_ROOT));
             info.push(sd_card_entry(total, free, mounted));
         }
     }
