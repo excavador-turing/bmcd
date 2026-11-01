@@ -52,11 +52,13 @@ const FRESH: Duration = Duration::from_secs(1800);
 /// for as long as it is open. Raising it further trades freshness for calm;
 /// lowering it is how a small board is worn down.
 const FRESH_AFTER_ERROR: Duration = Duration::from_secs(120);
-/// When the only thing wrong is that sources were slow (a timeout, or one still
-/// busy from the last check), the retry waits longer: a board that is slow but
-/// working would otherwise start the `curl`-heavy listings again every couple
-/// of minutes, against a GitHub allowance of 60 requests an hour.
-const FRESH_AFTER_SLOW: Duration = Duration::from_secs(900);
+/// When the only thing wrong is something that a retry in two minutes will not
+/// change -- sources that were slow (a timeout, or one still busy from the last
+/// check), or a card the kernel sees that nothing mounted -- the retry waits
+/// longer. A slow but working board would otherwise start the `curl`-heavy
+/// listings again every couple of minutes, against a GitHub allowance of 60
+/// requests an hour, and a board with an unmountable card would do it for ever.
+const FRESH_AFTER_RETRY_LATER: Duration = Duration::from_secs(900);
 
 /// How a candidate relates to what is running.
 ///
@@ -185,9 +187,14 @@ fn timed_out(deadline: Duration) -> String {
     format!("timed out after {} s", deadline.as_secs())
 }
 
-/// Is this error about slowness rather than about what the source said?
-fn is_slow(error: &str) -> bool {
-    error.starts_with("timed out after ") || error == STILL_BUSY
+/// The error of a card the kernel sees that nothing has mounted.
+const UNMOUNTED_CARD: &str =
+    "an SD card is inserted but not mounted (unsupported or damaged filesystem?)";
+
+/// Is this error one that a quick retry will not change: slowness, or a card
+/// that stays unmountable until somebody acts on it?
+fn is_retry_later(error: &str) -> bool {
+    error.starts_with("timed out after ") || error == STILL_BUSY || error == UNMOUNTED_CARD
 }
 
 /// Runs `command` to completion like `Command::output`, but gives up at
@@ -429,10 +436,7 @@ fn list_local_in(
             Card::Mounted => {}
             Card::Absent => return Ok(Vec::new()),
             Card::Unmounted => {
-                return Err(
-                    "an SD card is inserted but not mounted (unsupported or damaged filesystem?)"
-                        .to_string(),
-                );
+                return Err(UNMOUNTED_CARD.to_string());
             }
         }
     }
@@ -581,7 +585,7 @@ async fn restore() -> Option<Cached> {
         // Restored, therefore stale by definition: `get` compares the age
         // against FRESH and starts a refresh behind the answer it serves.
         ok: true,
-        slow_only: false,
+        retry_later_only: false,
         stale: false,
     })
 }
@@ -635,8 +639,9 @@ struct Cached {
     at: Instant,
     value: Catalog,
     ok: bool,
-    /// Not `ok`, and every error is a source being slow. See [`FRESH_AFTER_SLOW`].
-    slow_only: bool,
+    /// Not `ok`, and every error is one a quick retry will not change. See
+    /// [`FRESH_AFTER_RETRY_LATER`].
+    retry_later_only: bool,
     /// Something this listing reads has changed since it was taken, so the
     /// next `get` refreshes whatever its age. See [`invalidate`].
     stale: bool,
@@ -647,8 +652,8 @@ impl Cached {
     fn ttl(&self) -> Duration {
         if self.ok {
             FRESH
-        } else if self.slow_only {
-            FRESH_AFTER_SLOW
+        } else if self.retry_later_only {
+            FRESH_AFTER_RETRY_LATER
         } else {
             FRESH_AFTER_ERROR
         }
@@ -917,13 +922,13 @@ async fn fan_out() -> Catalog {
         .unwrap_or(running_hint);
 
     let mut ok = true;
-    let mut slow_only = true;
+    let mut retry_later_only = true;
     let sources = resolved
         .into_iter()
         .map(|(_, source, candidates, error, _)| {
             if let Some(error) = &error {
                 ok = false;
-                slow_only &= is_slow(error);
+                retry_later_only &= is_retry_later(error);
             }
             SourceCatalog {
                 id: source.id,
@@ -954,7 +959,7 @@ async fn fan_out() -> Catalog {
             at: Instant::now(),
             value: value.clone(),
             ok,
-            slow_only: !ok && slow_only,
+            retry_later_only: !ok && retry_later_only,
             stale,
         });
     }
@@ -1442,7 +1447,7 @@ mod tests {
         .await;
         assert_eq!(second[0].3.as_deref(), Some(STILL_BUSY));
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "no second call");
-        assert!(is_slow(STILL_BUSY));
+        assert!(is_retry_later(STILL_BUSY));
 
         // Let it go; the source can be asked again once it has returned.
         release.send(()).unwrap();
@@ -1457,18 +1462,19 @@ mod tests {
 
     #[test]
     fn slow_sources_are_retried_later_than_broken_ones() {
-        let cached = |ok, slow_only| Cached {
+        let cached = |ok, retry_later_only| Cached {
             at: Instant::now(),
             value: empty_catalog(false, 0),
             ok,
-            slow_only,
+            retry_later_only,
             stale: false,
         };
         assert_eq!(cached(true, false).ttl(), FRESH);
         assert_eq!(cached(false, false).ttl(), FRESH_AFTER_ERROR);
-        assert_eq!(cached(false, true).ttl(), FRESH_AFTER_SLOW);
-        assert!(is_slow(&timed_out(SOURCE_DEADLINE)));
-        assert!(!is_slow("curl: (6) Could not resolve host"));
+        assert_eq!(cached(false, true).ttl(), FRESH_AFTER_RETRY_LATER);
+        assert!(is_retry_later(&timed_out(SOURCE_DEADLINE)));
+        assert!(is_retry_later(UNMOUNTED_CARD));
+        assert!(!is_retry_later("curl: (6) Could not resolve host"));
         assert!(SOURCE_DEADLINE + SOURCE_GRACE < REFRESH_CLAIM);
     }
 
@@ -1534,9 +1540,12 @@ mod tests {
         let err =
             list_local_in(&source, "v2.8.0", card.path(), Card::Unmounted).expect_err("an error");
         assert!(err.contains("inserted but not mounted"), "{err}");
+        assert!(is_retry_later(&err), "it must not retry every two minutes");
     }
 
-    /// A card that is mounted and was never given a `firmware` folder.
+    /// A card that is mounted and was never given a `firmware` folder. Board B
+    /// on 2026-11-01: `/dev/mmcblk0p1 /mnt/sdcard ext4 rw,relatime` in
+    /// `/proc/mounts`, `/mnt/sdcard/firmware` absent.
     #[test]
     fn a_card_without_the_folder_is_an_empty_source_not_an_error() {
         let card = TempDir::new("sdcard").expect("tempdir");
@@ -1602,7 +1611,7 @@ mod tests {
             at: Instant::now(),
             value: empty_catalog(false, 0),
             ok: true,
-            slow_only: false,
+            retry_later_only: false,
             stale: false,
         });
         invalidate().await;

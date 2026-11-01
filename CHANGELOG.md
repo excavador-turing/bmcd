@@ -58,9 +58,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   blocking call never returned (a wedged read of a failing card) is skipped
   on the next check with "still busy from the previous check", rather than
   leaving another thread behind each time. When the only errors are such
-  slow sources, the retry waits 15 minutes instead of 2, so a slow but
-  working board does not start its `curl`-heavy listings every few minutes
-  against GitHub's 60 requests an hour. The 10-minute limit on the refresh as
+  slow sources, or a card that is inserted but not mounted (which a retry in
+  two minutes will not change), the retry waits 15 minutes instead of 2, so a
+  slow but working board does not start its `curl`-heavy listings every few
+  minutes against GitHub's 60 requests an hour. The 10-minute limit on the refresh as
   a whole stays as the outer guard.
 - **Concurrent requests with nothing cached each started their own firmware
   check, and a park that landed as a check finished could go unnoticed.** A
