@@ -21,7 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `write_durably`, now syncs the data and the directory (one `<name>.tmp`
   per target, opened exclusively, a stale one from an interrupted write
   removed first; a directory sync failure after rename is logged, not
-  treated as a failed write).
+  treated as a failed write). (thanks @danste22, #48 and #51)
 
 ## [2.43.0] — 2026-11-14
 
