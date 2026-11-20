@@ -18,8 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `fsync`. On the UBIFS overlay a power cut just after confirm could leave a
   correctly named empty or truncated file — Flat with no UI error for the
   switch document, or no network at boot for `interfaces`. One helper,
-  `write_durably`, now syncs the data and the directory (unique temp names;
-  a directory sync failure after rename is not treated as a failed write).
+  `write_durably`, now syncs the data and the directory (one `<name>.tmp`
+  per target, opened exclusively, a stale one from an interrupted write
+  removed first; a directory sync failure after rename is logged, not
+  treated as a failed write).
 
 ## [2.43.0] — 2026-11-14
 

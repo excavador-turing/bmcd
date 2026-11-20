@@ -393,8 +393,6 @@ async fn validate(upload: &CertificateUpload) -> Result<(PKey<Private>, X509, Ve
     Ok((key, leaf, chain))
 }
 
-/// Write one file and make sure it is on the disk.
-///
 async fn put_certificate(
     request: HttpRequest,
     tls: web::Data<config::Tls>,

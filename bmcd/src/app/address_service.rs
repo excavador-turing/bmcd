@@ -725,18 +725,13 @@ mod tests {
     /// A board in a temp dir: the file, `/sys/class/net` with or without
     /// `br0`, and an `ip` that prints `addr` and `route`.
     fn rig(file: Option<&str>, br0: bool, exec: Arc<FakeExec>) -> Rig {
-        rig_named("interfaces", file, br0, exec)
-    }
-
-    /// [`rig`], with the interfaces file under a name of the test's choosing.
-    fn rig_named(name: &str, file: Option<&str>, br0: bool, exec: Arc<FakeExec>) -> Rig {
         let dir = tempdir::TempDir::new("address-board").expect("temp dir");
         let net = dir.path().join("net");
         std::fs::create_dir_all(&net).unwrap();
         if br0 {
             std::fs::create_dir_all(net.join("br0/bridge")).unwrap();
         }
-        let path = dir.path().join("etc").join(name);
+        let path = dir.path().join("etc/interfaces");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         if let Some(file) = file {
             std::fs::write(&path, file).unwrap();
@@ -1057,24 +1052,17 @@ mod tests {
     /// view must not claim a file that was never written.
     #[tokio::test]
     async fn a_write_that_fails_leaves_the_change_pending_and_the_view_unchanged() {
-        // The write goes through `<name>.tmp.<pid>.<nanos>`, which cannot be
-        // blocked in advance, and root ignores permissions. A name long enough
-        // that the copy (`<name>.hand-written.<seconds>`) still fits in 255
-        // bytes but the temp file does not makes the write itself fail, after
-        // the copy is made.
-        let name = "i".repeat(230);
-        let rig = rig_named(
-            &name,
-            Some(HAND_FILE),
-            true,
-            FakeExec::board(ADDR_STOCK, ROUTE_STOCK),
-        );
+        let rig = board(Some(HAND_FILE), true);
         let pending = rig
             .service
             .apply(lan(), DEFAULT_WINDOW, true)
             .await
             .unwrap();
         let before = rig.service.view().await;
+        // Writing goes through `interfaces.tmp`; a directory there stops it,
+        // for root as well.
+        let blocker = rig.file.with_extension("tmp");
+        std::fs::create_dir(&blocker).unwrap();
 
         let error = rig
             .service
@@ -1101,9 +1089,20 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
-            names.iter().all(|n| !n.contains(".hand-written.")),
+            names
+                .iter()
+                .all(|n| !n.starts_with("interfaces.hand-written.")),
             "{names:?}"
         );
+
+        // Confirming again, once the disk allows it, works.
+        std::fs::remove_dir(&blocker).unwrap();
+        rig.service.confirm(&pending.token).await.expect("retry");
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.file, FileOrigin::Bmcd);
+        assert_eq!(view.configured, Some(lan()));
+        assert!(view.file_backup.is_some());
     }
 
     /// A Latin-1 byte in a comment made the file "not found" and so DHCP:
