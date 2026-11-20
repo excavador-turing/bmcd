@@ -22,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   token is still refused with the same 401 and `Bearer` challenge, but no
   longer counts. A 64-character random token cannot be guessed, so counting
   it gave no protection. A ban that already stands still refuses tokens.
+  (thanks @cloudlabworks, #39)
 
 ## [2.43.0] — 2026-11-14
 
