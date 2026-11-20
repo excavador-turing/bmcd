@@ -17,8 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`bridge vlan … dev br0 … self`). Without that, Flat→Split/Trunk cleared
   VID 1 from the front ports while `br0` stayed on the kernel default, the
   board went unreachable, and the confirm window reverted the change. The
-  planner now adds and deletes those `self` lines in the same order as the
-  other ports.
+  planner now emits those `self` lines, the BMC's new VLAN added BEFORE the
+  old one is deleted so the BMC is never in none, and a failed delete of a
+  `self` entry (a bridge that never had it) no longer stops the plan.
 
 ## [2.43.0] — 2026-11-14
 

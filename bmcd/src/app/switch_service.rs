@@ -37,7 +37,7 @@
 //! in the middle of an unconfirmed change finds the previous document there,
 //! because the pending one was never written.
 
-use crate::app::switch_applier::{interface_name, plan, Command};
+use crate::app::switch_applier::{interface_name, is_best_effort, plan, Command};
 use crate::app::switch_change::{
     ChangeError, Effect, Pending, RevertRecord, SwitchState, DEFAULT_WINDOW,
 };
@@ -408,6 +408,14 @@ async fn run_all(commands: &[Command]) -> Result<(), SwitchError> {
             .output()
             .map_err(SwitchError::Io)?;
         if !output.status.success() {
+            if is_best_effort(command) {
+                tracing::warn!(
+                    "{} failed, carrying on: {}",
+                    command.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                continue;
+            }
             return Err(SwitchError::Command {
                 command: command.join(" "),
                 detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),

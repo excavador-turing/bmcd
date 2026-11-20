@@ -114,6 +114,55 @@ fn vlan_add(dev: &str, vid: u16, pvid_untagged: bool, bridge_self: bool) -> Comm
     out
 }
 
+/// The `bridge vlan del` lines that take `port` out of the VLANs it is leaving.
+fn removals(port: PortId, running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
+    let (dev, bridge_self) = vlan_target(port);
+    let was = running.ports.get(&port).cloned().unwrap_or_default();
+    let now = wanted.ports.get(&port).cloned().unwrap_or_default();
+    was.vlans()
+        .difference(&now.vlans())
+        .map(|vid| vlan_del(dev, *vid, bridge_self))
+        .collect()
+}
+
+/// The `bridge vlan add` lines that put `port` into the VLANs it is joining.
+fn additions(port: PortId, running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
+    let (dev, bridge_self) = vlan_target(port);
+    let was = running.ports.get(&port).cloned().unwrap_or_default();
+    let now = wanted.ports.get(&port).cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for vid in &now.tagged {
+        if !was.tagged.contains(vid) {
+            out.push(vlan_add(dev, *vid, false, bridge_self));
+        }
+    }
+    if let Some(vid) = now.untagged {
+        if was.untagged != Some(vid) {
+            out.push(vlan_add(dev, vid, true, bridge_self));
+        }
+    }
+    out
+}
+
+/// True for a command whose failure does not stop the plan: deleting the
+/// bridge's own (`self`) VLAN entry.
+///
+/// What a delete wants is "the entry is gone", and a board whose bridge never
+/// had it (a hand-written `interfaces` file, say) already is. The BMC's new
+/// VLAN was added before this runs, so a delete that fails for any other
+/// reason leaves the BMC in one VLAN too many, which is harmless, whereas
+/// stopping here would leave the front ports half-moved with no rollback.
+pub fn is_best_effort(command: &Command) -> bool {
+    matches!(
+        command
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["bridge", "vlan", "del", "dev", BRIDGE, "vid", _, "self"]
+    )
+}
+
 /// Every command needed to move the switch from `running` to `wanted`.
 ///
 /// Computed as a whole rather than emitted as the document is walked, because
@@ -144,34 +193,32 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
         ]));
     }
 
-    // Remove what is no longer wanted, before adding, so a port moving from
-    // one untagged VLAN to another is never briefly in both. Includes the
-    // BMC's `br0 self` entry in the same pass as the front-panel ports.
-    for port in PortId::ALL {
-        let (dev, bridge_self) = vlan_target(port);
-        let was = running.ports.get(&port).cloned().unwrap_or_default();
-        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
-        for vid in was.vlans().difference(&now.vlans()) {
-            commands.push(vlan_del(dev, *vid, bridge_self));
-        }
+    // The BMC first, and its own order inside: join the new VLAN, THEN leave
+    // the old one. The BMC is what the board is managed through; being in two
+    // VLANs on the bridge itself is harmless for a moment, being in none is
+    // not, and a plan that stops part-way is not rolled back. A failed delete
+    // here leaves the BMC in one VLAN too many (see [`is_best_effort`]).
+    for port in PortId::ALL
+        .into_iter()
+        .filter(|p| interface_name(*p).is_none())
+    {
+        commands.extend(additions(port, running, wanted));
+        commands.extend(removals(port, running, wanted));
     }
 
-    for port in PortId::ALL {
-        let (dev, bridge_self) = vlan_target(port);
-        let was = running.ports.get(&port).cloned().unwrap_or_default();
-        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
-
-        for vid in &now.tagged {
-            if was.tagged.contains(vid) {
-                continue;
-            }
-            commands.push(vlan_add(dev, *vid, false, bridge_self));
-        }
-        if let Some(vid) = now.untagged {
-            if was.untagged != Some(vid) {
-                commands.push(vlan_add(dev, vid, true, bridge_self));
-            }
-        }
+    // Then the front ports: remove what is no longer wanted, before adding, so
+    // a port moving from one untagged VLAN to another is never briefly in both.
+    for port in PortId::ALL
+        .into_iter()
+        .filter(|p| interface_name(*p).is_some())
+    {
+        commands.extend(removals(port, running, wanted));
+    }
+    for port in PortId::ALL
+        .into_iter()
+        .filter(|p| interface_name(*p).is_some())
+    {
+        commands.extend(additions(port, running, wanted));
     }
 
     if turning_on {
@@ -229,9 +276,8 @@ mod tests {
         assert!(plan(&Preset::Flat.expand(), &Preset::Flat.expand()).is_empty());
     }
 
-    /// The BMC has no `bmc` netdev. Membership is `dev br0 … self`. Emitting
-    /// `dev bmc` would fail at the first apply; omitting `self` leaves the
-    /// BMC on VID 1 while Split/Trunk clear VID 1 from the front ports.
+    /// The BMC has no `bmc` netdev, so no command can name one; its VLANs are
+    /// `dev br0 ... self` lines, covered by the tests below.
     #[test]
     fn no_command_ever_names_the_bmc_port() {
         let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
@@ -239,29 +285,112 @@ mod tests {
         assert_eq!(interface_name(PortId::Bmc), None);
     }
 
-    #[test]
-    fn the_bmc_vlan_is_programmed_on_br0_self() {
-        let to_trunk = joined(&plan(&Preset::Flat.expand(), &trunk()));
-        assert!(
-            to_trunk
-                .iter()
-                .any(|l| l == "bridge vlan del dev br0 vid 1 self"),
-            "leave Flat's VID 1 on the bridge itself: {to_trunk:#?}"
-        );
-        assert!(
-            to_trunk
-                .iter()
-                .any(|l| l == "bridge vlan add dev br0 vid 10 pvid untagged self"),
-            "join the management VLAN on the bridge itself: {to_trunk:#?}"
-        );
+    /// Only the `br0 ... self` lines of a plan: the BMC's own.
+    fn self_lines(plan: &[Command]) -> Vec<String> {
+        joined(plan)
+            .into_iter()
+            .filter(|l| l.contains("dev br0") && l.ends_with(" self"))
+            .collect()
+    }
 
-        let to_split = joined(&plan(&Preset::Flat.expand(), &Preset::Split.expand()));
-        assert!(
-            to_split
-                .iter()
-                .any(|l| l.contains("dev br0") && l.ends_with(" self")),
-            "Split must program br0 self: {to_split:#?}"
+    /// The BMC joins its new VLAN before it leaves the old one, so it is never
+    /// in none: a plan that stops part-way is not rolled back.
+    #[test]
+    fn the_bmc_vlan_is_programmed_on_br0_self_add_first() {
+        let to_trunk = plan(&Preset::Flat.expand(), &trunk());
+        assert_eq!(
+            self_lines(&to_trunk),
+            [
+                "bridge vlan add dev br0 vid 10 pvid untagged self",
+                "bridge vlan del dev br0 vid 1 self",
+            ]
         );
+        assert_eq!(
+            self_lines(&plan(&Preset::Flat.expand(), &Preset::Split.expand())),
+            [
+                "bridge vlan add dev br0 vid 4093 pvid untagged self",
+                "bridge vlan del dev br0 vid 1 self",
+            ]
+        );
+    }
+
+    /// The path that runs when a change is not confirmed: back to Flat, the BMC
+    /// on VID 1 again, added before the management VLAN is dropped.
+    #[test]
+    fn reverting_trunk_to_flat_puts_the_bmc_back_on_vid_1_first() {
+        let back = plan(&trunk(), &Preset::Flat.expand());
+        assert_eq!(
+            self_lines(&back),
+            [
+                "bridge vlan add dev br0 vid 1 pvid untagged self",
+                "bridge vlan del dev br0 vid 10 self",
+            ]
+        );
+        // Filtering still comes off before anything else.
+        assert!(joined(&back)[0].contains("vlan_filtering 0"), "{back:#?}");
+    }
+
+    #[test]
+    fn changing_the_management_vid_moves_the_bmc_add_first() {
+        let mut ten = trunk();
+        let mut twenty = trunk();
+        for (doc, vid) in [(&mut ten, 10), (&mut twenty, 20)] {
+            doc.ports.get_mut(&PortId::Bmc).unwrap().untagged = Some(vid);
+        }
+        assert_eq!(
+            self_lines(&plan(&ten, &twenty)),
+            [
+                "bridge vlan add dev br0 vid 20 pvid untagged self",
+                "bridge vlan del dev br0 vid 10 self",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_management_vid_emits_no_self_lines() {
+        // Trunk to a Trunk that differs only in the node VLAN.
+        let mut other = trunk();
+        other.ports.get_mut(&PortId::Node1).unwrap().untagged = Some(30);
+        let lines = plan(&trunk(), &other);
+        assert!(!lines.is_empty(), "the node port did change");
+        assert!(self_lines(&lines).is_empty(), "{lines:#?}");
+    }
+
+    /// Whatever else is in the plan, the BMC's lines come after filtering is
+    /// switched off, before any front port is touched, and before it is
+    /// switched on.
+    #[test]
+    fn the_bmc_lines_sit_between_filtering_off_and_the_front_ports() {
+        let lines = joined(&plan(&trunk(), &Preset::Flat.expand()));
+        let first_self = lines.iter().position(|l| l.ends_with(" self")).unwrap();
+        let first_front = lines.iter().position(|l| l.contains("dev node")).unwrap();
+        assert!(first_self < first_front, "{lines:#?}");
+
+        let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let last_self = lines.iter().rposition(|l| l.ends_with(" self")).unwrap();
+        let on = lines
+            .iter()
+            .position(|l| l.contains("vlan_filtering 1"))
+            .unwrap();
+        assert!(last_self < on, "{lines:#?}");
+    }
+
+    /// Only the delete of the bridge's own entry may fail without stopping the
+    /// plan; every other command still does.
+    #[test]
+    fn only_a_self_delete_is_best_effort() {
+        let plan = plan(&Preset::Flat.expand(), &trunk());
+        let tolerated: Vec<_> = plan.iter().filter(|c| is_best_effort(c)).collect();
+        assert_eq!(
+            joined(&tolerated.iter().map(|c| (*c).clone()).collect::<Vec<_>>()),
+            ["bridge vlan del dev br0 vid 1 self"]
+        );
+        assert!(!is_best_effort(&cmd(&[
+            "bridge", "vlan", "del", "dev", "node1", "vid", "1"
+        ])));
+        assert!(!is_best_effort(&cmd(&[
+            "bridge", "vlan", "add", "dev", "br0", "vid", "10", "pvid", "untagged", "self"
+        ])));
     }
 
     /// A name is not a switch setting. Renaming a VLAN must not touch the
@@ -309,7 +438,10 @@ mod tests {
     /// joins the new one, or it is briefly in both.
     #[test]
     fn removals_come_before_additions() {
-        let lines = joined(&plan(&Preset::Split.expand(), &trunk()));
+        let lines: Vec<_> = joined(&plan(&Preset::Split.expand(), &trunk()))
+            .into_iter()
+            .filter(|l| l.starts_with("bridge vlan") && !l.ends_with(" self"))
+            .collect();
         let first_add = lines.iter().position(|l| l.contains("vlan add")).unwrap();
         let last_del = lines.iter().rposition(|l| l.contains("vlan del")).unwrap();
         assert!(last_del < first_add, "{lines:#?}");
