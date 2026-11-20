@@ -12,6 +12,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A session token the daemon had forgotten counted as a wrong password.**
+  Tokens live in memory, so a restart forgets all of them, and an expired
+  token is dropped from the store. A browser tab or script still sending one
+  got a 401 for each request, and each 401 counted toward the peer's ban
+  exactly like a wrong password. A page that fires several requests at once
+  could therefore ban its own address after a BMC reboot, and the correct
+  password typed from that machine was then refused with a 429. An unknown
+  token is still refused with the same 401 and `Bearer` challenge, but no
+  longer counts. A 64-character random token cannot be guessed, so counting
+  it gave no protection. A ban that already stands still refuses tokens.
+  (thanks @cloudlabworks, #39)
+
+- **Confirmed config files are flushed to flash before rename.**
+  `switch.json`, `/etc/network/interfaces`, access overrides, the managed
+  client CA, and TLS key/cert pairs were written with temp+rename and no
+  `fsync`. On the UBIFS overlay a power cut just after confirm could leave a
+  correctly named empty or truncated file — Flat with no UI error for the
+  switch document, or no network at boot for `interfaces`. One helper,
+  `write_durably`, now syncs the data and the directory (one `<name>.tmp`
+  per target, opened exclusively, a stale one from an interrupted write
+  removed first; a directory sync failure after rename is logged, not
+  treated as a failed write). (thanks @danste22, #48 and #51)
+
 - **Split and Trunk left the BMC on VLAN 1.** `plan()` skipped `PortId::Bmc`
   because it has no netdev. The BMC's membership is the bridge `self` entry
   (`bridge vlan … dev br0 … self`). Without that, Flat→Split/Trunk cleared

@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate::utils::write_durably;
 use config::FileFormat;
 use serde::Deserialize;
 use serde_with::serde_as;
@@ -133,29 +134,14 @@ impl AccessOverrides {
 
     pub fn store(&self) -> std::io::Result<()> {
         let path = Path::new(ACCESS_OVERRIDES);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_atomically(path, &serde_json::to_vec_pretty(self)?)
+        // write_durably creates parents; a half-written CA/access file is a
+        // board that asks for a client certificate and can verify none.
+        write_durably(path, &serde_json::to_vec_pretty(self)?)
     }
 }
 
-/// Write through a temporary file in the SAME directory, then rename.
-///
-/// A half-written CA bundle is a board that asks for a client certificate and
-/// can verify none, discovered at the next login rather than now; a rename is
-/// atomic on the same filesystem, so the file is either the old one or the
-/// new one and never half of either.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
 pub fn write_client_ca(pem: &[u8]) -> std::io::Result<()> {
-    write_atomically(Path::new(MANAGED_CLIENT_CA), pem)
+    write_durably(Path::new(MANAGED_CLIENT_CA), pem)
 }
 
 pub fn remove_client_ca() -> std::io::Result<()> {

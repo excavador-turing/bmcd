@@ -42,6 +42,7 @@ use crate::app::switch_change::{
     ChangeError, Effect, Pending, RevertRecord, SwitchState, DEFAULT_WINDOW,
 };
 use crate::app::switch_document::{PortId, Preset, SwitchDocument};
+use crate::utils::write_durably;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -301,7 +302,7 @@ impl SwitchService {
         let mut inner = self.inner.lock().await;
         let effect = inner.state.confirm(token, SystemTime::now())?;
         if let Effect::Persist(document) = effect {
-            write_atomically(
+            write_durably(
                 &self.path,
                 &serde_json::to_vec_pretty(&document)
                     .map_err(|e| SwitchError::Io(std::io::Error::other(e)))?,
@@ -423,14 +424,6 @@ async fn run_all(commands: &[Command]) -> Result<(), SwitchError> {
         }
     }
     Ok(())
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]

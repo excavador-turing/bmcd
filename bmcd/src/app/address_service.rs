@@ -33,6 +33,7 @@ use crate::app::address_change::{
 };
 use crate::app::address_document::{parse, resolv_conf, AddressDocument};
 use crate::app::network_interfaces::{InterfaceInfo, MANAGED};
+use crate::utils::{write_durably, write_synced};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -293,7 +294,7 @@ impl AddressService {
             let wanted = inner.running.render();
             let have = std::fs::read_to_string(&self.path).unwrap_or_default();
             if have != wanted {
-                match write_atomically(&self.path, wanted.as_bytes()) {
+                match write_durably(&self.path, wanted.as_bytes()) {
                     Ok(()) => {
                         inner.stamp = modified(&self.path);
                         done.file_rewritten = true;
@@ -435,7 +436,7 @@ impl AddressService {
             }
             backup = Some(kept);
         }
-        if let Err(e) = write_atomically(&self.path, document.render().as_bytes()) {
+        if let Err(e) = write_durably(&self.path, document.render().as_bytes()) {
             if let Some(kept) = &backup {
                 let _ = std::fs::remove_file(kept);
             }
@@ -539,7 +540,7 @@ fn keep_a_copy_at(path: &Path, seconds: u64) -> std::io::Result<(PathBuf, Vec<Pa
     // never overwritten.
     let tmp = path.with_file_name(format!("{prefix}tmp"));
     let result = (|| {
-        std::fs::write(&tmp, &bytes)?;
+        write_synced(&tmp, &bytes, None)?;
         for attempt in 0u32.. {
             let candidate = if attempt == 0 {
                 format!("{prefix}{seconds}")
@@ -589,14 +590,6 @@ fn prune_copies(dir: &Path, prefix: &str, just_made: &Path) -> Vec<PathBuf> {
         }
     }
     removed
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -1066,7 +1059,8 @@ mod tests {
             .await
             .unwrap();
         let before = rig.service.view().await;
-        // Writing goes through `interfaces.tmp`; a directory there stops it.
+        // Writing goes through `interfaces.tmp`; a directory there stops it,
+        // for root as well.
         let blocker = rig.file.with_extension("tmp");
         std::fs::create_dir(&blocker).unwrap();
 

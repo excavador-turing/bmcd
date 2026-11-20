@@ -253,6 +253,14 @@ ban lapses, not the retries during it. One success clears the peer's counter
 outright. The bookkeeping is in memory only: restarting the daemon forgives
 everyone.
 
+What counts is a wrong password, on `POST /api/bmc/authenticate` or in a
+`Basic` header. A bearer token the daemon does not know is refused with a 401
+but does not count. A token offered as a websocket subprotocol
+(`bmcd.bearer.<token>`) is a bearer token too, so an unknown one does not count
+either. The token store is in memory too, so after a restart every
+client still holds a token the daemon has forgotten. That is not a guess, and
+a 64-character random token cannot be guessed anyway.
+
 **A ban is answered as a ban, not as a wrong password.** Every other
 authentication failure is the 401 (or, on `POST /api/bmc/authenticate`, the
 403) it has always been; `ExceededAllowedAttempts` is **429 Too Many
@@ -359,7 +367,7 @@ archive. Two consequences:
 - **Every change here means recomputing `bmcd.hash`.** Buildroot runs
   `cargo vendor` and re-packs the archive (the `-cargo2` suffix), so the recorded
   sha256 covers the vendored crates as well as our source. It is computed in the
-  pinned build container with Rust 1.85.0; a Rust bump can legitimately change
+  pinned build container with Rust 1.98.1; a Rust bump can legitimately change
   it, and a stale hash fails the firmware build, not this one.
 - The recipe installs with `--path ./bmcd`, because this repo's root
   `Cargo.toml` has been a **virtual manifest** since v2.3.5 split out
@@ -369,10 +377,10 @@ archive. Two consequences:
 
 We do not use `cargo cross` (upstream's instructions, below the fold). For a
 change that only has to compile and pass its tests, one container is enough —
-`rust:1.85-bookworm`, the same toolchain version the firmware vendors with:
+`rust:1.98.1-bookworm`, the same toolchain version the firmware vendors with:
 
 ```bash
-docker run --rm -it -v "$PWD":/src -w /src rust:1.85-bookworm bash -c '
+docker run --rm -it -v "$PWD":/src -w /src rust:1.98.1-bookworm bash -c '
   apt-get update &&
   apt-get install -y libusb-1.0-0-dev libssl-dev pkg-config libudev-dev &&
   rustup component add rustfmt clippy &&
@@ -438,11 +446,9 @@ that had been yanked.
 listener stopped going through `HttpServer::bind_openssl`. Both were already in
 the tree beneath `actix-web`; the lockfile gained two lines and no crate.
 
-Resolution is pinned to **Rust 1.85**. A plain `cargo update` pulls actix-web
-4.15, `serde_with` 3.22, `time` 0.3.55 and the `icu_*` family, all of which now
-require rustc 1.88 and none of which compile here, so they are held one minor
-behind on purpose. Raising the toolchain is a decision about the Buildroot
-toolchain, not about this repo — and it has to happen together with
+The toolchain is pinned to **Rust 1.98.1** in `rust-toolchain.toml`, and
+`Cargo.lock` is resolved with it. Raising the toolchain is a decision about the
+Buildroot toolchain, not about this repo — and it has to happen together with
 `Cargo.lock`, `cargo_ci.yml` and `bmcd.hash`.
 
 Three advisories are still open in the lockfile. One of them has since been

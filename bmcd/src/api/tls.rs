@@ -48,12 +48,11 @@ use crate::api::into_legacy_response::LegacyResponse;
 use crate::authentication::authentication_context::Actor;
 use crate::config;
 use crate::tls_store::{Served, ServedCertificate, Source};
+use crate::utils::write_durably_with_mode;
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::Path;
 
 /// The script that issues the board's own certificate, run when an installed
 /// one is removed so the board is never left without one.
@@ -394,27 +393,6 @@ async fn validate(upload: &CertificateUpload) -> Result<(PKey<Private>, X509, Ve
     Ok((key, leaf, chain))
 }
 
-/// Write one file and make sure it is on the disk.
-///
-/// Through a temporary name in the same directory and a rename, so a daemon
-/// reading mid-write never sees half a file and a failure leaves the previous
-/// contents alone. The same shape the board's own generator uses.
-fn write_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let tmp = path.with_extension(format!("new.{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)
-}
-
 async fn put_certificate(
     request: HttpRequest,
     tls: web::Data<config::Tls>,
@@ -429,11 +407,11 @@ async fn put_certificate(
     // certificate beside a new key, which nothing reads until the certificate
     // lands. The reverse would leave a new certificate beside the old key,
     // which is the pair a reboot would try to serve.
-    write_atomically(&tls.private_key, body.private_key.as_bytes(), 0o600)
+    write_durably_with_mode(&tls.private_key, body.private_key.as_bytes(), Some(0o600))
         .map_err(|e| LegacyResponse::from(anyhow::anyhow!("could not store the key: {e}")))?;
-    write_atomically(&tls.certificate, body.certificate.as_bytes(), 0o644).map_err(|e| {
-        LegacyResponse::from(anyhow::anyhow!("could not store the certificate: {e}"))
-    })?;
+    write_durably_with_mode(&tls.certificate, body.certificate.as_bytes(), Some(0o644)).map_err(
+        |e| LegacyResponse::from(anyhow::anyhow!("could not store the certificate: {e}")),
+    )?;
 
     let source = Source::of(&leaf);
     let subject = name_to_string(leaf.subject_name());
