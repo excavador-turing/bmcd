@@ -20,6 +20,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   planner now emits those `self` lines, the BMC's new VLAN added BEFORE the
   old one is deleted so the BMC is never in none, and a failed delete of a
   `self` entry (a bridge that never had it) no longer stops the plan.
+  (thanks @danste22, #49 and #52)
 
 ## [2.43.0] — 2026-11-14
 
