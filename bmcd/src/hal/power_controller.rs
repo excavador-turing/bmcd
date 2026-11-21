@@ -17,7 +17,7 @@ use super::{
 };
 use anyhow::Context;
 use gpiod::{Chip, Lines, Options, Output};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{str::FromStr, time::Duration};
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
@@ -31,7 +31,15 @@ const PORT2_EN: &str = "node2-en";
 const PORT3_EN: &str = "node3-en";
 const PORT4_EN: &str = "node4-en";
 
-/// Physical memory, for the latch shadow word below.
+/// The gpio-latch platform device. Newer firmware exports the boot cookie and
+/// the latch shadow word below from the kernel driver that owns them, as the
+/// read-only attributes `shadow` (the word, hex) and `shadow_valid` (`1` when
+/// the cookie is the SPL's). Older firmware does not, and then the words are
+/// read from physical memory.
+const LATCH_SYSFS: &str = "/sys/bus/platform/devices/gpio-latch";
+const LATCH_SHADOW_ATTR: &str = "shadow";
+const LATCH_VALID_ATTR: &str = "shadow_valid";
+/// Physical memory, the fallback for the latch shadow word below.
 const DEV_MEM: &str = "/dev/mem";
 /// Boot cookie that the SPL leaves in SoC SRAM ("TPi2"). It is written on every
 /// boot, cold or warm, so it only says that the SPL ran and that the shadow
@@ -156,7 +164,8 @@ impl PowerController {
     /// # Returns
     ///
     /// * `Ok(bit-field)` where bit(n) = 1 means node n is powered. On a
-    ///   latching board this is read from the latch shadow in SoC SRAM, which
+    ///   latching board this is read from the latch shadow in SoC SRAM (through
+    ///   the kernel's sysfs attributes, or `/dev/mem` on older firmware), which
     ///   outlives a reboot of the BMC and is cleared by a cold boot, so it
     ///   reflects the rails that are actually on, not what this daemon last
     ///   requested. Where the shadow cannot be read, and on a board without
@@ -250,10 +259,66 @@ fn nodes_powered_by_latch(cookie: u32, shadow: u32) -> u8 {
         .fold(0u8, |acc, node| acc | (1 << node))
 }
 
-/// Reads the boot cookie and the latch shadow word out of SoC SRAM.
+/// Reads the boot cookie and the latch shadow word from the kernel's
+/// gpio-latch attributes under `dir`.
+///
+/// # Returns
+///
+/// * `Ok(Some((cookie, shadow)))` when the driver exports them. The attribute
+///   only says whether the cookie is the SPL's, so the cookie is returned as
+///   `BOOT_COOKIE` when it is and as 0 when it is not.
+/// * `Ok(None)` when the driver does not export them (older firmware).
+/// * `Err(e)` when they exist but cannot be read or make no sense.
+fn read_latch_words_sysfs(dir: &Path) -> anyhow::Result<Option<(u32, u32)>> {
+    let read = |attr: &str| -> anyhow::Result<Option<String>> {
+        let path = dir.join(attr);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text.trim().to_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| path.display().to_string()),
+        }
+    };
+
+    let (Some(shadow), Some(valid)) = (read(LATCH_SHADOW_ATTR)?, read(LATCH_VALID_ATTR)?) else {
+        return Ok(None);
+    };
+
+    let hex = shadow
+        .strip_prefix("0x")
+        .or_else(|| shadow.strip_prefix("0X"))
+        .unwrap_or(&shadow);
+    let shadow = u32::from_str_radix(hex, 16)
+        .with_context(|| format!("{LATCH_SHADOW_ATTR} is not a hex word: {shadow:?}"))?;
+    let cookie = match valid.as_str() {
+        "1" => BOOT_COOKIE,
+        "0" => 0,
+        other => anyhow::bail!("{LATCH_VALID_ATTR} is neither 0 nor 1: {other:?}"),
+    };
+
+    Ok(Some((cookie, shadow)))
+}
+
+/// Reads the boot cookie and the latch shadow word: from the kernel's sysfs
+/// attributes under `dir` when the driver exports them, otherwise (older
+/// firmware, or attributes that cannot be read) through `dev_mem`.
+fn read_latch_words_from(
+    dir: &Path,
+    dev_mem: impl FnOnce() -> anyhow::Result<(u32, u32)>,
+) -> anyhow::Result<(u32, u32)> {
+    match read_latch_words_sysfs(dir) {
+        Ok(Some(words)) => return Ok(words),
+        Ok(None) => trace!("no latch shadow in sysfs, reading {DEV_MEM}"),
+        Err(e) => warn!("cannot read the latch shadow from sysfs: {:#}", e),
+    }
+
+    dev_mem()
+}
+
+/// Reads the boot cookie and the latch shadow word out of SoC SRAM through
+/// `/dev/mem`.
 ///
 /// Reads only: no line is requested and nothing is written.
-fn read_latch_words() -> anyhow::Result<(u32, u32)> {
+fn read_latch_words_dev_mem() -> anyhow::Result<(u32, u32)> {
     use std::os::fd::AsRawFd;
 
     const PAGE: usize = 4096;
@@ -295,7 +360,16 @@ fn read_latch_words() -> anyhow::Result<(u32, u32)> {
 /// * `Ok(bit-field)` where bit(n) = 1 means node n is powered.
 /// * `Err(e)` when the shadow could not be read.
 fn read_latch_power_state() -> anyhow::Result<u8> {
-    let (cookie, shadow) = read_latch_words()?;
+    read_latch_power_state_from(Path::new(LATCH_SYSFS), read_latch_words_dev_mem)
+}
+
+/// `read_latch_power_state` with the sysfs directory and the `/dev/mem` read
+/// given, so that a test can stand in for both.
+fn read_latch_power_state_from(
+    dir: &Path,
+    dev_mem: impl FnOnce() -> anyhow::Result<(u32, u32)>,
+) -> anyhow::Result<u8> {
+    let (cookie, shadow) = read_latch_words_from(dir, dev_mem)?;
     let state = nodes_powered_by_latch(cookie, shadow);
     debug!(
         "latch shadow {:#05x}, cookie {:#010x}: powered nodes {:#06b}",
@@ -362,5 +436,129 @@ mod tests {
             nodes_powered_by_latch(BOOT_COOKIE, ALL_ON | 0xffff_fe00),
             0b1111
         );
+    }
+
+    /// A stand-in for the gpio-latch platform device: `shadow` and
+    /// `shadow_valid` as the kernel prints them, or absent.
+    fn latch_dir(shadow: Option<&str>, valid: Option<&str>) -> tempdir::TempDir {
+        let dir = tempdir::TempDir::new("latch-sysfs").expect("temp dir");
+        if let Some(shadow) = shadow {
+            std::fs::write(dir.path().join(LATCH_SHADOW_ATTR), shadow).unwrap();
+        }
+        if let Some(valid) = valid {
+            std::fs::write(dir.path().join(LATCH_VALID_ATTR), valid).unwrap();
+        }
+        dir
+    }
+
+    /// A `/dev/mem` read that must not happen.
+    fn no_dev_mem() -> anyhow::Result<(u32, u32)> {
+        panic!("/dev/mem was read although sysfs answered")
+    }
+
+    #[test]
+    fn sysfs_is_read_first_and_dev_mem_is_not_touched() {
+        let dir = latch_dir(Some("0x0000001f\n"), Some("1\n"));
+        assert_eq!(
+            read_latch_words_from(dir.path(), no_dev_mem).unwrap(),
+            (BOOT_COOKIE, ALL_ON)
+        );
+        assert_eq!(
+            read_latch_power_state_from(dir.path(), no_dev_mem).unwrap(),
+            0b1111
+        );
+    }
+
+    #[test]
+    fn the_shadow_is_parsed_with_or_without_the_prefix() {
+        for text in ["0x000001e1\n", "0X1E1", "1e1\n", "000001E1"] {
+            let dir = latch_dir(Some(text), Some("1\n"));
+            assert_eq!(
+                read_latch_words_from(dir.path(), no_dev_mem).unwrap(),
+                (BOOT_COOKIE, 0x1e1),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cold_board_through_sysfs_reads_nothing_powered() {
+        // The SPL cleared the latches: the cookie is there, the shadow is 0.
+        let dir = latch_dir(Some("0x00000000\n"), Some("1\n"));
+        assert_eq!(
+            read_latch_power_state_from(dir.path(), no_dev_mem).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_shadow_the_kernel_calls_invalid_is_not_trusted() {
+        let dir = latch_dir(Some("0x0000001f\n"), Some("0\n"));
+        assert_eq!(
+            read_latch_words_from(dir.path(), no_dev_mem).unwrap(),
+            (0, ALL_ON)
+        );
+        assert_eq!(
+            read_latch_power_state_from(dir.path(), no_dev_mem).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn old_firmware_without_the_attributes_falls_back_to_dev_mem() {
+        let dir = latch_dir(None, None);
+        assert_eq!(
+            read_latch_words_from(dir.path(), || Ok((BOOT_COOKIE, ALL_ON))).unwrap(),
+            (BOOT_COOKIE, ALL_ON)
+        );
+        assert_eq!(
+            read_latch_power_state_from(dir.path(), || Ok((BOOT_COOKIE, ALL_ON))).unwrap(),
+            0b1111
+        );
+        // A directory that is not there at all is the same case.
+        let gone = dir.path().join("no-such-device");
+        assert_eq!(
+            read_latch_power_state_from(&gone, || Ok((BOOT_COOKIE, ALL_ON | (1 << 8)))).unwrap(),
+            0b1110
+        );
+    }
+
+    #[test]
+    fn half_of_the_attributes_falls_back_to_dev_mem() {
+        for (shadow, valid) in [(Some("0x1f"), None), (None, Some("1"))] {
+            let dir = latch_dir(shadow, valid);
+            assert_eq!(
+                read_latch_words_from(dir.path(), || Ok((BOOT_COOKIE, ALL_ON))).unwrap(),
+                (BOOT_COOKIE, ALL_ON)
+            );
+        }
+    }
+
+    #[test]
+    fn attributes_that_make_no_sense_fall_back_to_dev_mem() {
+        for (shadow, valid) in [
+            ("not a word", "1"),
+            ("", "1"),
+            ("0x1ffffffff", "1"),
+            ("0x1f", "2"),
+            ("0x1f", ""),
+        ] {
+            let dir = latch_dir(Some(shadow), Some(valid));
+            assert!(
+                read_latch_words_sysfs(dir.path()).is_err(),
+                "{shadow:?} {valid:?}"
+            );
+            assert_eq!(
+                read_latch_words_from(dir.path(), || Ok((BOOT_COOKIE, ALL_ON))).unwrap(),
+                (BOOT_COOKIE, ALL_ON),
+                "{shadow:?} {valid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_source_available_is_an_error() {
+        let dir = latch_dir(None, None);
+        assert!(read_latch_power_state_from(dir.path(), || anyhow::bail!("no /dev/mem")).is_err());
     }
 }

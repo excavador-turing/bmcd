@@ -18,6 +18,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back); an apply that fails in the middle of a plan runs the way back and
   reports the first error; the timer's revert goes on past a failing command.
   The behaviour itself shipped in 2.45.0; this pins it.
+- **The latch shadow is read from the kernel's sysfs attributes first.** Where
+  the firmware's gpio-latch driver exports `shadow` and `shadow_valid` under
+  `/sys/bus/platform/devices/gpio-latch/`, the daemon reads the boot cookie
+  state and the shadow word from there and no longer maps SoC SRAM through
+  `/dev/mem`. On firmware without the attributes (every firmware up to and
+  including v2.52.0), or when they cannot be read or make no sense, it reads
+  `/dev/mem` as before, and on a v2.4 board or where neither can be read it
+  still reads the node enable lines. What counts as a powered node does not
+  change. The shadow-word contract with the bootloader is the one
+  [@danste22](https://github.com/danste22) carried to 6.18, from Sven
+  Rademakers' 2024 patch.
 
 ## [2.46.0] — 2026-11-20
 
