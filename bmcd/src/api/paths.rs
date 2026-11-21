@@ -217,7 +217,7 @@ pub(crate) static ALIASES: &[Alias] = &[
         path: "/reboot",
         ty: "reboot",
         document_param: None,
-        summary: "Reboot the BMC; the compute modules keep running",
+        summary: "Reboot the BMC; on a v2.5 board the compute modules keep running, on a v2.4 board they are power-cycled",
     },
     Alias {
         method: Method::Post,

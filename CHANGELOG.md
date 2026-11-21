@@ -12,6 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The reboot endpoint no longer says the compute modules keep running on
+  every board.** The OpenAPI summary of `POST /api/bmc/reboot` and the README
+  now say what is true of both revisions: on a v2.5 board the modules keep
+  running (the daemon adopts the live power state), on a v2.4 board a BMC
+  reboot power-cycles them. Text only; no behaviour changes.
 - **The switch rollback paths are now covered by tests.** A confirm whose
   `switch.json` write fails keeps the change pending (and the same token
   confirms once the disk allows it, or the window puts the old configuration

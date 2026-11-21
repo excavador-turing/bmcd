@@ -27,7 +27,7 @@ it is wrong.
 
 | verified | evidence |
 | -- | -- |
-| **Node power state survives a BMC reboot.** The daemon reads the live rail state on start and adopts it, instead of re-applying what `bmcd.bin` persisted | Ten flashes and daemon restarts with four modules powered: every rail stayed on, every `/proc/uptime` monotonic. Fixes upstream [bmcd#90](https://github.com/turing-machines/bmcd/issues/90) |
+| **Node power state survives a BMC reboot on a v2.5 board** (on a v2.4 board a BMC reboot power-cycles the four modules). The daemon reads the live rail state on start and adopts it, instead of re-applying what `bmcd.bin` persisted | Ten flashes and daemon restarts with four modules powered: every rail stayed on, every `/proc/uptime` monotonic. Fixes upstream [bmcd#90](https://github.com/turing-machines/bmcd/issues/90) |
 | **`power_on_time` is per node, and is a duration** | Upstream inferred it from one shared bit, so the read could only ever agree for node 1. Confirmed live on 2026-09-08: node 1 reported 126327 s power-on against 58 s of OS uptime after a manual reboot -- the field tracks the rail, not the operating system |
 | **An authenticated Prometheus endpoint**, with a credential that opens it and nothing else | 77 metric lines under the token; 401 for root, for a wrong token, and for the token against `/api/bmc` |
 | **The About payload carries the kernel release** | `"kernel":"6.12.109"` on the board, matching `/proc/sys/kernel/osrelease` |
