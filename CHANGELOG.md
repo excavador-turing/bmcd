@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.47.0] — 2026-11-21
+
+The daemon reads the latch shadow word from the kernel's sysfs attributes, and
+says the v2.4 caveat where the reboot endpoint claimed the modules keep running.
+
+The shadow-word contract is the one that the kernel's gpio-latch patch keeps
+with the bootloader, which [@danste22](https://github.com/danste22) (Daniel
+Steinhauf) carried to 6.18 (with the original idea from Sven Rademakers, whose
+2024 patch in turing-machines/BMC-Firmware started it). Thanks to both.
+
 ### Changed
 
 - **The reboot endpoint no longer says the compute modules keep running on
