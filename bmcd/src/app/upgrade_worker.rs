@@ -222,6 +222,7 @@ impl UpgradeWorker {
     /// is a separate, visible choice.
     pub async fn os_park(mut self) -> anyhow::Result<()> {
         let file_name = self.data_transfer.file_name()?.to_owned();
+        require_image_name(&file_name)?;
         let image_size = self.data_transfer.size()?;
         let source = self.data_transfer.reader().await?;
         tracing::info!("parking firmware image {}", file_name.to_string_lossy());
@@ -291,6 +292,7 @@ impl UpgradeWorker {
 
     pub async fn os_update(mut self) -> anyhow::Result<()> {
         let file_name = self.data_transfer.file_name()?.to_owned();
+        require_image_name(&file_name)?;
         // Read the size before the reader is taken: on a URL transfer it is the
         // content-length of a response that `reader()` consumes.
         let image_size = self.data_transfer.size()?;
@@ -314,13 +316,7 @@ impl UpgradeWorker {
         let mut writer = WriteMonitor::new(&mut file, &mut self.written_sender, &crc);
         copy_or_cancel(source, &mut writer, &self.cancel).await?;
 
-        let result = spawn_blocking(move || {
-            Command::new("sh")
-                .arg("-c")
-                .arg(format!("osupdate {}", os_update_img.to_string_lossy()))
-                .status()
-        })
-        .await?;
+        let result = spawn_blocking(move || osupdate_command(&os_update_img).status()).await?;
 
         tokio::fs::remove_dir_all(&staging_dir).await?;
 
@@ -354,6 +350,41 @@ const STAGED_NOTE: &str = "/mnt/overlay/staged-firmware";
 /// an uploaded file.
 const OTA_PREFIX: &str = "tp2-bmc-firmware-ota-";
 const OTA_SUFFIX: &str = ".tpu";
+
+/// A firmware image name is one path component of `[A-Za-z0-9._-]`.
+///
+/// `.` and `..` match that class and still leave the staging directory, so
+/// they are refused. Anything else is refused before a file is created:
+/// `Path::join` of an absolute name replaces the directory, and a shell
+/// metacharacter must never reach `osupdate`.
+pub(crate) fn firmware_image_name(name: &str) -> Result<&str, &'static str> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("firmware file name must be one component matching [A-Za-z0-9._-]");
+    }
+    Ok(name)
+}
+
+fn require_image_name(name: &std::ffi::OsStr) -> anyhow::Result<()> {
+    let Some(name) = name.to_str() else {
+        bail!("firmware file name must be one component matching [A-Za-z0-9._-]");
+    };
+    firmware_image_name(name).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// `osupdate` takes the image path as an argument. The path is never
+/// interpolated into a shell command.
+fn osupdate_command(image: &Path) -> Command {
+    let mut command = Command::new("osupdate");
+    command.arg(image);
+    command
+}
 
 /// Recovers the release tag from a published OTA filename, when the name
 /// follows the shape this fork publishes: `tp2-bmc-firmware-ota-v2.3.0.tpu`.
@@ -588,6 +619,34 @@ mod test {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_image_name_is_one_safe_component() {
+        assert_eq!(
+            firmware_image_name("tp2-bmc-firmware-ota-v2.52.0.tpu"),
+            Ok("tp2-bmc-firmware-ota-v2.52.0.tpu")
+        );
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/tmp/bmcd-traversal-test",
+            "a$(id)",
+            "a;id",
+            "dir/img.tpu",
+            "a b",
+        ] {
+            assert!(firmware_image_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn osupdate_is_not_a_shell() {
+        let image = PathBuf::from("/tmp/os_upgrade/firmware.tpu");
+        let command = osupdate_command(&image);
+        assert_eq!(command.get_program(), "osupdate");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [image.as_os_str()]);
+    }
 
     #[test]
     fn a_published_ota_name_yields_its_tag() {

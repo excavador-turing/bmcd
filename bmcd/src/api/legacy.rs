@@ -1304,6 +1304,15 @@ fn resolve_sdcard_file(root: &Path, mounted: bool, file: &str) -> LegacyResult<P
 /// * otherwise the image is uploaded by the client, and `length` is required.
 ///
 /// `sha256`, when given, is verified for every source as the bytes are read.
+///
+/// For `type=firmware`, an uploaded or downloaded image's name must be one
+/// component of `[A-Za-z0-9._-]` ([`firmware_image_name`]): the upgrade worker
+/// stages the image under that name and hands its path to `osupdate`. It is
+/// checked here, before anything is written. A node flash streams the image
+/// to the node and never uses the name as a path, so a name like
+/// `image (1).img` stays accepted there.
+///
+/// [`firmware_image_name`]: crate::app::upgrade_worker::firmware_image_name
 async fn create_data_transfer_in(
     query: &Query,
     sdcard_root: &Path,
@@ -1315,6 +1324,14 @@ async fn create_data_transfer_in(
 
     let sha256 = try_map_sha256(query.get("sha256"))?;
     let local = flag(query, "local")?;
+    let firmware = query.get("type").map(String::as_str) == Some("firmware");
+    let check_name = |name: &str| -> LegacyResult<()> {
+        if firmware {
+            crate::app::upgrade_worker::firmware_image_name(name)
+                .map_err(LegacyResponse::bad_request)?;
+        }
+        Ok(())
+    };
 
     if flag(query, "sdcard")? {
         if local {
@@ -1344,6 +1361,14 @@ async fn create_data_transfer_in(
                 e
             ))
         })?;
+        if firmware {
+            let segment = url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| LegacyResponse::bad_request("`file` url has no file name"))?;
+            check_name(segment)?;
+        }
         return Ok(DataTransfer::url(url, sha256).await?);
     }
 
@@ -1355,7 +1380,9 @@ async fn create_data_transfer_in(
     let size = u64::from_str(size)
         .map_err(|_| LegacyResponse::bad_request("`length` parameter is not a number"))?;
 
-    Ok(DataTransfer::remote(PathBuf::from(&file), size, 16, sha256))
+    check_name(file)?;
+
+    Ok(DataTransfer::remote(PathBuf::from(file), size, 16, sha256))
 }
 
 pub fn try_map_sha256(value: Option<&String>) -> LegacyResult<Option<bytes::Bytes>> {
@@ -1605,6 +1632,66 @@ mod test {
             );
         }
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upload_file_name_must_be_one_safe_component() {
+        let root = Path::new("/nonexistent");
+        for file in [
+            "/tmp/bmcd-traversal-test",
+            "a$(id)",
+            "a;id",
+            "..",
+            "dir/img.tpu",
+            "",
+        ] {
+            let query = q(&[("type", "firmware"), ("file", file), ("length", "1")]);
+            let (status, _) = err_status(create_data_transfer_in(&query, root, false).await);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{file}");
+        }
+        let query = q(&[
+            ("type", "firmware"),
+            ("file", "tp2-bmc-firmware-ota-v2.52.0.tpu"),
+            ("length", "1"),
+        ]);
+        match create_data_transfer_in(&query, root, false).await {
+            Ok(transfer) => assert_eq!(
+                transfer.file_name().unwrap(),
+                "tp2-bmc-firmware-ota-v2.52.0.tpu"
+            ),
+            other => panic!("expected a remote transfer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_file_name_with_shell_characters_is_refused_before_fetch() {
+        let query = q(&[
+            ("type", "firmware"),
+            ("file", "https://example.invalid/a$(id)"),
+        ]);
+        let (status, _) =
+            err_status(create_data_transfer_in(&query, Path::new("/nonexistent"), false).await);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_node_flash_name_is_not_held_to_the_firmware_rule() {
+        let root = Path::new("/nonexistent");
+        let query = q(&[
+            ("type", "flash"),
+            ("node", "1"),
+            ("file", "image (1).img"),
+            ("length", "1"),
+        ]);
+        match create_data_transfer_in(&query, root, false).await {
+            Ok(transfer) => assert_eq!(transfer.file_name().unwrap(), "image (1).img"),
+            other => panic!("expected a remote transfer, got {other:?}"),
+        }
+        for file in ["dir/img.tpu", "a$(id).tpu"] {
+            let query = q(&[("type", "firmware"), ("file", file), ("length", "1")]);
+            let (status, _) = err_status(create_data_transfer_in(&query, root, false).await);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{file}");
+        }
     }
 
     #[tokio::test]
