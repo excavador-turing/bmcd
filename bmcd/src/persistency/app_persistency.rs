@@ -279,7 +279,7 @@ mod tests {
                     ApplicationPersistency::new(keys_with_default.clone(), &bin_file, None)
                         .await
                         .unwrap();
-                persistency.set("test", &777u128).await;
+                persistency.try_set("test", &777u128).await.unwrap();
                 drop(persistency);
 
                 // workaround to give the spawned task for syncing the file to disk some time
@@ -287,7 +287,7 @@ mod tests {
                 let persistency = ApplicationPersistency::new(keys_with_default, bin_file, None)
                     .await
                     .unwrap();
-                assert_eq!(persistency.get::<u128>("test").await, 777u128);
+                assert_eq!(persistency.try_get::<u128>("test").await.unwrap(), 777u128);
             });
         });
     }
@@ -314,7 +314,7 @@ mod tests {
 
                 for n in 0..6u128 {
                     sleep(Duration::from_millis(100)).await;
-                    persistency.set("test", &n).await;
+                    persistency.try_set("test", &n).await.unwrap();
                 }
 
                 let keys_with_default = [("test", bincode::serialize(&1u128).unwrap())];
@@ -326,7 +326,7 @@ mod tests {
 
                 // check that the previous persistency instance did not write to file during the updates of
                 // the test value. We expect to see the default value of the previous persistency
-                assert_eq!(persistency2.get::<u128>("test").await, 123u128);
+                assert_eq!(persistency2.try_get::<u128>("test").await.unwrap(), 123u128);
             });
         });
     }

@@ -156,7 +156,7 @@ impl UpgradeWorker {
         bmc.activate_slot(node.to_inverse_bitfield(), node.to_bitfield())
             .await?;
         bmc.usb_boot(node, false).await?;
-        let (mode, _) = bmc.get_usb_mode().await;
+        let (mode, _) = bmc.get_usb_mode().await?;
         bmc.configure_usb(mode).await?;
         Ok(())
     }
@@ -304,6 +304,10 @@ impl UpgradeWorker {
         os_update_img.push(&file_name);
 
         tokio::fs::create_dir_all(&staging_dir).await?;
+        // Removed on every exit, including a cancelled copy. The delete used
+        // to run only after `spawn_blocking` returned, so a failed copy left
+        // the image in the staging directory.
+        let _staging = RemoveStagingDir(staging_dir.clone());
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -317,8 +321,6 @@ impl UpgradeWorker {
         copy_or_cancel(source, &mut writer, &self.cancel).await?;
 
         let result = spawn_blocking(move || osupdate_command(&os_update_img).status()).await?;
-
-        tokio::fs::remove_dir_all(&staging_dir).await?;
 
         let success = result?;
         if !success.success() {
@@ -337,6 +339,19 @@ impl UpgradeWorker {
         }
 
         Ok(())
+    }
+}
+
+/// Deletes the firmware staging directory when the update ends, however it ends.
+struct RemoveStagingDir(PathBuf);
+
+impl Drop for RemoveStagingDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("could not remove {}: {e}", self.0.display());
+            }
+        }
     }
 }
 
@@ -613,6 +628,19 @@ mod test {
         assert_eq!(expected_crc, write_watcher.crc());
         assert_eq!(&buffer, buf_writer.get_ref());
         assert_eq!(*receiver.borrow_and_update(), buffer.len() as u64);
+    }
+
+    #[test]
+    fn staging_dir_is_removed_when_the_guard_drops() {
+        let parent = TempDir::new("staging_parent").unwrap();
+        let dir = parent.path().join("image");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.tpu"), b"x").unwrap();
+        {
+            let _guard = RemoveStagingDir(dir.clone());
+            assert!(dir.exists());
+        }
+        assert!(!dir.exists());
     }
 }
 

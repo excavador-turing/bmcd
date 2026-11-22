@@ -228,7 +228,13 @@ async fn collect(bmc: &BmcApplication, certificate: Certificate) -> Snapshot {
         .unwrap_or_default();
     cooling.sort_by(|left, right| left.device.cmp(&right.device));
 
-    let (usb_config, bus_type) = bmc.get_usb_mode().await;
+    let usb = match bmc.get_usb_mode().await {
+        Ok((usb_config, bus_type)) => Some(UsbTopology::of(usb_config, bus_type)),
+        Err(e) => {
+            tracing::warn!("USB mode left out of the snapshot: {e:#}");
+            None
+        }
+    };
 
     Snapshot {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -236,7 +242,7 @@ async fn collect(bmc: &BmcApplication, certificate: Certificate) -> Snapshot {
         cooling,
         ports: get_switch_ports().await,
         nodes,
-        usb: Some(UsbTopology::of(usb_config, bus_type)),
+        usb,
         health: get_health().await,
         firmware: get_firmware_slots(super::legacy::firmware_version().await).await,
         certificate,

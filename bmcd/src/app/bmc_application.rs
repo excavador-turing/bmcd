@@ -299,7 +299,7 @@ impl BmcApplication {
     /// returns Err(e) on an internal gpio error or when there is an error
     /// writing power LED status.
     pub async fn toggle_power_states(&self, inverse_toggle: bool) -> anyhow::Result<()> {
-        let node_values = self.app_db.get::<u8>(ACTIVATED_NODES_KEY).await;
+        let node_values = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
 
         let mut on = node_values == 0;
         if inverse_toggle && node_values != 0 && node_values != 0b1111 {
@@ -351,12 +351,12 @@ impl BmcApplication {
     #[instrument(skip(self), fields(alternative_port, config))]
     async fn initialize_usb_mode(&self) -> anyhow::Result<()> {
         if self.pin_controller.usb_bus_type() == UsbArchitecture::UsbHub {
-            let alternative_port = self.app_db.get::<bool>(NODE1_USB_MODE).await;
+            let alternative_port = self.app_db.try_get::<bool>(NODE1_USB_MODE).await?;
             self.pin_controller.set_node1_usb_route(alternative_port)?;
             tracing::Span::current().record("alternative_port", alternative_port);
         }
 
-        let config = self.app_db.get::<UsbConfig>(USB_CONFIG).await;
+        let config = self.app_db.try_get::<UsbConfig>(USB_CONFIG).await?;
         tracing::Span::current().record("config", format!("{:?}", config));
         self.configure_usb(config).await.context("USB configure")
     }
@@ -369,7 +369,7 @@ impl BmcApplication {
         // were.
         resume_all_governors().await;
 
-        let store = self.app_db.get::<CoolingMap>(COOLING_DEVICES).await;
+        let store = self.app_db.try_get::<CoolingMap>(COOLING_DEVICES).await?;
         let devices = get_cooling_state().await;
 
         info!(
@@ -397,18 +397,18 @@ impl BmcApplication {
         // cleanup storage
         let map: CoolingMap = HashMap::from_iter(set_devices);
         info!("loaded cooling devices: {:?}", map);
-        self.app_db.set(COOLING_DEVICES, map).await;
+        self.app_db.try_set(COOLING_DEVICES, map).await?;
 
         spawn_override_ceiling();
 
         Ok(())
     }
 
-    pub async fn get_usb_mode(&self) -> (UsbConfig, String) {
-        (
-            self.app_db.get::<UsbConfig>(USB_CONFIG).await,
+    pub async fn get_usb_mode(&self) -> anyhow::Result<(UsbConfig, String)> {
+        Ok((
+            self.app_db.try_get::<UsbConfig>(USB_CONFIG).await?,
             self.pin_controller.usb_bus_type().to_string(),
-        )
+        ))
     }
 
     /// routine to support legacy API
@@ -428,12 +428,14 @@ impl BmcApplication {
         );
         ensure!(mask != 0);
 
-        let state = self.app_db.get::<u8>(ACTIVATED_NODES_KEY).await;
+        let state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
         let new_state = (state & !mask) | (node_states & mask);
 
-        self.update_power_on_times(state, node_states, mask).await;
+        self.update_power_on_times(state, node_states, mask).await?;
 
-        self.app_db.set::<u8>(ACTIVATED_NODES_KEY, new_state).await;
+        self.app_db
+            .try_set::<u8>(ACTIVATED_NODES_KEY, new_state)
+            .await?;
         debug!("node activated bits updated:{:#06b}.", new_state);
 
         let led = new_state != 0;
@@ -449,7 +451,12 @@ impl BmcApplication {
     }
 
     #[instrument(skip(self))]
-    async fn update_power_on_times(&self, activated_nodes: u8, node_states: u8, mask: u8) {
+    async fn update_power_on_times(
+        &self,
+        activated_nodes: u8,
+        node_states: u8,
+        mask: u8,
+    ) -> anyhow::Result<()> {
         let mut node_infos = self
             .app_db
             .try_get::<NodeInfos>(NODE_INFO_KEY)
@@ -465,24 +472,27 @@ impl BmcApplication {
         }
 
         self.app_db
-            .set::<NodeInfos>(NODE_INFO_KEY, node_infos)
-            .await;
+            .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_node1_usb_route(&self, alternative_port: bool) -> anyhow::Result<()> {
         info!("changed node1 usb route. port= {}", alternative_port);
         self.pin_controller.set_node1_usb_route(alternative_port)?;
-        self.app_db.set(NODE1_USB_MODE, alternative_port).await;
+        self.app_db
+            .try_set(NODE1_USB_MODE, alternative_port)
+            .await?;
         Ok(())
     }
 
-    pub async fn get_node1_usb_route(&self) -> bool {
-        self.app_db.get::<bool>(NODE1_USB_MODE).await
+    pub async fn get_node1_usb_route(&self) -> anyhow::Result<bool> {
+        Ok(self.app_db.try_get::<bool>(NODE1_USB_MODE).await?)
     }
 
     pub async fn configure_usb(&self, config: UsbConfig) -> anyhow::Result<()> {
         self.configure_usb_internal(config).await?;
-        self.app_db.set(USB_CONFIG, config).await;
+        self.app_db.try_set(USB_CONFIG, config).await?;
         Ok(())
     }
 
@@ -611,9 +621,17 @@ impl BmcApplication {
     }
 
     /// The serial speed of each node's console, as stored: what the ports are
-    /// opened at when the daemon starts. 115200 for a node with none.
+    /// opened at when the daemon starts. 115200 for a node with none, and for
+    /// every node when the stored node info cannot be read: the consoles
+    /// still open, and the error is logged.
     pub async fn node_bauds(&self) -> [u32; 4] {
-        let stored = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        let stored = match self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::error!("stored node info cannot be read, consoles open at 115200: {e}");
+                NodeInfos::default()
+            }
+        };
         std::array::from_fn(|i| effective_baud(stored[i].uart_baud))
     }
 
@@ -629,13 +647,13 @@ impl BmcApplication {
         new_info: HashMap<NodeId, NodeInfoUpdate>,
     ) -> anyhow::Result<()> {
         validate_node_infos(&new_info)?;
-        let mut stored_nodes = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        let mut stored_nodes = self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await?;
 
         let new_bauds = apply_node_updates(&mut stored_nodes, new_info);
 
         self.app_db
-            .set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
-            .await;
+            .try_set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
+            .await?;
 
         // After it is stored, so that a speed that was applied is a speed
         // that survives the next start.
@@ -654,7 +672,7 @@ impl BmcApplication {
             anyhow::bail!("Current time before Unix epoch");
         };
 
-        let mut node_infos = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        let mut node_infos = self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await?;
         node_infos.iter_mut().for_each(|info| {
             if let Some(time) = &mut info.power_on_time {
                 // saturating: the stored value is a wall-clock stamp, and the
@@ -672,13 +690,13 @@ impl BmcApplication {
         let res = set_cooling_state(device, &speed).await;
 
         if res.is_ok() {
-            let mut cooling = self.app_db.get::<CoolingMap>(COOLING_DEVICES).await;
+            let mut cooling = self.app_db.try_get::<CoolingMap>(COOLING_DEVICES).await?;
             if cooling.len() < COOLING_CAPACITY {
                 let mut hasher = DefaultHasher::new();
                 device.hash(&mut hasher);
                 let value = cooling.entry(hasher.finish()).or_default();
                 *value = speed;
-                self.app_db.set(COOLING_DEVICES, cooling).await;
+                self.app_db.try_set(COOLING_DEVICES, cooling).await?;
             } else {
                 tracing::warn!(
                     "cooling devices persistency full, no room to persist speed of '{}'",

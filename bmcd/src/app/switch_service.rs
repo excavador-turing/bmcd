@@ -55,9 +55,10 @@ use crate::app::switch_interfaces::{
 use crate::utils::write_durably;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Where the confirmed document lives. Beside `access.json`, on the overlay,
 /// for the same reason: this daemon never rewrites `config.yaml`.
@@ -144,6 +145,11 @@ pub struct SwitchService {
     bond_executors: Vec<PathBuf>,
     /// Runs `ip` and `bridge`. The real thing, unless a test says otherwise.
     exec: Arc<dyn Exec>,
+    /// One switch change at a time. Not held across `.await`: the commands
+    /// themselves run on a blocking thread, and this only stops a second
+    /// change starting while the first is still on that thread.
+    busy: Arc<AtomicBool>,
+    busy_notify: Arc<Notify>,
 }
 
 struct Inner {
@@ -185,9 +191,79 @@ impl SwitchService {
             net_class: NET_CLASS.into(),
             bond_executors: bond_executor_paths(),
             exec: Arc::new(SystemExec),
+            busy: Arc::new(AtomicBool::new(false)),
+            busy_notify: Arc::new(Notify::new()),
         }
     }
 
+    /// Wait until no other switch change is in progress, then hold that place
+    /// until the guard drops.
+    async fn switch_turn(&self) -> SwitchTurn {
+        loop {
+            // Subscribe before the check. The other order loses the wake when
+            // the holder finishes between the check and the wait.
+            let notified = self.busy_notify.notified();
+            tokio::pin!(notified);
+            if self
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return SwitchTurn {
+                    busy: Arc::clone(&self.busy),
+                    notify: Arc::clone(&self.busy_notify),
+                };
+            }
+            notified.await;
+        }
+    }
+
+    /// `ip` / `bridge` off the async worker, and not while `inner` is held.
+    async fn blocking_plan(
+        &self,
+        commands: &[Command],
+    ) -> Result<(usize, Result<(), SwitchError>), SwitchError> {
+        let exec = Arc::clone(&self.exec);
+        let commands = commands.to_vec();
+        tokio::task::spawn_blocking(move || run_plan(exec.as_ref(), &commands))
+            .await
+            .map_err(|e| {
+                SwitchError::Io(std::io::Error::other(format!(
+                    "switch command task stopped: {e}"
+                )))
+            })
+    }
+
+    async fn blocking_all(&self, commands: &[Command]) -> Result<(), SwitchError> {
+        self.blocking_plan(commands).await?.1
+    }
+
+    async fn blocking_best_effort(&self, commands: &[Command]) -> Result<(), SwitchError> {
+        let exec = Arc::clone(&self.exec);
+        let commands = commands.to_vec();
+        tokio::task::spawn_blocking(move || run_best_effort(exec.as_ref(), &commands))
+            .await
+            .map_err(|e| {
+                SwitchError::Io(std::io::Error::other(format!(
+                    "switch command task stopped: {e}"
+                )))
+            })?
+    }
+}
+
+struct SwitchTurn {
+    busy: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for SwitchTurn {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+impl SwitchService {
     /// Tests run the plan against a recording stand-in instead of `ip`.
     #[cfg(test)]
     pub fn with_exec(mut self, exec: Arc<dyn Exec>) -> Self {
@@ -207,39 +283,18 @@ impl SwitchService {
     }
 
     fn bond_present(&self) -> bool {
-        self.net_class.join(BOND).exists()
+        bond_present_in(&self.net_class)
     }
 
     /// `br0`'s `vlan_filtering`, from the bridge itself.
     fn kernel_filtering(&self) -> Option<bool> {
-        self.bridge_flag("vlan_filtering").map(|v| v != 0)
-    }
-
-    /// Whether `br0` runs spanning tree: the kernel's `stp_state` is 0 (off),
-    /// 1 (kernel STP) or 2 (user-space STP).
-    fn kernel_stp(&self) -> Option<bool> {
-        self.bridge_flag("stp_state").map(|v| v != 0)
-    }
-
-    fn bridge_flag(&self, name: &str) -> Option<u32> {
-        std::fs::read_to_string(self.net_class.join(BRIDGE).join("bridge").join(name))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        kernel_filtering_in(&self.net_class)
     }
 
     /// What the bridge ports are in, per `bridge -j vlan show`. `None` when
     /// that cannot be run or read, which is "unknown", never "nothing".
     fn kernel_vlans(&self) -> Option<KernelVlans> {
-        let (program, args) = SHOW_VLANS.split_first().expect("a command has a program");
-        match self.exec.run(program, args) {
-            Ok(out) => parse_bridge_vlans(&out),
-            Err(e) => {
-                tracing::warn!("could not read the bridge VLANs: {e}");
-                None
-            }
-        }
+        kernel_vlans_from(self.exec.as_ref())
     }
 
     /// What is missing from the kernel that `document` says should be there:
@@ -286,13 +341,19 @@ impl SwitchService {
     /// clean: what `fallback` says is running is then a guess, and the next
     /// plan would be computed from it. Falls back to `fallback` when the
     /// kernel cannot be read.
-    fn running_from_reality(&self, fallback: &SwitchDocument) -> SwitchDocument {
-        let (Some(vlans), Some(filtering)) = (self.kernel_vlans(), self.kernel_filtering()) else {
-            tracing::warn!("could not read the switch back from the kernel; keeping the document");
-            return fallback.clone();
-        };
-        let stp = self.kernel_stp().unwrap_or(fallback.stp);
-        document_from_kernel(&vlans, filtering, stp, self.bond_present(), fallback)
+    ///
+    /// `bridge -j vlan show` is a process, so this runs on a blocking thread,
+    /// and the callers do not hold `inner` while it does.
+    async fn running_from_reality(&self, fallback: &SwitchDocument) -> SwitchDocument {
+        let exec = Arc::clone(&self.exec);
+        let net_class = self.net_class.clone();
+        let owned = fallback.clone();
+        tokio::task::spawn_blocking(move || running_from_kernel(exec.as_ref(), &net_class, &owned))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("reading the switch back from the kernel stopped: {e}");
+                fallback.clone()
+            })
     }
 
     /// Look for `br0` somewhere other than the kernel's `/sys/class/net`.
@@ -350,6 +411,7 @@ impl SwitchService {
             );
             return Ok(());
         }
+        let _turn = self.switch_turn().await;
         let mut inner = self.inner.lock().await;
         let Some(document) = inner.state.confirmed().cloned() else {
             return Ok(());
@@ -425,15 +487,18 @@ impl SwitchService {
             } else {
                 boot_baseline(&document)
             };
-            run_all(self.exec.as_ref(), &plan(&baseline, &document))?;
-            inner.running = document;
+            let commands = plan(&baseline, &document);
+            drop(inner);
+            self.blocking_all(&commands).await?;
+            self.inner.lock().await.running = document;
             return Ok(());
         }
 
         let baseline = baseline.unwrap_or_else(|| Preset::flat().expand());
         let commands = plan(&baseline, &document);
-        run_all(self.exec.as_ref(), &commands)?;
-        inner.running = document;
+        drop(inner);
+        self.blocking_all(&commands).await?;
+        self.inner.lock().await.running = document;
         tracing::info!("switch configuration applied from {}", self.path.display());
         Ok(())
     }
@@ -463,6 +528,7 @@ impl SwitchService {
         window: Duration,
         replace_hand_written: bool,
     ) -> Result<Pending, SwitchError> {
+        let _turn = self.switch_turn().await;
         self.bridge_check()?;
         let lag = document.second_uplink == SecondUplink::Lag;
         if lag && !self.bond_native() {
@@ -516,13 +582,20 @@ impl SwitchService {
             // A failure here leaves the switch part-way. Undo what it did,
             // best-effort (steps that never ran usually fail too), and then
             // drop the pending change. What is undone is only what this apply
-            // did: see [`undo_plan`].
-            let (done, outcome) = run_plan(self.exec.as_ref(), &commands);
+            // did: see [`undo_plan`]. The commands run on a blocking thread,
+            // and `inner` is not held while they run: one of the two workers
+            // would otherwise sit inside `ip` or `bridge`.
+            drop(inner);
+            let (done, outcome) = self.blocking_plan(&commands).await?;
+            let mut inner = self.inner.lock().await;
             if let Err(e) = outcome {
-                let bond_created = commands[..done].iter().any(creates_bond);
+                let bond_created = commands.iter().take(done).any(creates_bond);
                 let undo = undo_plan(&previous, &document, bond_created);
-                let _ = run_best_effort(self.exec.as_ref(), &undo);
-                inner.running = self.running_from_reality(&previous);
+                drop(inner);
+                let _ = self.blocking_best_effort(&undo).await;
+                let running = self.running_from_reality(&previous).await;
+                let mut inner = self.inner.lock().await;
+                inner.running = running;
                 let _ = inner.state.revert(SystemTime::now());
                 return Err(e);
             }
@@ -565,7 +638,7 @@ impl SwitchService {
     /// BMC's own VLAN, because those are the only paths a confirmation could
     /// arrive over. With `Trunk` redundant that is both, and either forwarding
     /// is enough -- spanning tree will have blocked the other on purpose.
-    async fn start_window_if_reachable(&self, inner: &mut Inner, now: SystemTime) {
+    fn start_window_if_reachable(&self, inner: &mut Inner, now: SystemTime) {
         let Some(pending) = inner.state.pending() else {
             return;
         };
@@ -613,6 +686,7 @@ impl SwitchService {
     /// the timer would put the old document back, and the next boot would come
     /// up on a configuration nobody confirmed.
     pub(crate) async fn confirm_at(&self, token: &str, now: SystemTime) -> Result<(), SwitchError> {
+        let _turn = self.switch_turn().await;
         let mut inner = self.inner.lock().await;
         // Check first, write both files, and only then commit. A refusal or a
         // write that fails leaves the change pending: it can be confirmed
@@ -698,9 +772,16 @@ impl SwitchService {
     }
 
     pub async fn revert(&self) -> Result<(), SwitchError> {
-        let mut inner = self.inner.lock().await;
-        let effect = inner.state.revert(SystemTime::now())?;
-        self.carry_out(&mut inner, effect).await
+        let _turn = self.switch_turn().await;
+        let (effect, running) = {
+            let mut inner = self.inner.lock().await;
+            let effect = inner.state.revert(SystemTime::now())?;
+            let running = inner.running.clone();
+            (effect, running)
+        };
+        let (next, outcome) = self.carry_out(effect, &running).await;
+        self.inner.lock().await.running = next;
+        outcome
     }
 
     /// Called on a timer. Starts a window whose uplink has come up, and puts
@@ -711,18 +792,24 @@ impl SwitchService {
 
     /// [`tick`](Self::tick) at a given time.
     pub(crate) async fn tick_at(&self, now: SystemTime) {
-        let mut inner = self.inner.lock().await;
-        self.start_window_if_reachable(&mut inner, now).await;
-        let effect = inner.state.tick(now);
-        if matches!(effect, Effect::None) {
-            return;
-        }
-        tracing::warn!("switch change was not confirmed in its window; putting the previous configuration back");
-        if let Err(e) = self.carry_out(&mut inner, effect).await {
+        let _turn = self.switch_turn().await;
+        let (effect, running) = {
+            let mut inner = self.inner.lock().await;
+            self.start_window_if_reachable(&mut inner, now);
+            let effect = inner.state.tick(now);
+            if matches!(effect, Effect::None) {
+                return;
+            }
+            tracing::warn!("switch change was not confirmed in its window; putting the previous configuration back");
+            (effect, inner.running.clone())
+        };
+        let (next, outcome) = self.carry_out(effect, &running).await;
+        if let Err(e) = &outcome {
             // There is nothing above this to tell. Saying so loudly is the
             // whole of the response.
             tracing::error!("could not put the previous switch configuration back: {e}");
         }
+        self.inner.lock().await.running = next;
     }
 
     /// Put a document back on the switch, for a revert.
@@ -733,22 +820,78 @@ impl SwitchService {
     /// with nothing above to try again. And `running` is then read back from
     /// the kernel rather than taken from the document, because after a failure
     /// the document is not what is running.
-    async fn carry_out(&self, inner: &mut Inner, effect: Effect) -> Result<(), SwitchError> {
+    ///
+    /// Returns the document that is running afterwards. The caller stores it
+    /// after the commands have finished, so the switch lock is not held while
+    /// `ip` or `bridge` runs.
+    async fn carry_out(
+        &self,
+        effect: Effect,
+        running: &SwitchDocument,
+    ) -> (SwitchDocument, Result<(), SwitchError>) {
         if let Effect::Apply(document) = effect {
-            let commands = plan(&inner.running, &document);
-            let outcome = run_best_effort(self.exec.as_ref(), &commands);
-            inner.running = match &outcome {
+            let commands = plan(running, &document);
+            let outcome = self.blocking_best_effort(&commands).await;
+            let next = match &outcome {
                 Ok(()) => document,
-                Err(_) => self.running_from_reality(&document),
+                Err(_) => self.running_from_reality(&document).await,
             };
-            return outcome;
+            return (next, outcome);
         }
-        Ok(())
+        (running.clone(), Ok(()))
     }
 }
 
 /// Where the kernel exposes network interfaces.
 pub const NET_CLASS: &str = "/sys/class/net";
+
+fn bond_present_in(net_class: &Path) -> bool {
+    net_class.join(BOND).exists()
+}
+
+fn bridge_flag_in(net_class: &Path, name: &str) -> Option<u32> {
+    std::fs::read_to_string(net_class.join(BRIDGE).join("bridge").join(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn kernel_filtering_in(net_class: &Path) -> Option<bool> {
+    bridge_flag_in(net_class, "vlan_filtering").map(|v| v != 0)
+}
+
+/// Whether `br0` runs spanning tree: the kernel's `stp_state` is 0 (off),
+/// 1 (kernel STP) or 2 (user-space STP).
+fn kernel_stp_in(net_class: &Path) -> Option<bool> {
+    bridge_flag_in(net_class, "stp_state").map(|v| v != 0)
+}
+
+fn kernel_vlans_from(exec: &dyn Exec) -> Option<KernelVlans> {
+    let (program, args) = SHOW_VLANS.split_first()?;
+    match exec.run(program, args) {
+        Ok(out) => parse_bridge_vlans(&out),
+        Err(e) => {
+            tracing::warn!("could not read the bridge VLANs: {e}");
+            None
+        }
+    }
+}
+
+/// [`SwitchService::running_from_reality`]'s blocking half.
+fn running_from_kernel(
+    exec: &dyn Exec,
+    net_class: &Path,
+    fallback: &SwitchDocument,
+) -> SwitchDocument {
+    let (Some(vlans), Some(filtering)) = (kernel_vlans_from(exec), kernel_filtering_in(net_class))
+    else {
+        tracing::warn!("could not read the switch back from the kernel; keeping the document");
+        return fallback.clone();
+    };
+    let stp = kernel_stp_in(net_class).unwrap_or(fallback.stp);
+    document_from_kernel(&vlans, filtering, stp, bond_present_in(net_class), fallback)
+}
 
 /// The bridge port state that means "this port passes frames".
 ///
@@ -812,9 +955,9 @@ fn run_command(exec: &dyn Exec, command: &Command) -> Result<(), SwitchError> {
 /// Run the plan, stopping at the first failure. Returns how many commands were
 /// done, and how it ended.
 ///
-/// Each command is an ioctl with a command line in front of it and returns in
-/// well under a millisecond, so there is no handing the runtime a blocking
-/// task per command: that would cost more than it saved.
+/// Each command is an ioctl with a command line in front of it. Callers run
+/// the whole plan on a blocking thread, one task for the plan, not one task
+/// per command.
 fn run_plan(exec: &dyn Exec, commands: &[Command]) -> (usize, Result<(), SwitchError>) {
     for (done, command) in commands.iter().enumerate() {
         match run_command(exec, command) {
@@ -826,11 +969,6 @@ fn run_plan(exec: &dyn Exec, commands: &[Command]) -> (usize, Result<(), SwitchE
         }
     }
     (commands.len(), Ok(()))
-}
-
-/// [`run_plan`] for a caller with nothing to do about a failure part-way.
-fn run_all(exec: &dyn Exec, commands: &[Command]) -> Result<(), SwitchError> {
-    run_plan(exec, commands).1
 }
 
 /// Run every command, going past errors so later steps still run. The first
