@@ -125,7 +125,10 @@ pub const REFUSAL: &str =
 /// and why, which a board in that state has no way to keep private anyway.
 fn is_permitted(method: &Method, path: &str) -> bool {
     match path {
-        "/api/bmc/authenticate" | "/api/bmc/access/password" | "/api/bmc/access" => true,
+        "/api/bmc/authenticate"
+        | "/api/bmc/logout"
+        | "/api/bmc/access/password"
+        | "/api/bmc/access" => true,
         "/api/bmc/storage" => method == Method::GET,
         "/api/bmc/storage/repair" => method == Method::POST,
         _ => false,
@@ -285,6 +288,7 @@ mod tests {
         let gate = FactoryPassword::new(path);
 
         assert!(gate.permits(&Method::POST, "/api/bmc/authenticate"));
+        assert!(gate.permits(&Method::POST, "/api/bmc/logout"));
         assert!(gate.permits(&Method::GET, "/api/bmc/access"));
         assert!(gate.permits(&Method::POST, "/api/bmc/access/password"));
 

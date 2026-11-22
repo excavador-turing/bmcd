@@ -131,6 +131,16 @@ impl SchemedAuthError {
             None => format!(r#"realm="{}""#, realm),
         }
     }
+
+    /// The challenge to send. A browser must not be offered `Basic`: it would
+    /// cache the password and attach it to a later `<img>` on its own.
+    pub fn challenge_for(&self, realm: &str, browser: bool) -> String {
+        if browser && !matches!(self.0, Some(Scheme::Bearer)) {
+            format!(r#"Bearer realm="{realm}""#)
+        } else {
+            self.challenge(realm)
+        }
+    }
 }
 
 impl Display for SchemedAuthError {

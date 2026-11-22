@@ -244,6 +244,7 @@ fn shadow_hash(username: &str) -> Option<String> {
 async fn set_password(
     request: HttpRequest,
     body: web::Json<PasswordChange>,
+    auth: web::Data<crate::authentication::linux_authenticator::LinuxAuthenticator>,
 ) -> Result<HttpResponse, LegacyResponse> {
     let body = body.into_inner();
 
@@ -314,11 +315,9 @@ async fn set_password(
 
     match result {
         Ok(Ok(output)) if output.status.success() => {
-            // The name and the actor, never the password. bmcd already
-            // watches /etc/shadow with inotify, so the cached hash updates
-            // itself and existing sessions keep working -- a token outlives
-            // the password it was minted from, which is why the interface
-            // tells the operator to sign other sessions out.
+            // The shadow watcher drops sessions when the hash changes. Drop
+            // them here as well, so a token cannot outlive this call.
+            auth.clear_sessions().await;
             tracing::info!(
                 "password changed for {} by {}",
                 body.username,
