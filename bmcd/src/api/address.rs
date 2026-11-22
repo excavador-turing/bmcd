@@ -200,7 +200,7 @@ mod tests {
     }
 
     fn service() -> web::Data<AddressService> {
-        let dir = tempdir::TempDir::new("address-confirm").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-confirm").expect("temp dir");
         web::Data::new(AddressService::load(dir.path().join("interfaces")))
     }
 
@@ -303,7 +303,7 @@ mod tests {
 
     #[actix_web::test]
     async fn a_change_on_a_board_without_br0_is_a_409_in_the_legacy_shape() {
-        let dir = tempdir::TempDir::new("address-409").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-409").expect("temp dir");
         let path = dir.path().join("interfaces");
         std::fs::write(&path, "auto br-wan\niface br-wan inet dhcp\n").unwrap();
         let exec = FakeExec::board(ADDR_SPLIT, ROUTE_SPLIT);
@@ -331,7 +331,7 @@ mod tests {
 
     #[actix_web::test]
     async fn a_hand_written_file_is_a_409_until_the_request_says_replace_hand_written() {
-        let dir = tempdir::TempDir::new("address-409-hand").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-409-hand").expect("temp dir");
         std::fs::create_dir_all(dir.path().join("net/br0")).unwrap();
         let path = dir.path().join("interfaces");
         std::fs::write(
@@ -370,7 +370,7 @@ mod tests {
     /// sentence -- the command and what it printed -- not a wrapped copy.
     #[actix_web::test]
     async fn a_failed_command_is_a_500_carrying_the_commands_own_message() {
-        let dir = tempdir::TempDir::new("address-500").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-500").expect("temp dir");
         std::fs::create_dir_all(dir.path().join("net/br0")).unwrap();
         let path = dir.path().join("interfaces");
         let exec = FakeExec::failing(ADDR_SPLIT, ROUTE_SPLIT, "/sbin/udhcpc");

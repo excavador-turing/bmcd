@@ -273,7 +273,7 @@ fn remove_stale_link(link: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use tempdir::TempDir;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
 
     fn open_slave(link: &Path) -> File {
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_points_at_the_slave_and_is_removed_on_drop() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = ConsolePty::create(&link).unwrap();
 
@@ -313,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_link_is_replaced_and_a_real_file_is_not() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode2");
         symlink("/dev/pts/does-not-exist", &link).unwrap();
         let pty = ConsolePty::create(&link).unwrap();
@@ -327,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_leaves_a_link_that_was_taken_over() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = ConsolePty::create(&link).unwrap();
         std::fs::remove_file(&link).unwrap();
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_output_reaches_the_slave_untouched() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = ConsolePty::create(&link).unwrap();
         let mut tool = open_slave(&link);
@@ -356,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_a_tool_types_goes_to_the_write_channel_without_echo() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = Arc::new(ConsolePty::create(&link).unwrap());
         let (tx, mut rx) = mpsc::channel::<Bytes>(8);
@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn nobody_reading_never_blocks_and_stays_bounded() {
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = ConsolePty::create(&link).unwrap();
 
@@ -401,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn a_baud_rate_set_on_the_slave_is_accepted_and_harmless() {
         use nix::sys::termios::{cfsetspeed, BaudRate};
-        let dir = TempDir::new("console_pty").unwrap();
+        let dir = TempDir::with_prefix("console_pty").unwrap();
         let link = dir.path().join("ttyNode1");
         let pty = ConsolePty::create(&link).unwrap();
         let tool = open_slave(&link);

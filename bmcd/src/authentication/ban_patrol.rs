@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::authentication_errors::AuthenticationError;
-use humantime::format_duration;
+use crate::utils::format_duration;
 use std::{collections::HashMap, ops::Add, time::Duration};
 use tokio::time::Instant;
 

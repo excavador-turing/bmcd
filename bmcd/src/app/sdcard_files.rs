@@ -244,8 +244,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn card() -> tempdir::TempDir {
-        let dir = tempdir::TempDir::new("sdcard").expect("temp dir");
+    fn card() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::with_prefix("sdcard").expect("temp dir");
         fs::create_dir_all(dir.path().join("images")).unwrap();
         fs::write(dir.path().join("talos.img"), vec![0u8; 20 * 1024 * 1024]).unwrap();
         fs::write(dir.path().join("truncated.img"), b"not really").unwrap();

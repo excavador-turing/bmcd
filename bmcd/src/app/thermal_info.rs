@@ -423,8 +423,8 @@ mod tests {
     /// node we added, reading 52539 millidegrees, and the fan the kernel now
     /// drives from it sitting on step 4 of 6 with a seven-entry table behind
     /// those steps.
-    fn fake_sysfs() -> (tempdir::TempDir, PathBuf) {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+    fn fake_sysfs() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path().to_path_buf();
 
         write_zone(&root, "thermal_zone0", "bmc-thermal", "52539");
@@ -535,7 +535,7 @@ mod tests {
     /// These are the 28 bytes the board's own property holds.
     #[tokio::test]
     async fn a_property_is_read_as_big_endian_cells() {
-        let dir = tempdir::TempDir::new("device_tree").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("device_tree").expect("tempdir");
         let path = dir.path().join("cooling-levels");
 
         fs::write(
@@ -565,7 +565,7 @@ mod tests {
     /// caller can tell from a table, rather than a fabricated one.
     #[tokio::test]
     async fn a_fan_with_no_table_in_the_device_tree_reports_no_levels() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path();
         write_cooler(root, "cooling_device0", "pwm-fan", "4", "6");
         write_platform_device(root, "pwm-fan", "system-fan");
@@ -584,7 +584,7 @@ mod tests {
     /// table, and neither is an error.
     #[tokio::test]
     async fn a_cooling_device_with_no_platform_driver_reports_no_levels() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path();
         write_cooler(root, "cooling_device0", "pwm-fan", "4", "6");
 
@@ -600,7 +600,7 @@ mod tests {
     /// it would be the exact failure this endpoint exists to avoid.
     #[tokio::test]
     async fn a_table_that_disagrees_with_max_state_is_not_reported() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path();
         write_cooler(root, "cooling_device0", "pwm-fan", "1", "2");
         let node = write_platform_device(root, "pwm-fan", "system-fan");
@@ -616,7 +616,7 @@ mod tests {
     /// reader would take for a measurement.
     #[tokio::test]
     async fn two_devices_on_one_driver_report_no_levels() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path();
         write_cooler(root, "cooling_device0", "pwm-fan", "4", "6");
         let first = write_platform_device(root, "pwm-fan", "system-fan");
@@ -632,7 +632,7 @@ mod tests {
     /// see that the board has nothing to measure rather than reading a zero.
     #[tokio::test]
     async fn a_board_with_no_thermal_zones_reports_empty_lists() {
-        let empty = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let empty = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
 
         assert_eq!(
             read_thermal(empty.path()).await,
@@ -647,7 +647,7 @@ mod tests {
     /// there to open. Still two empty lists, not an error.
     #[tokio::test]
     async fn a_missing_thermal_class_reports_empty_lists() {
-        let empty = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let empty = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let missing = empty.path().join("not-a-directory");
 
         let thermal = read_thermal(&missing).await;
@@ -661,7 +661,7 @@ mod tests {
     /// than taking the whole request down or inventing a temperature.
     #[tokio::test]
     async fn a_zone_that_will_not_give_a_reading_is_listed_without_one() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let zone = thermal_class(dir.path()).join("thermal_zone0");
         fs::create_dir_all(&zone).expect("create zone dir");
         fs::write(zone.join("type"), "bmc-thermal\n").expect("type");
@@ -680,7 +680,7 @@ mod tests {
     /// even though the node behind it has one.
     #[tokio::test]
     async fn a_cooler_without_states_is_listed_without_them() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         let root = dir.path();
         write_cooler(root, "cooling_device0", "pwm-fan", "-1", "6");
         let node = write_platform_device(root, "pwm-fan", "system-fan");
@@ -711,7 +711,7 @@ mod tests {
     /// entry is `thermal_zone0` on every read.
     #[tokio::test]
     async fn zones_and_coolers_come_back_in_index_order() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         for index in [10, 2, 0, 1] {
             write_zone(
                 dir.path(),
@@ -754,7 +754,7 @@ mod tests {
     /// cooling device reports exactly that.
     #[tokio::test]
     async fn only_indexed_zones_and_coolers_are_listed() {
-        let dir = tempdir::TempDir::new("sysfs").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("sysfs").expect("tempdir");
         write_zone(dir.path(), "thermal_zone0", "bmc-thermal", "52539");
         fs::create_dir_all(thermal_class(dir.path()).join("thermal_zone")).expect("create dir");
         fs::create_dir_all(thermal_class(dir.path()).join("cooling_devices")).expect("create dir");

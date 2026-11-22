@@ -451,7 +451,7 @@ mod tests {
     }
 
     fn service() -> web::Data<SwitchService> {
-        let dir = tempdir::TempDir::new("switch-confirm").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-confirm").expect("temp dir");
         web::Data::new(SwitchService::load(dir.path().join("switch.json")))
     }
 

@@ -480,8 +480,8 @@ mod tests {
     /// The uptime, the NAND counts and the memory total are the board's own;
     /// the free and available memory, the load and the RTC driver names are
     /// shaped like it rather than read off it.
-    fn fake_board() -> (tempdir::TempDir, PathBuf, PathBuf, PathBuf) {
-        let dir = tempdir::TempDir::new("health").expect("tempdir");
+    fn fake_board() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::TempDir::with_prefix("health").expect("tempdir");
         let proc = dir.path().join("proc");
         let ubi_class = dir.path().join("ubi");
         let rtc_class = dir.path().join("rtc");
@@ -651,7 +651,7 @@ mod tests {
     /// rather than answering with a zero that reads like a measurement.
     #[tokio::test]
     async fn a_board_that_can_tell_us_nothing_answers_with_nothing() {
-        let dir = tempdir::TempDir::new("health").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("health").expect("tempdir");
         let empty = dir.path().join("absent");
         let health = read_health(&empty, &empty, &empty, None).await;
 

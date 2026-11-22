@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn a_missing_relation_is_unknown_not_newer() {
@@ -1178,7 +1178,7 @@ mod tests {
     /// the user nothing twice.
     #[test]
     fn a_parked_image_is_ordered_against_the_running_version() {
-        let dir = TempDir::new("catalog").expect("tempdir");
+        let dir = TempDir::with_prefix("catalog").expect("tempdir");
         for name in [
             "tp2-bmc-firmware-ota-v2.8.1-rc1.tpu",
             "tp2-bmc-firmware-ota-v2.7.0.tpu",
@@ -1235,7 +1235,7 @@ mod tests {
     /// a board running newer code.
     #[test]
     fn nothing_is_ordered_against_an_unversioned_running_build() {
-        let dir = TempDir::new("catalog").expect("tempdir");
+        let dir = TempDir::with_prefix("catalog").expect("tempdir");
         std::fs::write(dir.path().join("tp2-bmc-firmware-ota-v2.3.0.tpu"), b"x").expect("write");
 
         let source = Source {
@@ -1342,7 +1342,7 @@ mod tests {
     /// only the shell would leave the `sleep` holding the pipes.
     #[test]
     fn a_hung_child_and_its_children_are_killed_at_the_deadline() {
-        let marker = TempDir::new("hung").expect("tempdir");
+        let marker = TempDir::with_prefix("hung").expect("tempdir");
         let pidfile = marker.path().join("pid");
         let mut command = Command::new("sh");
         command
@@ -1366,7 +1366,7 @@ mod tests {
     /// only works because the exited script has not been reaped yet.
     #[test]
     fn a_grandchild_holding_the_pipes_after_the_child_exits_is_bounded_and_killed() {
-        let marker = TempDir::new("holder").expect("tempdir");
+        let marker = TempDir::with_prefix("holder").expect("tempdir");
         let pidfile = marker.path().join("pid");
         let mut command = Command::new("sh");
         command.arg("-c").arg(format!(
@@ -1509,7 +1509,7 @@ mod tests {
     /// and held the catalogue at the two-minute retry for ever.
     #[test]
     fn no_card_is_an_empty_source_not_an_error() {
-        let card = TempDir::new("sdcard").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
         assert_eq!(
             crate::app::upgrade_worker::is_mount_point(card.path()).ok(),
             Some(false)
@@ -1535,7 +1535,7 @@ mod tests {
     /// fault the operator can fix, not an empty source.
     #[test]
     fn a_card_that_is_inserted_but_not_mounted_is_an_error() {
-        let card = TempDir::new("sdcard").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
         let source = card_source(card.path());
         let err =
             list_local_in(&source, "v2.8.0", card.path(), Card::Unmounted).expect_err("an error");
@@ -1548,7 +1548,7 @@ mod tests {
     /// `/proc/mounts`, `/mnt/sdcard/firmware` absent.
     #[test]
     fn a_card_without_the_folder_is_an_empty_source_not_an_error() {
-        let card = TempDir::new("sdcard").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
         std::fs::write(card.path().join("talos.img"), b"x").expect("write");
 
         let source = card_source(card.path());
@@ -1558,7 +1558,7 @@ mod tests {
 
     #[test]
     fn a_card_with_the_folder_lists_its_images() {
-        let card = TempDir::new("sdcard").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
         let folder = card.path().join("firmware");
         std::fs::create_dir_all(&folder).expect("mkdir");
         std::fs::write(folder.join("tp2-bmc-firmware-ota-v2.9.0.tpu"), b"x").expect("write");
@@ -1574,7 +1574,7 @@ mod tests {
     /// folder of images. Without these the fix would be "never report".
     #[test]
     fn a_card_that_is_there_but_unreadable_is_still_an_error() {
-        let card = TempDir::new("sdcard").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
         std::fs::write(card.path().join("firmware"), b"a file, not a folder").expect("write");
 
         let source = card_source(card.path());
@@ -1587,8 +1587,8 @@ mod tests {
     /// mistake in the configuration, not the state of a board.
     #[test]
     fn a_missing_folder_off_the_card_is_still_an_error() {
-        let card = TempDir::new("sdcard").expect("tempdir");
-        let elsewhere = TempDir::new("elsewhere").expect("tempdir");
+        let card = TempDir::with_prefix("sdcard").expect("tempdir");
+        let elsewhere = TempDir::with_prefix("elsewhere").expect("tempdir");
         let source = Source {
             id: "usb".into(),
             label: "Elsewhere".into(),

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use bytes::Bytes;
-use circular_buffer::CircularBuffer;
+use circular_buffer::FixedCircularBuffer;
 use futures::StreamExt;
 use futures::{Sink, SinkExt, Stream};
 use serde::Serialize;
@@ -35,7 +35,7 @@ use super::console_pty::ConsolePty;
 
 use crate::utils::{string_from_utf16, string_from_utf32};
 
-type RingBuffer = CircularBuffer<OUTPUT_BUF_SIZE, u8>;
+type RingBuffer = FixedCircularBuffer<u8, OUTPUT_BUF_SIZE>;
 
 const OUTPUT_BUF_SIZE: usize = 16 * 1024;
 
@@ -288,7 +288,7 @@ async fn run_worker<P: Port>(
                 };
 
                 trace!("writing {} bytes node {}", bytes.len(), node);
-                // Implementation is actually infallible in the currently used v0.1.3
+                // `u8` has no destructor that can fail this write.
                 if buffer.lock().await.write(&bytes).is_err() {
                     tracing::error!("Failed to write to buffer of node {}", node);
                     break;
@@ -363,7 +363,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
 
     /// A port with nothing behind it but a pipe: the test plays the node on
@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn rig(with_console: bool, baud: u32) -> Rig {
-        let dir = TempDir::new("serial_handler").unwrap();
+        let dir = TempDir::with_prefix("serial_handler").unwrap();
         let link = dir.path().join("ttyNode1");
         let (port_end, node) = tokio::io::duplex(64 * 1024);
         let bauds = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -581,7 +581,7 @@ mod test {
 
     use super::*;
     use rand::RngCore;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
     use tokio::io::BufWriter;
 
     fn random_array<const SIZE: usize>() -> Vec<u8> {
@@ -594,7 +594,7 @@ mod test {
     fn mount_point_detection() {
         assert!(is_mount_point(Path::new("/")).unwrap());
         // a directory inside a mount shares the device id of its parent.
-        let dir = TempDir::new("staging_test").unwrap();
+        let dir = TempDir::with_prefix("staging_test").unwrap();
         assert!(!is_mount_point(dir.path()).unwrap());
         // a directory that is not there cannot be written to either.
         assert_eq!(is_mount_point(&dir.path().join("absent")).ok(), Some(false));
@@ -632,7 +632,7 @@ mod test {
 
     #[test]
     fn staging_dir_is_removed_when_the_guard_drops() {
-        let parent = TempDir::new("staging_parent").unwrap();
+        let parent = TempDir::with_prefix("staging_parent").unwrap();
         let dir = parent.path().join("image");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("a.tpu"), b"x").unwrap();

@@ -1245,7 +1245,7 @@ mod tests {
     /// than reporting a zero.
     #[tokio::test]
     async fn thermal_zones_are_read_in_index_order() {
-        let dir = tempdir::TempDir::new("thermal").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("thermal").expect("tempdir");
         let root = dir.path();
 
         for (zone, kind, temp) in [
@@ -1285,7 +1285,7 @@ mod tests {
     /// that describes the sensor, and every v2.4 board.
     #[tokio::test]
     async fn a_board_with_no_thermal_zones_reads_as_empty() {
-        let dir = tempdir::TempDir::new("thermal").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("thermal").expect("tempdir");
         assert_eq!(read_sensors(&dir.path().join("absent")).await, Vec::new());
     }
 

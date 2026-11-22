@@ -476,12 +476,12 @@ fn unauthorized_response<B>(
 mod tests {
     use super::*;
     use crate::authentication::authentication_context::tests::build_test_context;
+    use crate::utils::format_duration;
     use actix_web::body::BoxBody;
     use actix_web::dev::fn_service;
     use actix_web::http::StatusCode;
     use actix_web::test::TestRequest;
     use base64::{engine::general_purpose, Engine as _};
-    use humantime::format_duration;
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -911,7 +911,7 @@ mod tests {
             "body: {body}"
         );
         assert!(
-            body.contains(&format_duration(Duration::from_secs(seconds)).to_string()),
+            body.contains(&format_duration(Duration::from_secs(seconds))),
             "body {body:?} does not agree with Retry-After: {seconds}"
         );
     }
@@ -1134,7 +1134,7 @@ mod tests {
     /// accepts -- so a 403 is the factory gate and not a rejected login.
     #[actix_web::test]
     async fn a_factory_board_refuses_everything_but_login_and_the_password_change() {
-        let dir = tempdir::TempDir::new("gate").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate").expect("temp dir");
         let shadow = factory_shadow(dir.path());
 
         let refused = rest_call()
@@ -1148,7 +1148,7 @@ mod tests {
 
     #[actix_web::test]
     async fn a_factory_board_still_lets_you_log_in_and_change_the_password() {
-        let dir = tempdir::TempDir::new("gate-open").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate-open").expect("temp dir");
         let shadow = factory_shadow(dir.path());
 
         // Logging in has to work, or there is no way to reach the change.
@@ -1177,7 +1177,7 @@ mod tests {
     /// authenticated; and nothing else that changes the board was opened.
     #[actix_web::test]
     async fn a_factory_board_still_answers_the_storage_report_and_the_repair() {
-        let dir = tempdir::TempDir::new("gate-storage").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate-storage").expect("temp dir");
         let shadow = factory_shadow(dir.path());
         let call_as = |request: TestRequest, credential: Option<String>| {
             let request = request.peer_addr(PEER.parse().expect("a peer address"));
@@ -1266,7 +1266,7 @@ mod tests {
     /// account name to somebody guessing.
     #[actix_web::test]
     async fn a_wrong_password_on_a_factory_board_is_still_unauthorized() {
-        let dir = tempdir::TempDir::new("gate-wrong").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate-wrong").expect("temp dir");
         let shadow = factory_shadow(dir.path());
         assert_eq!(
             call_on_factory_board(wrong_password(PEER), &shadow).await,
@@ -1283,7 +1283,7 @@ mod tests {
     /// and `S99postupdate` does not come through here at all.
     #[actix_web::test]
     async fn loopback_is_not_gated_by_the_factory_password() {
-        let dir = tempdir::TempDir::new("gate-loopback").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate-loopback").expect("temp dir");
         let shadow = factory_shadow(dir.path());
         let local = rest_call_from("127.0.0.1:41234").to_srv_request();
         assert_eq!(
@@ -1297,7 +1297,7 @@ mod tests {
     /// changed goes straight through.
     #[actix_web::test]
     async fn a_board_with_a_changed_password_is_not_gated() {
-        let dir = tempdir::TempDir::new("gate-changed").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("gate-changed").expect("temp dir");
         let path = dir.path().join("shadow");
         let hash = pwhash::sha512_crypt::hash("a much better password").expect("a shadow hash");
         std::fs::write(&path, format!("root:{hash}:19000:0:99999:7:::\n")).expect("write");

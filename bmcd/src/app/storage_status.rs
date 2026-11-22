@@ -1129,7 +1129,7 @@ overlay / overlay rw,relatime,lowerdir=/,upperdir=/mnt/overlay/upper,workdir=/mn
 
     #[test]
     fn the_service_resolves_the_root_through_sysfs_files() {
-        let dir = tempdir::TempDir::new("real-board").unwrap();
+        let dir = tempfile::TempDir::with_prefix("real-board").unwrap();
         std::fs::write(dir.path().join("mounts"), REAL_MOUNTS).unwrap();
         std::fs::write(dir.path().join("cmdline"), format!("{REAL_CMDLINE}\n")).unwrap();
         for (name, dev) in [("ubiblock0_1", "254:0"), ("mmcblk0", "179:0")] {
@@ -1152,7 +1152,7 @@ overlay / overlay rw,relatime,lowerdir=/,upperdir=/mnt/overlay/upper,workdir=/mn
 
     #[test]
     fn ubi_volume_names_come_from_sysfs() {
-        let dir = tempdir::TempDir::new("ubi-sysfs").unwrap();
+        let dir = tempfile::TempDir::with_prefix("ubi-sysfs").unwrap();
         for (volume, name) in [
             ("ubi0_0", "rootfs\n"),
             ("ubi0_1", "overlay\n"),
@@ -1402,14 +1402,14 @@ overlay / overlay rw,relatime,lowerdir=/,upperdir=/mnt/overlay/upper,workdir=/mn
 
     /// A board on disk: the files the service reads, and a recording `Exec`.
     pub struct Board {
-        pub _dir: tempdir::TempDir,
+        pub _dir: tempfile::TempDir,
         pub exec: Arc<FakeExec>,
         pub service: StorageService,
     }
 
     impl Board {
         pub fn new(root: &str, reason: Option<&str>, cmdline: &str, volumes: &[&str]) -> Board {
-            let dir = tempdir::TempDir::new("storage-board").unwrap();
+            let dir = tempfile::TempDir::with_prefix("storage-board").unwrap();
             std::fs::write(dir.path().join("mounts"), board_mounts(root, false)).unwrap();
             std::fs::write(dir.path().join("cmdline"), cmdline).unwrap();
             if let Some(reason) = reason {
@@ -1540,7 +1540,7 @@ overlay / overlay rw,relatime,lowerdir=/,upperdir=/mnt/overlay/upper,workdir=/mn
 
     #[test]
     fn a_service_with_no_files_does_not_panic() {
-        let dir = tempdir::TempDir::new("storage-none").unwrap();
+        let dir = tempfile::TempDir::with_prefix("storage-none").unwrap();
         let service = StorageService::with(
             FakeExec::board("", ""),
             StoragePaths::under(&dir.path().join("nothing")),

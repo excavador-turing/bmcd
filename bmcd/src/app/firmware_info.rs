@@ -521,7 +521,7 @@ async fn read_attribute<T: std::str::FromStr>(dir: &Path, attribute: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     /// The rollback volume is never mounted, so its version can only come
     /// from what the gate wrote down when it promoted. A board that has never
@@ -529,7 +529,7 @@ mod tests {
     /// render "not readable" rather than a guess.
     #[tokio::test]
     async fn the_rollback_version_is_read_or_honestly_absent() {
-        let dir = TempDir::new("rollback").expect("tempdir");
+        let dir = TempDir::with_prefix("rollback").expect("tempdir");
         let path = dir.path().join("rollback-version");
 
         assert_eq!(read_rollback_version(&path).await, None, "no file");
@@ -551,7 +551,7 @@ mod tests {
     /// exists.
     #[tokio::test]
     async fn the_gates_history_is_counted_from_its_own_log() {
-        let dir = TempDir::new("promotion").expect("tempdir");
+        let dir = TempDir::with_prefix("promotion").expect("tempdir");
         let log = dir.path().join("postupdate.log");
 
         let mut text = String::new();
@@ -578,7 +578,7 @@ mod tests {
     /// like a board whose every update was refused.
     #[tokio::test]
     async fn no_log_is_no_history_rather_than_zero() {
-        let dir = TempDir::new("promotion").expect("tempdir");
+        let dir = TempDir::with_prefix("promotion").expect("tempdir");
         assert!(read_promotion_history(&dir.path().join("absent.log"))
             .await
             .is_none());
@@ -589,7 +589,7 @@ mod tests {
     /// says so in its help text rather than pretending otherwise.
     #[tokio::test]
     async fn an_unfinished_attempt_counts_as_promoted_and_that_is_documented() {
-        let dir = TempDir::new("promotion").expect("tempdir");
+        let dir = TempDir::with_prefix("promotion").expect("tempdir");
         let log = dir.path().join("postupdate.log");
         tokio::fs::write(
             &log,
@@ -609,7 +609,7 @@ mod tests {
     /// render an absurd counter.
     #[tokio::test]
     async fn a_nonsensical_log_does_not_wrap_the_counter() {
-        let dir = TempDir::new("promotion").expect("tempdir");
+        let dir = TempDir::with_prefix("promotion").expect("tempdir");
         let log = dir.path().join("postupdate.log");
         tokio::fs::write(
             &log,
@@ -626,8 +626,8 @@ mod tests {
     /// A `/sys/class/ubi` and a `/sys/class/block` built from what the board
     /// reads today: `rootfs` at volume 1 with a ubiblock device on it, and
     /// `rootfs_prev` at volume 3 without one.
-    fn fake_ubi() -> (tempdir::TempDir, PathBuf, PathBuf) {
-        let dir = tempdir::TempDir::new("ubi").expect("tempdir");
+    fn fake_ubi() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::TempDir::with_prefix("ubi").expect("tempdir");
         let ubi_class = dir.path().join("ubi");
         let block_class = dir.path().join("block");
 
@@ -742,7 +742,7 @@ mod tests {
     /// roll back to. That is a fact about the board, not a missing reading.
     #[tokio::test]
     async fn a_board_with_one_slot_has_no_rollback() {
-        let dir = tempdir::TempDir::new("ubi").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("ubi").expect("tempdir");
         let ubi_class = dir.path().join("ubi");
         let block_class = dir.path().join("block");
         write_volume(&ubi_class, 1, "rootfs", 37019648);
@@ -771,7 +771,7 @@ mod tests {
     /// The older kernel naming, `ubiblock1` rather than `ubiblock0_1`.
     #[tokio::test]
     async fn the_short_ubiblock_name_is_accepted_too() {
-        let dir = tempdir::TempDir::new("ubi").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("ubi").expect("tempdir");
         let ubi_class = dir.path().join("ubi");
         let block_class = dir.path().join("block");
         write_volume(&ubi_class, 1, "rootfs", 37019648);
@@ -786,7 +786,7 @@ mod tests {
     /// be read as "UBI is there and has nothing in it".
     #[tokio::test]
     async fn a_board_without_ubi_reads_as_absent() {
-        let dir = tempdir::TempDir::new("ubi").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("ubi").expect("tempdir");
         let volumes = read_volumes(
             &dir.path().join("nothing"),
             &dir.path().join("block"),
@@ -803,7 +803,7 @@ mod tests {
     /// missing size does not take the slot down with it.
     #[tokio::test]
     async fn a_volume_without_a_size_is_still_a_slot() {
-        let dir = tempdir::TempDir::new("ubi").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("ubi").expect("tempdir");
         let ubi_class = dir.path().join("ubi");
         let volume = ubi_class.join(UBI_DEVICE).join("ubi0_1");
         fs::create_dir_all(&volume).expect("create volume dir");
@@ -849,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_last_line_of_the_log_wins() {
-        let dir = tempdir::TempDir::new("promotion").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("promotion").expect("tempdir");
         let log = dir.path().join("postupdate.log");
         fs::write(
             &log,
@@ -873,7 +873,7 @@ mod tests {
     /// half line the offset cuts through is not mistaken for one.
     #[tokio::test]
     async fn a_long_log_is_read_from_its_end() {
-        let dir = tempdir::TempDir::new("promotion").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("promotion").expect("tempdir");
         let log = dir.path().join("postupdate.log");
         let mut content = "Sun Sep  6 10:00:00 UTC 2026 postupdate: an old one\n".repeat(1024);
         content.push_str("Mon Sep  7 19:30:22 UTC 2026 postupdate: the last one\n");
@@ -887,7 +887,7 @@ mod tests {
     /// A board that has never been upgraded has no log.
     #[tokio::test]
     async fn no_log_is_no_promotion() {
-        let dir = tempdir::TempDir::new("promotion").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("promotion").expect("tempdir");
         assert_eq!(read_promotion(&dir.path().join("absent.log")).await, None);
     }
 }

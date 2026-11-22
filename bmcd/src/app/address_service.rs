@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_the_images_dhcp_default() {
-        let dir = tempdir::TempDir::new("address-missing").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-missing").expect("temp dir");
         let service = AddressService::load(dir.path().join("interfaces"));
         let inner = service.inner.try_lock().unwrap();
         assert_eq!(inner.running, AddressDocument::Dhcp);
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_file_this_daemon_wrote_is_recognised_as_its_own() {
-        let dir = tempdir::TempDir::new("address-ours").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-ours").expect("temp dir");
         let path = dir.path().join("interfaces");
         std::fs::write(&path, AddressDocument::Dhcp.render()).unwrap();
         let service = AddressService::load(&path);
@@ -668,7 +668,7 @@ mod tests {
     /// start, without waiting for the address to be changed again.
     #[tokio::test]
     async fn a_file_this_daemon_wrote_with_the_old_hook_is_rewritten_at_start() {
-        let dir = tempdir::TempDir::new("address-repair").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-repair").expect("temp dir");
         let path = dir.path().join("interfaces");
         let resolv = dir.path().join("resolv.conf");
         let doc = AddressDocument::Static(crate::app::address_document::StaticAddress {
@@ -709,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_hand_edited_file_is_never_rewritten_and_dhcp_touches_no_resolvers() {
-        let dir = tempdir::TempDir::new("address-repair-hand").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-repair-hand").expect("temp dir");
         let path = dir.path().join("interfaces");
         let resolv = dir.path().join("resolv.conf");
         let hand = "auto br0\niface br0 inet static\n  address 10.1.2.3/16\n  gateway 10.1.0.1\n  bridge-ports node1 node2 node3 node4 ge0 ge1\n";
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn a_file_it_cannot_read_is_said_to_be_unreadable_and_runs_as_dhcp() {
-        let dir = tempdir::TempDir::new("address-unreadable").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-unreadable").expect("temp dir");
         let path = dir.path().join("interfaces");
         std::fs::write(
             &path,
@@ -777,7 +777,7 @@ mod tests {
     }
 
     struct Rig {
-        dir: tempdir::TempDir,
+        dir: tempfile::TempDir,
         file: PathBuf,
         exec: Arc<FakeExec>,
         service: AddressService,
@@ -786,7 +786,7 @@ mod tests {
     /// A board in a temp dir: the file, `/sys/class/net` with or without
     /// `br0`, and an `ip` that prints `addr` and `route`.
     fn rig(file: Option<&str>, br0: bool, exec: Arc<FakeExec>) -> Rig {
-        let dir = tempdir::TempDir::new("address-board").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-board").expect("temp dir");
         let net = dir.path().join("net");
         std::fs::create_dir_all(&net).unwrap();
         if br0 {
@@ -1184,7 +1184,7 @@ mod tests {
     /// hand-written content walked past the opt-in.
     #[test]
     fn a_file_that_is_not_utf8_is_unreadable_and_somebodys() {
-        let dir = tempdir::TempDir::new("address-latin1").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-latin1").expect("temp dir");
         let path = dir.path().join("interfaces");
         std::fs::write(
             &path,
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn two_copies_in_one_second_do_not_overwrite_each_other() {
-        let dir = tempdir::TempDir::new("address-copies").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-copies").expect("temp dir");
         let path = dir.path().join("interfaces");
         let mut kept = Vec::new();
         for n in 0..3 {
@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_five_copies_are_kept_and_the_new_one_always_is() {
-        let dir = tempdir::TempDir::new("address-prune").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-prune").expect("temp dir");
         let path = dir.path().join("interfaces");
         std::fs::write(&path, "x\n").unwrap();
         let mut removed_total = Vec::new();
@@ -1291,7 +1291,7 @@ mod tests {
 
     #[test]
     fn a_copy_that_cannot_be_made_leaves_nothing_behind() {
-        let dir = tempdir::TempDir::new("address-nocopy").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("address-nocopy").expect("temp dir");
         let path = dir.path().join("interfaces");
         assert!(keep_a_copy_at(&path, 1).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

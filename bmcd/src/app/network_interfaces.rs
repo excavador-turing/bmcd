@@ -429,7 +429,7 @@ pub mod tests {
 
     #[test]
     fn the_missing_message_lists_what_is_there_default_route_first() {
-        let dir = tempdir::TempDir::new("net-class").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("net-class").expect("temp dir");
         // A bridge with no address still counts as something the board has.
         std::fs::create_dir_all(dir.path().join("br-mgmt/bridge")).unwrap();
         std::fs::create_dir_all(dir.path().join("ge0")).unwrap();
@@ -441,7 +441,7 @@ pub mod tests {
         assert!(!managed_present(dir.path()));
         std::fs::create_dir_all(dir.path().join("br0")).unwrap();
         assert!(managed_present(dir.path()));
-        let empty = tempdir::TempDir::new("net-class-empty").expect("temp dir");
+        let empty = tempfile::TempDir::with_prefix("net-class-empty").expect("temp dir");
         assert!(missing_message(empty.path(), &Snapshot::default(), "x")
             .contains("no bridge and no interface"));
     }

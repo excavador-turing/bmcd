@@ -173,3 +173,50 @@ pub async fn logging_sink_stdio(output: &Output) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// A duration for a person to read: `1h 30m 5s`, `250ms`, `0s`.
+///
+/// Days, hours, minutes, seconds and milliseconds, the units that matter for
+/// a ban, a token age or a transfer. Anything under a millisecond is dropped.
+/// This replaces `humantime::format_duration`, whose crate is unmaintained
+/// (RUSTSEC-2026-0542) and was used for nothing else.
+pub fn format_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let parts = [
+        (secs / 86_400, "d"),
+        (secs / 3_600 % 24, "h"),
+        (secs / 60 % 60, "m"),
+        (secs % 60, "s"),
+        (u64::from(duration.subsec_millis()), "ms"),
+    ];
+    let text = parts
+        .iter()
+        .filter(|(value, _)| *value != 0)
+        .map(|(value, unit)| format!("{value}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        "0s".to_string()
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod format_duration_tests {
+    use super::format_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn reads_like_humantime_did() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+        assert_eq!(format_duration(Duration::from_micros(10)), "0s");
+        assert_eq!(format_duration(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_duration(Duration::from_secs(600)), "10m");
+        assert_eq!(format_duration(Duration::from_secs(5_405)), "1h 30m 5s");
+        assert_eq!(
+            format_duration(Duration::from_millis(90_061_500)),
+            "1d 1h 1m 1s 500ms"
+        );
+    }
+}
