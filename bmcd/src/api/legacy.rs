@@ -1006,7 +1006,10 @@ async fn set_node1_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<
 }
 
 async fn get_node1_usb_mode(bmc: &BmcApplication) -> LegacyResponse {
-    LegacyResponse::ok(bmc.get_node1_usb_route().await.into())
+    match bmc.get_node1_usb_route().await {
+        Ok(route) => LegacyResponse::ok(route.into()),
+        Err(e) => e.into(),
+    }
 }
 
 /// switches the USB configuration.
@@ -1054,19 +1057,19 @@ async fn set_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
 }
 
 /// gets the USB configuration from the POV of the configured node.
-async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    let (config, bus_type) = bmc.get_usb_mode().await;
+async fn get_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
+    let (config, bus_type) = bmc.get_usb_mode().await?;
 
     // The same mapping the metrics exposition uses, so the two cannot drift.
     let (node, mode, route) = config.parts();
 
     // A one-element array, which is upstream's shape for this endpoint.
-    json!([crate::api::responses::UsbState {
+    Ok(json!([crate::api::responses::UsbState {
         mode,
         node: node.to_string(),
         route,
         bus_type: bus_type.to_string(),
-    }])
+    }]))
 }
 
 /// `opt=set&type=cooling&device=<name>&speed=<step>[&mode=auto|manual]`

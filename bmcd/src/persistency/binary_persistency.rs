@@ -53,7 +53,9 @@ impl<'a> PersistencyHeader {
             bincode::serialized_size(&header)
                 .map_err(|e| PersistencyError::serialization("header size", e))?,
         )
-        .expect("current binary format does not support the given offset");
+        .map_err(|_| {
+            PersistencyError::Limit("current binary format does not support the given offset")
+        })?;
         Ok(header)
     }
 
@@ -155,8 +157,8 @@ impl<'a> PersistencyStore {
             .map_err(|e| PersistencyError::SerializationError("data serialization".into(), e))?;
 
         let mut header = PersistencyHeader::new()?;
-        header.data_size =
-            u32::try_from(data.len()).expect("persistency size > 4.2GB not supported");
+        header.data_size = u32::try_from(data.len())
+            .map_err(|_| PersistencyError::Limit("persistency size > 4.2GB not supported"))?;
 
         let header_bytes = bincode::serialize(&header)
             .map_err(|e| PersistencyError::SerializationError("header serialization".into(), e))?;
@@ -168,13 +170,9 @@ impl<'a> PersistencyStore {
         Ok(())
     }
 
-    pub async fn get<T>(&self, key: &str) -> T
-    where
-        for<'b> T: serde::Deserialize<'b>,
-    {
-        self.try_get(key).await.unwrap()
-    }
-
+    /// A key's value. A value that cannot be decoded is an error the caller
+    /// passes on, so the API reports it; there is no panicking or defaulting
+    /// variant.
     pub async fn try_get<T>(&self, key: &'a str) -> Result<T, PersistencyError<'a>>
     where
         for<'b> T: serde::Deserialize<'b>,
@@ -190,13 +188,7 @@ impl<'a> PersistencyStore {
             })
     }
 
-    pub async fn set<T>(&self, key: &str, value: T)
-    where
-        T: serde::Serialize,
-    {
-        self.try_set(key, value).await.unwrap()
-    }
-
+    /// Store a key's value. An error is the caller's to pass on.
     pub async fn try_set<T>(&self, key: &'a str, value: T) -> Result<(), PersistencyError<'a>>
     where
         T: serde::Serialize,
@@ -329,11 +321,27 @@ mod tests {
         assert!(matches!(set_unknown, Err(PersistencyError::UnknownKey(k)) if k == "doesnotexist"));
 
         let watcher = store.get_watcher().await;
-        assert_eq!(store.get::<u128>("test").await, 123u128);
+        assert_eq!(store.try_get::<u128>("test").await.unwrap(), 123u128);
         assert!(!store.is_dirty());
-        store.set("test", 333u128).await;
+        store.try_set("test", 333u128).await.unwrap();
         assert!(watcher.has_changed().unwrap());
         assert!(store.is_dirty());
-        assert_eq!(store.get::<u128>("test").await, 333u128);
+        assert_eq!(store.try_get::<u128>("test").await.unwrap(), 333u128);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_value_is_an_error_not_a_default() {
+        let mut cursor = Cursor::new(Vec::new());
+        let store = PersistencyStore::new([("test", vec![0xff])], &mut cursor).unwrap();
+
+        assert!(matches!(
+            store.try_get::<u128>("test").await,
+            Err(PersistencyError::SerializationError(..))
+        ));
+        assert!(matches!(
+            store.try_set("missing", 1u128).await,
+            Err(PersistencyError::UnknownKey(_))
+        ));
+        assert!(!store.is_dirty());
     }
 }

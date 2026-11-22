@@ -26,6 +26,8 @@ pub enum PersistencyError<'a> {
     IoError(#[from] std::io::Error),
     #[error("{0} is not registered in persistency storage")]
     UnknownKey(String),
+    #[error("{0}")]
+    Limit(&'static str),
 }
 
 impl<'a> PersistencyError<'a> {
