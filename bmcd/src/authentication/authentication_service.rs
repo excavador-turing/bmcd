@@ -16,13 +16,17 @@ use super::{
     authentication_errors::{AuthenticationError, SchemedAuthError},
     factory_password::{FactoryPassword, REFUSAL},
     passwd_validator::UnixValidator,
+    request_policy,
     verified_proxy::VerifiedProxy,
     websocket_subprotocol::{bearer_token, is_websocket_handshake},
 };
 use actix_web::{
     body::{EitherBody, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse},
-    http::header::{self},
+    http::{
+        header::{self},
+        Method,
+    },
     Error, HttpMessage, HttpRequest, HttpResponse,
 };
 use futures::future::LocalBoxFuture;
@@ -133,22 +137,10 @@ where
     fn call(&self, mut request: ServiceRequest) -> Self::Future {
         let service = self.service.clone();
 
-        // drop authentication for requests on loopback interface
-        if request
-            .head()
-            .peer_addr
-            .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
-        {
-            // Recorded, not merely allowed. Every mutating call reads this
-            // back to say how it was authorised, and "it wasn't" is the
-            // answer worth being able to search for.
-            request.extensions_mut().insert(Actor::Loopback);
-            return Box::pin(async move {
-                service
-                    .call(request)
-                    .await
-                    .map(ServiceResponse::map_into_left_body)
-            });
+        // Decided before any credential is read, for every request under
+        // this middleware, so a route cannot opt out (see `request_policy`).
+        if let Some(refusal) = policy_refusal(&request, self.realm) {
+            return Box::pin(std::future::ready(Ok(refusal)));
         }
 
         // A proxy holding a certificate from our CA, naming the human it
@@ -201,6 +193,32 @@ where
                 .peer_addr()
                 .unwrap_or_default()
                 .to_string();
+            // The on-board local token, from the board itself only. Not
+            // gated by the factory password: whoever can read the token is
+            // already root on the board. The lock is taken just for the
+            // comparison.
+            let loopback = request
+                .head()
+                .peer_addr
+                .is_some_and(|addr| addr.ip().to_canonical().is_loopback());
+            let candidate = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(request_policy::bearer_token)
+                .map(str::to_owned);
+            let local = match candidate {
+                Some(token) if loopback => context.lock().await.is_local_token(&token),
+                _ => false,
+            };
+            if local {
+                request.extensions_mut().insert(Actor::Loopback);
+                return service
+                    .call(request)
+                    .await
+                    .map(ServiceResponse::map_into_left_body);
+            }
+
             // The login body is read before the mutex. It is the one
             // unauthenticated request that carries a body, and holding the
             // only authentication lock across that read stalls every other
@@ -458,13 +476,83 @@ fn authenticated_response<B>(
     ))
 }
 
+/// A browser call: see [`request_policy::is_browser_request`].
+fn is_browser_call(request: &HttpRequest) -> bool {
+    request_policy::is_browser_request(request.headers())
+}
+
+/// The refusals that do not depend on who is asking (contract C2, C3).
+///
+/// * A state change that `Sec-Fetch-Site` says came from another site or
+///   another origin of this one: 403. `same-origin`, `none` or no header pass.
+/// * A state change on `GET` (`?opt=set`, an upload cancel, a backup) without
+///   an `Authorization: Bearer` header: 405, use POST. Older clients that
+///   send a Bearer token keep working for this release.
+/// * Basic authentication on a browser request: 401 with a Bearer challenge,
+///   so the browser never caches a password it would attach to an `<img>`.
+fn policy_refusal<B>(
+    request: &ServiceRequest,
+    realm: &str,
+) -> Option<ServiceResponse<EitherBody<B>>> {
+    let http = request.request();
+    let headers = http.headers();
+    let method = http.method();
+    let path = http.uri().path();
+    let query = http.uri().query().unwrap_or("");
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let refuse = |response: HttpResponse| {
+        Some(ServiceResponse::new(http.clone(), response).map_into_right_body())
+    };
+
+    let state_change = request_policy::is_state_change(method, path, query);
+    if state_change && request_policy::is_cross_site(headers) {
+        tracing::warn!("refused a cross-site {method} {path}");
+        return refuse(
+            HttpResponse::Forbidden().body("a state change from another site is refused"),
+        );
+    }
+    if state_change
+        && matches!(*method, Method::GET | Method::HEAD)
+        && authorization
+            .and_then(request_policy::bearer_token)
+            .is_none()
+    {
+        return refuse(
+            HttpResponse::MethodNotAllowed()
+                .insert_header((header::ALLOW, "POST"))
+                .body(
+                    "this request changes state: send it as POST. GET is served only with \
+                     an Authorization: Bearer token, for older clients",
+                ),
+        );
+    }
+    if authorization.is_some_and(request_policy::is_basic)
+        && request_policy::is_browser_request(headers)
+    {
+        return refuse(
+            HttpResponse::Unauthorized()
+                .insert_header((
+                    header::WWW_AUTHENTICATE,
+                    format!(r#"Bearer realm="{realm}""#),
+                ))
+                .body("Basic authentication is not accepted from a browser; log in for a token"),
+        );
+    }
+    None
+}
+
 fn unauthorized_response<B>(
     request: &HttpRequest,
     error: SchemedAuthError,
     realm: &str,
 ) -> Result<ServiceResponse<EitherBody<B>>, Error> {
     let response = HttpResponse::Unauthorized()
-        .insert_header((header::WWW_AUTHENTICATE, error.challenge(realm)))
+        .insert_header((
+            header::WWW_AUTHENTICATE,
+            error.challenge_for(realm, is_browser_call(request)),
+        ))
         .body(error.to_string());
     Ok(ServiceResponse::map_into_right_body(ServiceResponse::new(
         request.clone(),
@@ -489,6 +577,8 @@ mod tests {
     /// `PASSWORD`. Both are built fresh for every call, so no test can leave a
     /// ban or an aged token behind for the next one.
     const TOKEN: &str = "9RmQ0OGpXwYbLJ1t";
+    /// The on-board local token the test context holds.
+    const LOCAL_TOKEN: &str = "LocalTokenForTheTestsOnly0123456789abcdefghijklmnopqrstuvwxyzAB";
     const PASSWORD: &str = "hunter2";
 
     /// The address these tests are refused from, and one they are not. The ban
@@ -525,13 +615,14 @@ mod tests {
         shadow: &str,
     ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
            + Clone {
-        let context = build_test_context(
+        let mut context = build_test_context(
             [(TOKEN.to_string(), Instant::now())],
             [(
                 "root".to_string(),
                 pwhash::sha512_crypt::hash(PASSWORD).expect("a shadow hash"),
             )],
         );
+        context.set_local_token(LOCAL_TOKEN.to_string());
 
         let route = Rc::new(fn_service(|request: ServiceRequest| async move {
             Ok::<_, Error>(request.into_response(HttpResponse::Ok().body("reached the route")))
@@ -777,11 +868,11 @@ mod tests {
         assert_eq!(nothing.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// The loopback exemption. The firmware's boot-time health gate probes
-    /// `https://127.0.0.1/` while a new image is on trial, so a 401 here would
-    /// not be an inconvenience -- it would roll the firmware back.
+    /// Loopback is an address, not a credential. The health probe is
+    /// `https://127.0.0.1/`, the static interface, and does not come through
+    /// this middleware.
     #[actix_web::test]
-    async fn a_request_from_loopback_needs_no_credentials() {
+    async fn a_request_from_loopback_needs_a_token() {
         for peer in ["127.0.0.1:41234", "[::1]:41234", "[::ffff:127.0.0.1]:41234"] {
             let response = call(
                 TestRequest::get()
@@ -790,8 +881,35 @@ mod tests {
                     .to_srv_request(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK, "from {peer}");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "from {peer}");
         }
+
+        let response = call(
+            TestRequest::get()
+                .uri("/api/bmc?opt=get&type=power")
+                .peer_addr("127.0.0.1:41234".parse().expect("a peer address"))
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A page sends `Sec-Fetch-*`. Offering it `Basic` is what makes the
+    /// browser cache the password and attach it to a later `<img>`.
+    #[actix_web::test]
+    async fn a_browser_call_is_not_offered_basic() {
+        let response = call(
+            rest_call()
+                .insert_header(("Sec-Fetch-Mode", "no-cors"))
+                .insert_header(("Sec-Fetch-Site", "cross-site"))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = challenge(&response);
+        assert!(challenge.starts_with("Bearer "));
+        assert!(!challenge.contains("Basic"));
     }
 
     /// The new path: a browser's handshake, with the token where the
@@ -984,27 +1102,31 @@ mod tests {
         assert_eq!(correct.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// The loopback exemption, under the one condition this change could have
-    /// broken it: with a ban already standing. The firmware's boot-time health
-    /// gate probes `https://127.0.0.1/` while a new image is on trial, and a
-    /// 429 there would roll the firmware back just as surely as a 401 would.
-    /// Nothing on the board shares an address with the peer being banned, but
-    /// nothing in the code said so until this test did.
+    /// A ban is per peer. Loopback still needs a credential, and a ban on
+    /// another address does not answer for it.
     #[actix_web::test]
-    async fn loopback_is_exempt_even_while_another_peer_is_banned() {
+    async fn loopback_with_a_password_is_not_banned_with_another_peer() {
         let service = service();
 
         for _ in 0..ATTEMPTS {
             let _ = service.call(wrong_password(PEER)).await;
         }
 
-        for peer in ["127.0.0.1:41234", "[::1]:41234", "[::ffff:127.0.0.1]:41234"] {
-            let response = service
-                .call(rest_call_from(peer).to_srv_request())
-                .await
-                .expect("the middleware always answers");
-            assert_eq!(response.status(), StatusCode::OK, "from {peer}");
-        }
+        let bare = service
+            .call(rest_call_from("127.0.0.1:41234").to_srv_request())
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = service
+            .call(
+                rest_call_from("127.0.0.1:41234")
+                    .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                    .to_srv_request(),
+            )
+            .await
+            .expect("the middleware always answers");
+        assert_eq!(authed.status(), StatusCode::OK);
     }
 
     /// A token this daemon no longer knows is not a guessed password. The
@@ -1245,7 +1367,6 @@ mod tests {
             TestRequest::post().uri("/api/bmc/firmware/install"),
             TestRequest::post().uri("/api/bmc/hostname"),
             TestRequest::post().uri("/api/bmc?opt=set&type=reboot"),
-            TestRequest::get().uri("/api/bmc?opt=set&type=reboot"),
         ];
         for request in closed {
             let request = request.peer_addr(PEER.parse().expect("a peer address"));
@@ -1259,6 +1380,25 @@ mod tests {
                 "{method} {uri} must stay closed on a factory board"
             );
         }
+        // The GET spelling with Basic is refused before the gate is asked;
+        // with a token the gate still closes it.
+        let get = "/api/bmc?opt=set&type=reboot";
+        assert_eq!(
+            call_on_factory_board(
+                call_as(TestRequest::get().uri(get), Some(basic("root", PASSWORD))),
+                &shadow
+            )
+            .await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            call_on_factory_board(
+                call_as(TestRequest::get().uri(get), Some(format!("Bearer {TOKEN}"))),
+                &shadow
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// A wrong password on a factory board is a wrong password, not a lecture
@@ -1274,23 +1414,184 @@ mod tests {
         );
     }
 
-    /// Loopback is exempt because refusing it would protect nothing: anyone
-    /// with a shell on the board is already root on it. What it buys is the
-    /// on-board `tpi` working on a board that has not been set up.
-    ///
-    /// It is NOT about the first-boot promotion check, whatever an earlier
-    /// version of this comment claimed -- `/metrics` is a separate listener
-    /// and `S99postupdate` does not come through here at all.
+    /// Loopback without a token is a 401 on a factory board too. Promotion
+    /// reads `/metrics` and `https://127.0.0.1/`, neither of which is this
+    /// middleware.
     #[actix_web::test]
-    async fn loopback_is_not_gated_by_the_factory_password() {
+    async fn loopback_on_a_factory_board_still_needs_a_token() {
         let dir = tempdir::TempDir::new("gate-loopback").expect("temp dir");
         let shadow = factory_shadow(dir.path());
         let local = rest_call_from("127.0.0.1:41234").to_srv_request();
         assert_eq!(
             call_on_factory_board(local, &shadow).await,
-            StatusCode::OK,
-            "a factory board must still promote its own firmware"
+            StatusCode::UNAUTHORIZED
         );
+        // The local token is the board's own root acting; it is not gated.
+        let with_token = rest_call_from("127.0.0.1:41234")
+            .insert_header((header::AUTHORIZATION, format!("Bearer {LOCAL_TOKEN}")))
+            .to_srv_request();
+        assert_eq!(
+            call_on_factory_board(with_token, &shadow).await,
+            StatusCode::OK
+        );
+    }
+
+    /// Contract C1: the local token from loopback is the board itself.
+    #[actix_web::test]
+    async fn loopback_with_the_local_token_is_the_board() {
+        for peer in ["127.0.0.1:41234", "[::1]:41234", "[::ffff:127.0.0.1]:41234"] {
+            for scheme in ["Bearer", "bearer"] {
+                let response = call(
+                    rest_call_from(peer)
+                        .insert_header((header::AUTHORIZATION, format!("{scheme} {LOCAL_TOKEN}")))
+                        .to_srv_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK, "{scheme} from {peer}");
+            }
+        }
+    }
+
+    /// And from anywhere else it is just an unknown token.
+    #[actix_web::test]
+    async fn the_local_token_from_the_network_is_refused() {
+        let response = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, format!("Bearer {LOCAL_TOKEN}")))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn set_request(method: actix_web::http::Method, uri: &str) -> TestRequest {
+        TestRequest::default()
+            .method(method)
+            .uri(uri)
+            .peer_addr(PEER.parse().expect("a peer address"))
+    }
+
+    /// Contract C2: the transfer route was the one GET that skipped the
+    /// refusal. Without a Bearer header it is a 405 now, for every credential
+    /// that is not one.
+    #[actix_web::test]
+    async fn firmware_on_get_without_bearer_is_refused() {
+        let uri = "/api/bmc?opt=set&type=firmware&file=tp2.tpu&length=1";
+        let none = call(set_request(actix_web::http::Method::GET, uri).to_srv_request()).await;
+        assert_eq!(none.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            none.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST")
+        );
+        let basic = call(
+            set_request(actix_web::http::Method::GET, uri)
+                .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(basic.status(), StatusCode::METHOD_NOT_ALLOWED);
+        for uri in ["/api/bmc/upload/3/cancel", "/api/bmc/backup"] {
+            let response =
+                call(set_request(actix_web::http::Method::GET, uri).to_srv_request()).await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+        }
+    }
+
+    /// The transition: an older client with a token still works on GET.
+    #[actix_web::test]
+    async fn get_opt_set_with_bearer_is_still_served() {
+        for uri in [
+            "/api/bmc?opt=set&type=power&node1=1",
+            "/api/bmc?opt=set&type=firmware&file=tp2.tpu&length=1",
+            "/api/bmc/upload/3/cancel",
+            "/api/bmc/backup",
+        ] {
+            let response = call(
+                set_request(actix_web::http::Method::GET, uri)
+                    .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_opt_set_is_served() {
+        for credential in [format!("Bearer {TOKEN}"), basic("root", PASSWORD)] {
+            let response = call(
+                set_request(
+                    actix_web::http::Method::POST,
+                    "/api/bmc?opt=set&type=power&node1=1",
+                )
+                .insert_header((header::AUTHORIZATION, credential.clone()))
+                .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{credential}");
+        }
+    }
+
+    /// Contract C3: a state change from another site is refused whatever the
+    /// credential; from the same origin it is served.
+    #[actix_web::test]
+    async fn a_cross_site_post_is_refused() {
+        for site in ["cross-site", "same-site"] {
+            let response = call(
+                set_request(
+                    actix_web::http::Method::POST,
+                    "/api/bmc?opt=set&type=power&node1=1",
+                )
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .insert_header(("Sec-Fetch-Site", site))
+                .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{site}");
+        }
+        let same = call(
+            set_request(
+                actix_web::http::Method::POST,
+                "/api/bmc?opt=set&type=power&node1=1",
+            )
+            .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+            .insert_header(("Sec-Fetch-Site", "same-origin"))
+            .to_srv_request(),
+        )
+        .await;
+        assert_eq!(same.status(), StatusCode::OK);
+        // A read from another site is not a state change.
+        let read = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .insert_header(("Sec-Fetch-Site", "cross-site"))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK);
+    }
+
+    /// Contract C3: Basic is refused on any browser request, even with the
+    /// right password, and the challenge is not Basic.
+    #[actix_web::test]
+    async fn basic_from_a_browser_is_refused() {
+        for (name, value) in [
+            ("Origin", "https://bmc.local"),
+            ("Referer", "https://bmc.local/"),
+            ("Sec-Fetch-Mode", "cors"),
+        ] {
+            let response = call(
+                rest_call()
+                    .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                    .insert_header((name, value))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+            assert!(challenge(&response).starts_with("Bearer "), "{name}");
+        }
     }
 
     /// And the control: the same request on a board whose password was

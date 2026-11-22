@@ -36,9 +36,8 @@ use actix_files::file_extension_to_mime;
 use actix_multipart::Multipart;
 use actix_web::guard::{fn_guard, GuardContext};
 use actix_web::http::{header, StatusCode};
-use actix_web::{get, post, web, HttpMessage, HttpRequest, HttpResponse, Responder};
+use actix_web::{post, route, web, HttpMessage, HttpRequest, HttpResponse, Responder};
 use anyhow::Context;
-use async_compression::tokio::bufread::GzipEncoder;
 use async_compression::Level;
 use board_info::{self, BoardInfoAttribute};
 use humansize::{format_size, DECIMAL};
@@ -51,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
@@ -76,8 +75,16 @@ pub fn config(cfg: &mut web::ServiceConfig) {
                     .guard(fn_guard(flash_status_guard))
                     .to(handle_flash_status),
             )
+            // The transfer is a state change like any other `opt=set`: POST,
+            // or GET with a Bearer token for older clients. The middleware
+            // decides which (`request_policy`); this route has no say.
             .route(
                 web::get()
+                    .guard(fn_guard(flash_guard))
+                    .to(handle_transfer_request),
+            )
+            .route(
+                web::post()
                     .guard(fn_guard(flash_guard))
                     .to(handle_transfer_request),
             )
@@ -86,11 +93,13 @@ pub fn config(cfg: &mut web::ServiceConfig) {
                     .guard(fn_guard(set_node_info_guard))
                     .to(set_node_aux_info),
             )
-            .route(web::get().to(api_entry)),
+            .route(web::get().to(api_entry))
+            .route(web::post().to(api_entry)),
     )
     .service(handle_file_upload)
     .service(cancel_file_upload)
-    .service(backup_handler);
+    .service(backup_handler)
+    .service(logout);
 }
 
 /// The value of one query parameter. A `GuardContext` hands out the raw query
@@ -130,34 +139,133 @@ fn set_node_info_guard(context: &GuardContext<'_>) -> bool {
     query_param(query, "opt") == Some("set") && query_param(query, "type") == Some("node_info")
 }
 
-#[get("/backup")]
-async fn backup_handler() -> impl Responder {
-    let archive = tokio::task::spawn_blocking(move || {
-        let mut builder = tar::Builder::new(Vec::new());
-        builder.mode(tar::HeaderMode::Deterministic);
-        builder
-            .append_dir_all(".", "/mnt/overlay/upper/")
-            .and_then(|_| builder.finish())
-            .and_then(|_| builder.into_inner())
-    })
-    .await
-    .expect("error joining archiving task");
+const OVERLAY_UPPER: &str = "/mnt/overlay/upper";
 
-    match archive {
-        Ok(buffer) => {
-            let now = chrono::Local::now();
-            let content_disposition = format!(
-                r#"attachment; filename="tp2-backup-{}.tar.gz""#,
-                now.format("%d-%m-%Y")
-            );
-            let encoder = GzipEncoder::with_quality(std::io::Cursor::new(buffer), Level::Best);
-            HttpResponse::Ok()
-                .insert_header(header::ContentType(file_extension_to_mime("gz")))
-                .insert_header((header::CONTENT_DISPOSITION, content_disposition))
-                .streaming(ReaderStream::new(encoder))
-        }
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+/// Paths a backup must not contain. Relative to the overlay upper directory.
+///
+/// The account hashes (`etc/shadow`, its `-` backup, `etc/gshadow*`) and
+/// anything under `etc/ssl` that is a `.pem` or has `key` in its name: the
+/// daemon's private key and any other.
+fn is_backup_secret(rel: &Path) -> bool {
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let joined = parts.join("/");
+    if joined == "etc/shadow" || joined == "etc/shadow-" || joined.starts_with("etc/gshadow") {
+        return true;
     }
+    if parts.len() > 2 && parts[0] == "etc" && parts[1] == "ssl" {
+        let name = parts
+            .last()
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        return name.ends_with(".pem") || name.contains("key");
+    }
+    false
+}
+
+/// Everything under `root` except [`is_backup_secret`], as the overlay holds
+/// it: symlinks stay symlinks (never followed, so a link cannot pull a file
+/// from outside the overlay into the archive), and the overlay's whiteouts
+/// (character devices 0:0, which record a deleted file) are kept so a
+/// restore deletes what was deleted.
+fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::Result<()> {
+    builder.follow_symlinks(false);
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries = std::fs::read_dir(&dir)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if is_backup_secret(rel) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                builder.append_dir(rel, &path)?;
+                dirs.push(path);
+            } else {
+                builder.append_path_with_name(&path, rel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the gzip'd archive of `root` to `out`. On an error the gzip stream
+/// is left unfinished and the error returned: the archive must not look
+/// complete when it is not.
+fn write_backup<W: tokio::io::AsyncWrite + Unpin>(out: W, root: &Path) -> io::Result<()> {
+    let encoder = async_compression::tokio::write::GzipEncoder::with_quality(out, Level::Fastest);
+    let mut builder = tar::Builder::new(tokio_util::io::SyncIoBridge::new(encoder));
+    builder.mode(tar::HeaderMode::Deterministic);
+    append_tree(&mut builder, root)?;
+    let mut encoder = builder.into_inner()?.into_inner();
+    futures::executor::block_on(encoder.shutdown())
+}
+
+/// The archive as a body stream. A failure part-way ends the stream with an
+/// error, so the server aborts the response and the client sees a failed
+/// download, not a short archive behind a 200.
+fn backup_stream(root: PathBuf) -> impl futures::Stream<Item = io::Result<bytes::Bytes>> + 'static {
+    let (read, write) = tokio::io::duplex(64 * 1024);
+    let (done, outcome) = tokio::sync::oneshot::channel::<io::Result<()>>();
+    tokio::task::spawn_blocking(move || {
+        let result = write_backup(write, &root);
+        if let Err(e) = &result {
+            tracing::error!("backup of {} failed: {e}", root.display());
+        }
+        let _ = done.send(result);
+    });
+    let tail = futures::stream::once(async move {
+        match outcome.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(Err(e)),
+            Err(_) => Some(Err(io::Error::other("the backup task stopped"))),
+        }
+    });
+    futures::StreamExt::chain(
+        ReaderStream::new(read),
+        futures::StreamExt::filter_map(tail, std::future::ready),
+    )
+}
+
+/// `POST /api/bmc/backup`: the overlay, streamed, without the account hashes
+/// or private keys. `GET` is still routed for older clients, and the
+/// middleware serves it only with a Bearer token.
+#[route("/backup", method = "GET", method = "POST")]
+async fn backup_handler() -> HttpResponse {
+    let now = chrono::Local::now();
+    let content_disposition = format!(
+        r#"attachment; filename="tp2-backup-{}.tar.gz""#,
+        now.format("%d-%m-%Y")
+    );
+    HttpResponse::Ok()
+        .insert_header(header::ContentType(file_extension_to_mime("gz")))
+        .insert_header((header::CONTENT_DISPOSITION, content_disposition))
+        .streaming(backup_stream(PathBuf::from(OVERLAY_UPPER)))
+}
+
+/// Revokes the bearer token on this request.
+#[post("/logout")]
+async fn logout(
+    request: HttpRequest,
+    auth: web::Data<crate::authentication::linux_authenticator::LinuxAuthenticator>,
+) -> HttpResponse {
+    let Some(token) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::authentication::request_policy::bearer_token)
+    else {
+        return HttpResponse::BadRequest().body("logout revokes a bearer token");
+    };
+    auth.revoke_bearer(token).await;
+    HttpResponse::NoContent().finish()
 }
 
 async fn api_entry(
@@ -1406,7 +1514,9 @@ pub fn try_map_sha256(value: Option<&String>) -> LegacyResult<Option<bytes::Byte
     Ok(sha)
 }
 
-#[get("/upload/{handle}/cancel")]
+/// `POST`, or `GET` with a Bearer token for older clients: the middleware
+/// decides.
+#[route("/upload/{handle}/cancel", method = "GET", method = "POST")]
 async fn cancel_file_upload(ss: web::Data<StreamingDataService>) -> impl Responder {
     ss.cancel_all().await;
     HttpResponse::Ok().finish()
@@ -1458,6 +1568,85 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+
+    fn archive_names(bytes: Vec<u8>) -> Vec<(String, tar::EntryType)> {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.path().unwrap().to_string_lossy().into_owned(),
+                    entry.header().entry_type(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_backup_omits_hashes_and_keys_and_keeps_links() {
+        let root = tempdir::TempDir::new("overlay").unwrap();
+        let etc = root.path().join("etc");
+        let certs = etc.join("ssl/certs");
+        let private = etc.join("ssl/private");
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        for secret in ["shadow", "shadow-", "gshadow", "gshadow-"] {
+            std::fs::write(etc.join(secret), "secret").unwrap();
+        }
+        std::fs::write(certs.join("bmcd_key.pem"), "key").unwrap();
+        std::fs::write(certs.join("bmcd_cert.pem"), "cert").unwrap();
+        std::fs::write(private.join("server.key"), "key").unwrap();
+        std::fs::write(etc.join("hostname"), "bmc").unwrap();
+        // A link to a secret outside the overlay is stored as a link, not
+        // followed into the archive.
+        std::os::unix::fs::symlink("/etc/passwd", etc.join("localtime")).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        append_tree(&mut builder, root.path()).unwrap();
+        let names = archive_names(builder.into_inner().unwrap());
+
+        assert!(names.iter().any(|(n, _)| n == "etc/hostname"));
+        assert!(names
+            .iter()
+            .any(|(n, t)| n == "etc/localtime" && *t == tar::EntryType::Symlink));
+        for (name, _) in &names {
+            assert!(!name.contains("shadow"), "{name}");
+            assert!(!name.ends_with(".pem"), "{name}");
+            assert!(!name.contains("key"), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backup_that_fails_ends_the_stream_with_an_error() {
+        let stream = backup_stream(PathBuf::from("/nonexistent/overlay/upper"));
+        let items: Vec<_> = stream.collect().await;
+        assert!(
+            matches!(items.last(), Some(Err(_))),
+            "a failed backup must not end like a complete one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_that_succeeds_is_a_complete_gzip() {
+        let root = tempdir::TempDir::new("overlay-ok").unwrap();
+        std::fs::write(root.path().join("hostname"), "bmc").unwrap();
+        let items: Vec<_> = backup_stream(root.path().to_path_buf()).collect().await;
+        let mut gz = Vec::new();
+        for item in items {
+            gz.extend_from_slice(&item.expect("no error in a good backup"));
+        }
+        let mut tar_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(
+            &mut async_compression::tokio::bufread::GzipDecoder::new(&gz[..]),
+            &mut tar_bytes,
+        )
+        .await
+        .expect("a finished gzip stream");
+        let names = archive_names(tar_bytes);
+        assert!(names.iter().any(|(n, _)| n == "hostname"));
+    }
 
     fn q(pairs: &[(&str, &str)]) -> Query {
         web::Query(

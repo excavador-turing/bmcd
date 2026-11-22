@@ -12,13 +12,25 @@
 use actix_files::{Files, NamedFile};
 use actix_service::fn_service;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
-use actix_web::http::header::{HeaderValue, CACHE_CONTROL};
+use actix_web::http::header::{
+    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_SECURITY_POLICY, X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
+};
 use actix_web::{web, Error, HttpRequest, HttpResponse};
 use std::path::{Path, PathBuf};
 
 const REVALIDATE: &str = "no-cache";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const ASSETS: &str = "/assets/";
+
+fn browser_guards(headers: &mut HeaderMap) {
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+}
 
 /// The policy for a path that was found on disk.
 fn cache_control(path: &str) -> &'static str {
@@ -34,13 +46,15 @@ fn cache_control(path: &str) -> &'static str {
 /// with HTML is what makes a stale `index.html` fail on a MIME type.
 async fn fallback(req: HttpRequest, www: PathBuf) -> Result<HttpResponse, Error> {
     if req.path().starts_with(ASSETS) {
-        return Ok(HttpResponse::NotFound().finish());
+        let mut response = HttpResponse::NotFound().finish();
+        browser_guards(response.headers_mut());
+        return Ok(response);
     }
     let index = NamedFile::open_async(www.join("index.html")).await?;
     let mut response = index.into_response(&req);
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
+    browser_guards(headers);
     Ok(response)
 }
 
@@ -65,6 +79,7 @@ pub fn config(www: &Path) -> impl FnOnce(&mut web::ServiceConfig) {
                                     HeaderValue::from_static(cache_control(&path)),
                                 );
                             }
+                            browser_guards(headers);
                         }
                         Ok(response)
                     }
@@ -111,8 +126,26 @@ mod tests {
         .await;
         let res = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
         let status = res.status();
-        let cc = res
-            .headers()
+        let headers = res.headers();
+        if !path.starts_with("/api/") {
+            assert_eq!(
+                headers
+                    .get(X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(
+                headers.get(X_FRAME_OPTIONS).and_then(|v| v.to_str().ok()),
+                Some("DENY")
+            );
+            assert_eq!(
+                headers
+                    .get(CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("frame-ancestors 'none'")
+            );
+        }
+        let cc = headers
             .get(CACHE_CONTROL)
             .map(|v| v.to_str().unwrap().to_owned());
         let body = String::from_utf8(test::read_body(res).await.to_vec()).unwrap();

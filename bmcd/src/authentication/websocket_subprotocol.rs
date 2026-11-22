@@ -116,8 +116,7 @@ pub fn selected_protocol(head: &RequestHead) -> Option<&str> {
 /// Names the selected subprotocol on a handshake response. Without this a
 /// browser closes the connection the moment it opens, whatever the status
 /// line said. Called unconditionally by the route, because a client may offer
-/// a subprotocol whether it authenticated with a header, with a subprotocol,
-/// or -- over the loopback interface -- not at all.
+/// a subprotocol whether it authenticated with a header or with a subprotocol.
 pub fn echo_selected_protocol<B>(head: &RequestHead, response: &mut HttpResponse<B>) {
     let Some(protocol) = selected_protocol(head) else {
         return;

@@ -42,6 +42,7 @@ use super::factory_password::SHADOW_FILE;
 
 type LinuxContext = AuthenticationContext<UnixValidator>;
 
+#[derive(Clone)]
 pub struct LinuxAuthenticator {
     context: Arc<Mutex<LinuxContext>>,
     /// The board's own shadow file, asked on every request whether `root` is
@@ -66,12 +67,28 @@ impl LinuxAuthenticator {
     ) -> io::Result<Self> {
         let password_entries = Self::parse_shadow_file().await?;
 
+        let mut context = LinuxContext::with_unix_validator(
+            password_entries,
+            authentication_token_duration,
+            authentication_attemps,
+        );
+        // A new local token on every start. If it cannot be written the
+        // on-board `tpi` falls back to logging in; nothing else depends on it.
+        let local_token = super::local_token::generate();
+        match super::local_token::write(
+            std::path::Path::new(super::local_token::LOCAL_TOKEN_DIR),
+            &local_token,
+        ) {
+            Ok(path) => tracing::info!("local token written to {}", path.display()),
+            Err(e) => tracing::warn!(
+                "could not write the local token to {}: {e}",
+                super::local_token::LOCAL_TOKEN_DIR
+            ),
+        }
+        context.set_local_token(local_token);
+
         let instance = Self {
-            context: Arc::new(Mutex::new(LinuxContext::with_unix_validator(
-                password_entries,
-                authentication_token_duration,
-                authentication_attemps,
-            ))),
+            context: Arc::new(Mutex::new(context)),
             factory: Arc::new(
                 crate::authentication::factory_password::FactoryPassword::new(SHADOW_FILE),
             ),
@@ -85,6 +102,14 @@ impl LinuxAuthenticator {
         }
 
         Ok(instance)
+    }
+
+    pub async fn revoke_bearer(&self, token: &str) {
+        self.context.lock().await.revoke_bearer(token);
+    }
+
+    pub async fn clear_sessions(&self) {
+        self.context.lock().await.clear_sessions();
     }
 }
 

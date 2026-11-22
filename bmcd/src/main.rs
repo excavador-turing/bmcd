@@ -249,6 +249,10 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(switch.clone())
                         .app_data(address.clone())
                         .app_data(storage.clone())
+                        // `Data::from` the Arc, not `Data::new`: the handlers extract
+                        // `Data<LinuxAuthenticator>`, and `Data::new(arc)` would register a
+                        // `Data<Arc<LinuxAuthenticator>>`, which actix answers with a bare 500.
+                        .app_data(actix_web::web::Data::from(authentication.clone()))
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)

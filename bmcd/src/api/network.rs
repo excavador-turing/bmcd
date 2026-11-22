@@ -244,9 +244,9 @@ fn actor_name(request: &HttpRequest) -> String {
 
 /// Did this request come from the board itself?
 ///
-/// `/api/bmc` drops authentication for the loopback interface, which is how
-/// the on-board `tpi` works without credentials. For everything else that is a
-/// convenience. For a confirmation it is a hole, and the one below closes it.
+/// A confirmation from the board itself (the on-board local token, from
+/// loopback) proves nothing about whether the address that was just applied
+/// is reachable from the network, so it is refused.
 fn from_the_board_itself(request: &HttpRequest) -> bool {
     use crate::authentication::authentication_context::Actor;
     matches!(request.extensions().get::<Actor>(), Some(Actor::Loopback))

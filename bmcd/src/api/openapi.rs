@@ -331,14 +331,15 @@ fn retarget(node: Value) -> Value {
     }
 }
 
-/// `GET /api/bmc?opt=set&type=flash`, which is not a route of its own: it is
-/// the legacy dispatcher's transfer branch, so it is described by hand.
+/// `POST /api/bmc?opt=set&type=flash`, which is not a route of its own: it is
+/// the legacy dispatcher's transfer branch, so it is described by hand. The
+/// `GET` spelling is still served with a Bearer token, for older clients.
 fn flash_path() -> Value {
     let param = |name: &str, description: &str| {
         json!({ "name": name, "in": "query", "required": false,
                 "description": description, "schema": { "type": "string" } })
     };
-    json!({ "get": {
+    let mut post = json!({
         "summary": "Write an image to a node (opt=set&type=flash)",
         "operationId": "legacyFlashNode",
         "description": "Starts writing an image to a compute module and answers `{\"handle\": N}`; \
@@ -378,7 +379,101 @@ fn flash_path() -> Value {
                 "content": { "application/problem+json": { "schema": component_ref("Problem") } }
             }
         }
-    } })
+    });
+    let mut get = post.clone();
+    get["operationId"] = json!("legacyFlashNodeGet");
+    get["deprecated"] = json!(true);
+    get["summary"] = json!("Write an image to a node over GET (older clients)");
+    get["description"] = json!(
+        "The same as the POST, still served for older clients, but only with an \
+         `Authorization: Bearer` header. Any other credential, or none, is 405 with \
+         `Allow: POST`. Every other `opt=set` type follows the same rule."
+    );
+    get["security"] = json!([{ "bearer": [] }]);
+    get["responses"]["405"] = json!({ "description": "Sent without a Bearer token: use POST." });
+    post["responses"]["403"] =
+        json!({ "description": "`Sec-Fetch-Site` is `cross-site` or `same-site`." });
+    json!({ "post": post, "get": get })
+}
+
+/// Backup, logout and the upload cancel: state changes outside the alias
+/// table, described by hand.
+fn session_paths() -> Vec<(String, Value)> {
+    let problem = json!({
+        "description": "A refusal, RFC 9457.",
+        "content": { "application/problem+json": { "schema": component_ref("Problem") } }
+    });
+    let gone = json!({ "description": "Sent without a Bearer token: use POST." });
+    let cross = json!({ "description": "`Sec-Fetch-Site` is `cross-site` or `same-site`." });
+    let backup_ok = json!({
+        "description": "A gzip'd tar of the overlay, streamed. Left out: `etc/shadow`, \
+            `etc/shadow-`, `etc/gshadow*`, and every `.pem` or `*key*` under `etc/ssl`. \
+            Symlinks are stored as links and overlay whiteouts are kept. A failure part-way \
+            aborts the response, so the download fails rather than ending short.",
+        "content": { "application/gzip": { "schema": { "type": "string", "format": "binary" } } }
+    });
+    let cancel_ok = json!({ "description": "Every transfer in progress is cancelled." });
+    let handle = json!([{ "name": "handle", "in": "path", "required": true,
+                          "schema": { "type": "integer" } }]);
+    vec![
+        (
+            "/api/bmc/backup".to_string(),
+            json!({
+                "post": {
+                    "summary": "Download a backup of the board's configuration",
+                    "operationId": "postBackup",
+                    "responses": { "200": backup_ok.clone(), "403": cross.clone(),
+                                   "default": problem.clone() }
+                },
+                "get": {
+                    "summary": "Backup over GET (older clients)",
+                    "operationId": "getBackup",
+                    "deprecated": true,
+                    "description": "Served only with an `Authorization: Bearer` header.",
+                    "security": [{ "bearer": [] }],
+                    "responses": { "200": backup_ok, "405": gone.clone(),
+                                   "default": problem.clone() }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/logout".to_string(),
+            json!({ "post": {
+                "summary": "Revoke the bearer token this request carries",
+                "operationId": "postLogout",
+                "description": "The `Bearer` scheme is matched case-insensitively. Other \
+                    sessions are not touched; a password change drops all of them.",
+                "security": [{ "bearer": [] }],
+                "responses": {
+                    "204": { "description": "The token is revoked." },
+                    "400": { "description": "The request carries no bearer token." },
+                    "403": cross.clone(),
+                    "default": problem.clone()
+                }
+            } }),
+        ),
+        (
+            "/api/bmc/upload/{handle}/cancel".to_string(),
+            json!({
+                "post": {
+                    "summary": "Cancel the transfer in progress",
+                    "operationId": "postUploadCancel",
+                    "parameters": handle.clone(),
+                    "responses": { "200": cancel_ok.clone(), "403": cross,
+                                   "default": problem.clone() }
+                },
+                "get": {
+                    "summary": "Cancel over GET (older clients)",
+                    "operationId": "getUploadCancel",
+                    "deprecated": true,
+                    "description": "Served only with an `Authorization: Bearer` header.",
+                    "parameters": handle,
+                    "security": [{ "bearer": [] }],
+                    "responses": { "200": cancel_ok, "405": gone, "default": problem }
+                }
+            }),
+        ),
+    ]
 }
 
 /// The document. Regenerated on every request; it is a few kilobytes and
@@ -1051,6 +1146,9 @@ pub fn document() -> Value {
         paths.insert(path, entry);
     }
     paths.insert("/api/bmc".to_string(), flash_path());
+    for (path, entry) in session_paths() {
+        paths.insert(path, entry);
+    }
 
     let mut schema_components = components();
     schema_components.insert(
@@ -1165,9 +1263,16 @@ pub fn document() -> Value {
                             ever hardened). Boards ship as `root` / \
                             `turing`, which is printed in the quick-start guide and is the same on every \
                             board, so until it is changed the only thing the board will do is let you change \
-                            it. The refusal is `application/problem+json` and says so. Requests from the \
-                            board's own loopback interface are exempt, because that is how the firmware \
-                            promotes itself on first boot.",
+                            it. The refusal is `application/problem+json` and says so. A request from the \
+                            board's own loopback interface needs a token like any other: the on-board \
+                            `tpi` reads the local token the daemon writes to `/run/bmcd/local-token` at \
+                            every start, accepted from loopback only. The firmware health probe is the \
+                            static page at `https://127.0.0.1/`, not this API. State changes are POST \
+                            (`?opt=set` included); their GET forms are served only with a Bearer token, \
+                            for older clients, and answer 405 otherwise. A state change whose \
+                            `Sec-Fetch-Site` is `cross-site` or `same-site` is 403, and Basic \
+                            authentication is refused on any request carrying `Sec-Fetch-*`, `Origin` \
+                            or `Referer`.",
             "contact": { "name": "excavador-turing", "url": "https://github.com/excavador-turing" },
             "license": { "name": "Apache-2.0" }
         },
@@ -1233,6 +1338,12 @@ mod tests {
     /// which is the whole point of the assertion below.
     const NOT_ALIASES: &[(&str, &str)] = &[
         ("/api/bmc", "get"),
+        ("/api/bmc", "post"),
+        ("/api/bmc/backup", "get"),
+        ("/api/bmc/backup", "post"),
+        ("/api/bmc/logout", "post"),
+        ("/api/bmc/upload/{handle}/cancel", "get"),
+        ("/api/bmc/upload/{handle}/cancel", "post"),
         ("/api/bmc/access", "get"),
         ("/api/bmc/access/password", "post"),
         ("/api/bmc/access/client-ca", "put"),

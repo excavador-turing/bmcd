@@ -41,6 +41,10 @@ where
     password_validator: PhantomData<P>,
     expire_timeout: Duration,
     ban_patrol: BanPatrol,
+    /// The on-board local token ([`super::local_token`]). Accepted from a
+    /// loopback peer only, never expires, and is not dropped by a password
+    /// change: the token store above is, this is not.
+    local_token: Option<String>,
 }
 
 impl<P> AuthenticationContext<P>
@@ -58,14 +62,45 @@ where
             password_validator: PhantomData::<UnixValidator>,
             expire_timeout,
             ban_patrol: BanPatrol::new(authentication_attempts),
+            local_token: None,
         }
+    }
+
+    /// Install the token written for the on-board `tpi`.
+    pub fn set_local_token(&mut self, token: String) {
+        self.local_token = Some(token);
+    }
+
+    /// Whether `candidate` is the local token. The caller has checked the
+    /// peer is loopback; this never looks at the address.
+    pub fn is_local_token(&self, candidate: &str) -> bool {
+        self.local_token
+            .as_deref()
+            .is_some_and(|token| super::local_token::matches(token, candidate))
     }
 
     pub fn reload_password_cache(
         &mut self,
         password_entries: impl Iterator<Item = (String, String)>,
     ) {
-        self.passwds = HashMap::from_iter(password_entries);
+        let next = HashMap::from_iter(password_entries);
+        // A changed hash is a password change, including one made with
+        // `passwd` on the board. Tokens minted from the old password stop.
+        if next != self.passwds {
+            self.token_store.clear();
+        }
+        self.passwds = next;
+    }
+
+    /// Drops one bearer token. Unknown tokens are already gone.
+    pub fn revoke_bearer(&mut self, token: &str) {
+        self.token_store.remove(token);
+    }
+
+    /// Drops every session. Used when this daemon itself changes the password,
+    /// before the shadow watcher has run.
+    pub fn clear_sessions(&mut self) {
+        self.token_store.clear();
     }
 
     /// This function piggy-backs removes of expired tokens on an authentication
@@ -150,7 +185,7 @@ where
         http_authorization_line: &str,
     ) -> Result<PendingAuthorization, SchemedAuthError> {
         match http_authorization_line.split_once(' ') {
-            Some(("Bearer", token)) => self
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => self
                 .authorize_bearer(peer, token)
                 .await
                 .map(|name| {
@@ -160,7 +195,7 @@ where
                     })
                 })
                 .map_err(AuthenticationError::into_bearer_error),
-            Some(("Basic", credentials)) => self
+            Some((scheme, credentials)) if scheme.eq_ignore_ascii_case("basic") => self
                 .basic_hash(peer, credentials)
                 .map_err(AuthenticationError::into_basic_error),
             Some((auth, _)) => {
@@ -330,29 +365,25 @@ pub enum PendingAuthorization {
 
 /// Who a request is, for the audit line.
 ///
-/// `Loopback` is named rather than folded into "authenticated", because it is
-/// the bypass: `/api/bmc` skips authentication entirely for requests from the
-/// board itself, which is how the on-board `tpi` works without credentials.
-/// An audit trail that cannot tell that apart from a real credential is not an
-/// audit trail — and this is the line somebody reading one would most want to
-/// find.
-///
-/// It used to say "and how the promotion gate reads its metrics token". It
-/// does not: `/metrics` moved to its own plain-HTTP listener that takes no
-/// credential, and `S99postupdate` has made one plain request ever since. The
-/// on-board `tpi` is the only thing left that relies on the bypass at all,
-/// which is worth knowing before anyone reasons about what removing it would
-/// cost.
+/// `Loopback` is named rather than folded into "authenticated": it is the
+/// board acting on itself (the on-board `tpi` with the local token from
+/// [`super::local_token`]), and a confirmation of a network change from there
+/// proves nothing about whether the new address is reachable. Loopback without
+/// that token gets a 401 like any other peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Actor {
+    /// The board itself: a loopback peer with the on-board local token.
     Loopback,
-    User { name: String, scheme: &'static str },
+    User {
+        name: String,
+        scheme: &'static str,
+    },
 }
 
 impl std::fmt::Display for Actor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Actor::Loopback => write!(f, "loopback (unauthenticated)"),
+            Actor::Loopback => write!(f, "loopback (local token)"),
             Actor::User { name, scheme } => write!(f, "{} ({})", name, scheme),
         }
     }
@@ -395,7 +426,47 @@ pub mod tests {
             password_validator: PhantomData::<UnixValidator>,
             expire_timeout: Duration::from_secs(20),
             ban_patrol: BanPatrol::new(10),
+            local_token: None,
         }
+    }
+
+    #[actix_web::test]
+    async fn a_changed_password_hash_drops_existing_tokens() {
+        let mut context = build_test_context(
+            [("123".to_string(), Instant::now())],
+            [("root".to_string(), "old-hash".to_string())],
+        );
+        context.reload_password_cache([("root".to_string(), "old-hash".to_string())].into_iter());
+        assert!(context
+            .authorize_request("peer", "Bearer 123")
+            .await
+            .is_ok());
+
+        context.reload_password_cache([("root".to_string(), "new-hash".to_string())].into_iter());
+        assert!(context
+            .authorize_request("peer", "Bearer 123")
+            .await
+            .is_err());
+    }
+
+    #[actix_web::test]
+    async fn logout_drops_only_that_token() {
+        let mut context = build_test_context(
+            [
+                ("keep".to_string(), Instant::now()),
+                ("drop".to_string(), Instant::now()),
+            ],
+            Vec::<(String, String)>::new(),
+        );
+        context.revoke_bearer("drop");
+        assert!(context
+            .authorize_request("peer", "Bearer keep")
+            .await
+            .is_ok());
+        assert!(context
+            .authorize_request("peer", "Bearer drop")
+            .await
+            .is_err());
     }
 
     #[actix_web::test]
