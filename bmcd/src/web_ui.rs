@@ -105,10 +105,10 @@ pub fn config(www: &Path) -> impl FnOnce(&mut web::ServiceConfig) {
 mod tests {
     use super::*;
     use actix_web::{http::StatusCode, test, App};
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     fn www() -> TempDir {
-        let dir = TempDir::new("www").unwrap();
+        let dir = TempDir::with_prefix("www").unwrap();
         std::fs::create_dir(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("index.html"), "<html>ui</html>").unwrap();
         std::fs::write(dir.path().join("favicon.ico"), "icon").unwrap();

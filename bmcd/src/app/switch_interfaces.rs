@@ -369,7 +369,7 @@ mod tests {
     /// The executor is found where the caller says, not where the build is.
     #[test]
     fn the_bond_executor_is_looked_for_in_the_given_paths() {
-        let dir = tempdir::TempDir::new("switch-bond-executor").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-bond-executor").expect("temp dir");
         let there = dir.path().join("bond");
         std::fs::write(&there, "#!/bin/sh\n").unwrap();
         let absent = dir.path().join("nowhere");

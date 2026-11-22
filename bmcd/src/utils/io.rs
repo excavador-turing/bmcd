@@ -280,7 +280,7 @@ mod test {
 
     #[test]
     fn write_durably_replaces_the_file_and_leaves_no_tmp() {
-        let dir = tempdir::TempDir::new("write-durably").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably").expect("temp dir");
         let path = dir.path().join("switch.json");
         std::fs::write(&path, b"old").unwrap();
         write_durably(&path, b"new confirmed").unwrap();
@@ -307,7 +307,7 @@ mod test {
     #[test]
     fn write_durably_with_mode_makes_a_private_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir::TempDir::new("write-durably-mode").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably-mode").expect("temp dir");
         let key = dir.path().join("server.key");
         write_durably_with_mode(&key, b"key", Some(0o600)).unwrap();
         assert_eq!(mode_of(&key), 0o600);
@@ -325,7 +325,7 @@ mod test {
     /// the same file removes it, so nothing piles up.
     #[test]
     fn write_durably_removes_a_temp_left_by_an_interrupted_write() {
-        let dir = tempdir::TempDir::new("write-durably-stale").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably-stale").expect("temp dir");
         let path = dir.path().join("switch.json");
         std::fs::write(dir.path().join("switch.json.tmp"), b"half a wri").unwrap();
         write_durably(&path, b"whole").unwrap();
@@ -337,7 +337,7 @@ mod test {
     /// untouched. A directory there fails even for root.
     #[test]
     fn write_durably_fails_cleanly_when_the_temp_name_is_taken() {
-        let dir = tempdir::TempDir::new("write-durably-blocked").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably-blocked").expect("temp dir");
         let path = dir.path().join("switch.json");
         std::fs::write(&path, b"old").unwrap();
         std::fs::create_dir(dir.path().join("switch.json.tmp")).unwrap();
@@ -348,7 +348,7 @@ mod test {
     /// A rename that fails takes its temp file with it.
     #[test]
     fn write_durably_leaves_no_tmp_when_the_rename_fails() {
-        let dir = tempdir::TempDir::new("write-durably-rename").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably-rename").expect("temp dir");
         let path = dir.path().join("switch.json");
         // A directory cannot be replaced by a file.
         std::fs::create_dir(&path).unwrap();
@@ -358,7 +358,7 @@ mod test {
 
     #[test]
     fn write_durably_creates_missing_parents() {
-        let dir = tempdir::TempDir::new("write-durably-parents").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("write-durably-parents").expect("temp dir");
         let path = dir.path().join("etc").join("bmcd").join("switch.json");
         write_durably(&path, b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");

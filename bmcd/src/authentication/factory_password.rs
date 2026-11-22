@@ -233,14 +233,14 @@ mod tests {
 
     #[test]
     fn a_board_on_the_factory_password_is_recognised() {
-        let dir = tempdir::TempDir::new("factory").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("factory").expect("temp dir");
         let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
         assert!(FactoryPassword::new(path).still_set());
     }
 
     #[test]
     fn a_board_whose_password_was_changed_is_not() {
-        let dir = tempdir::TempDir::new("changed").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("changed").expect("temp dir");
         let path = shadow(dir.path(), &hash_of("a much better password"));
         assert!(!FactoryPassword::new(path).still_set());
     }
@@ -250,7 +250,7 @@ mod tests {
     /// an operator with an editor -- must be noticed at once.
     #[test]
     fn a_change_is_noticed_without_a_restart() {
-        let dir = tempdir::TempDir::new("noticed").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("noticed").expect("temp dir");
         let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
         let gate = FactoryPassword::new(&path);
         assert!(gate.still_set());
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn a_locked_account_is_not_a_factory_account() {
         for field in ["*", "!", "!!", ""] {
-            let dir = tempdir::TempDir::new("locked").expect("temp dir");
+            let dir = tempfile::TempDir::with_prefix("locked").expect("temp dir");
             let path = shadow(dir.path(), field);
             assert!(
                 !FactoryPassword::new(path).still_set(),
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn only_login_the_access_card_and_the_password_change_are_permitted() {
-        let dir = tempdir::TempDir::new("permits").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("permits").expect("temp dir");
         let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
         let gate = FactoryPassword::new(path);
 
@@ -313,7 +313,7 @@ mod tests {
     /// always on the factory password, and the repair is the way out.
     #[test]
     fn exactly_the_storage_report_and_the_storage_repair_are_opened() {
-        let dir = tempdir::TempDir::new("storage-gate").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("storage-gate").expect("temp dir");
         let path = shadow(dir.path(), &hash_of(FACTORY_PASSWORD));
         let gate = FactoryPassword::new(path);
 
@@ -366,7 +366,7 @@ mod tests {
     /// that were never on the list.
     #[test]
     fn a_changed_password_permits_everything() {
-        let dir = tempdir::TempDir::new("open").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("open").expect("temp dir");
         let path = shadow(dir.path(), &hash_of("a much better password"));
         let gate = FactoryPassword::new(path);
         assert!(gate.permits(&Method::GET, "/api/bmc"));

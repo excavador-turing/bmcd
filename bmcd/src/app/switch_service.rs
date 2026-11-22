@@ -1011,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_board_with_no_persisted_document_reports_flat_and_applies_nothing() {
-        let dir = tempdir::TempDir::new("switch-none").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-none").expect("temp dir");
         let service = SwitchService::load(dir.path().join("switch.json"));
         let view = service.view().await;
         assert_eq!(view.confirmed, None);
@@ -1025,7 +1025,7 @@ mod tests {
     /// round trip exactly.
     #[tokio::test]
     async fn a_persisted_document_is_read_back_as_confirmed() {
-        let dir = tempdir::TempDir::new("switch-persist").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-persist").expect("temp dir");
         let path = dir.path().join("switch.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&trunk()).unwrap()).unwrap();
 
@@ -1043,7 +1043,7 @@ mod tests {
     /// because its switch sidecar is truncated is worse than a board on Flat.
     #[tokio::test]
     async fn a_corrupt_file_reads_as_nothing_confirmed() {
-        let dir = tempdir::TempDir::new("switch-corrupt").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-corrupt").expect("temp dir");
         let path = dir.path().join("switch.json");
         std::fs::write(&path, b"{ this is not json").unwrap();
         let service = SwitchService::load(&path);
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_view_reports_the_default_window() {
-        let dir = tempdir::TempDir::new("switch-window").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-window").expect("temp dir");
         let service = SwitchService::load(dir.path().join("switch.json"));
         assert_eq!(
             service.view().await.default_window_s,
@@ -1065,7 +1065,7 @@ mod tests {
     /// during the very delay the window exists to survive.
     #[test]
     fn a_port_is_forwarding_only_in_the_forwarding_state() {
-        let dir = tempdir::TempDir::new("switch-brport").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-brport").expect("temp dir");
         let net = dir.path();
         for (state, expected) in [
             ("0", false),
@@ -1089,7 +1089,7 @@ mod tests {
     /// only thing there is to read.
     #[test]
     fn a_port_outside_a_bridge_falls_back_to_carrier() {
-        let dir = tempdir::TempDir::new("switch-carrier").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-carrier").expect("temp dir");
         let net = dir.path();
         for (carrier, expected) in [("1", true), ("0", false)] {
             let name = format!("ge{carrier}");
@@ -1101,13 +1101,13 @@ mod tests {
 
     #[test]
     fn a_port_that_does_not_exist_is_not_forwarding() {
-        let dir = tempdir::TempDir::new("switch-absent").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-absent").expect("temp dir");
         assert!(!is_forwarding(dir.path(), "ge0"));
     }
 
     #[test]
     fn safe_mode_is_read_from_the_kernel_command_line() {
-        let dir = tempdir::TempDir::new("switch-cmdline").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-cmdline").expect("temp dir");
 
         let plain = dir.path().join("plain");
         std::fs::write(&plain, "loglevel=8 root=254:0 postupdate\n").unwrap();
@@ -1122,7 +1122,7 @@ mod tests {
     /// safe mode, and a substring test would say it was.
     #[test]
     fn safe_mode_matches_a_whole_word() {
-        let dir = tempdir::TempDir::new("switch-cmdline-word").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-cmdline-word").expect("temp dir");
         let path = dir.path().join("cmdline");
         std::fs::write(&path, "root=/dev/safemodest nosafemode\n").unwrap();
         assert!(!is_safemode(&path));
@@ -1139,7 +1139,7 @@ mod tests {
     /// A board with no `br0` is told so, once, and nothing is run.
     #[tokio::test]
     async fn without_br0_an_apply_is_refused_before_anything_is_run() {
-        let dir = tempdir::TempDir::new("switch-nobridge").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-nobridge").expect("temp dir");
         let net = dir.path().join("net");
         std::fs::create_dir_all(net.join("br-wan/bridge")).unwrap();
         let service = SwitchService::load(dir.path().join("switch.json")).with_net_class(&net);
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_dual_writes_interfaces_with_switch_header() {
-        let dir = tempdir::TempDir::new("switch-confirm-ifaces").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-confirm-ifaces").expect("temp dir");
         let interfaces = dir.path().join("interfaces");
         // Persist path shared by confirm: header + bond stanza round-trip.
         let document = lag_flat();
@@ -1289,7 +1289,7 @@ mod tests {
 
     /// A service on a fake board: the kernel's view, the files, the commands.
     struct Rig {
-        dir: tempdir::TempDir,
+        dir: tempfile::TempDir,
         service: SwitchService,
         exec: Arc<FakeExec>,
         interfaces: PathBuf,
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     fn rig(name: &str, filtering: bool, bond: bool, interfaces: Option<&str>) -> Rig {
-        let dir = tempdir::TempDir::new(name).expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix(name).expect("temp dir");
         let exec = FakeExec::new();
         let interfaces_path = dir.path().join("interfaces");
         if let Some(text) = interfaces {
@@ -1321,7 +1321,7 @@ mod tests {
     /// A rig whose confirmed document is `document`, with its `interfaces`
     /// rendered for it, so that boot heal sees a file that matches.
     fn booted(name: &str, document: &SwitchDocument, filtering: bool, bond: bool) -> Rig {
-        let dir = tempdir::TempDir::new(name).expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix(name).expect("temp dir");
         let exec = FakeExec::new();
         let interfaces_path = dir.path().join("interfaces");
         let executors = executor(dir.path());
@@ -1622,7 +1622,7 @@ mod tests {
     /// `switch.json`, and does not leave the copy of the hand file behind.
     #[tokio::test]
     async fn a_failed_interfaces_write_leaves_the_change_pending() {
-        let dir = tempdir::TempDir::new("switch-confirm-fail").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-confirm-fail").expect("temp dir");
         let switch_path = dir.path().join("switch.json");
         let interfaces = dir.path().join("interfaces");
         std::fs::write(&interfaces, HAND_FILE).unwrap();

@@ -34,3 +34,12 @@ expression = "MIT AND ISC AND OpenSSL"
 license-files = [
     { path = "LICENSE", hash = 0xbd0eed23 }
 ]
+
+# Advisories that do not apply to this daemon, or that wait on a planned
+# change. Each one says why; anything not listed here fails the check.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0443", reason = "actix-files: Windows 8.3 short names only; the board is Linux. The fix is in actix-files 0.7.4, a major bump for a later change." },
+    { id = "RUSTSEC-2025-0141", reason = "#93 step 4: reader for existing bmcd.bin first" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; used to format and parse UTC timestamps. Replacing it is its own change." },
+]

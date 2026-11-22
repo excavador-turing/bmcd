@@ -440,8 +440,8 @@ mod tests {
 
     /// A stand-in for the gpio-latch platform device: `shadow` and
     /// `shadow_valid` as the kernel prints them, or absent.
-    fn latch_dir(shadow: Option<&str>, valid: Option<&str>) -> tempdir::TempDir {
-        let dir = tempdir::TempDir::new("latch-sysfs").expect("temp dir");
+    fn latch_dir(shadow: Option<&str>, valid: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::with_prefix("latch-sysfs").expect("temp dir");
         if let Some(shadow) = shadow {
             std::fs::write(dir.path().join(LATCH_SHADOW_ATTR), shadow).unwrap();
         }

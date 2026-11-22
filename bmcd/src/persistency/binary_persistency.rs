@@ -29,6 +29,11 @@ use super::error::PersistencyError;
 use crate::persistency::default_hash;
 
 const BINARY_VERSION: u32 = 1;
+// This file is still bincode 1. A later reader has to load a `bmcd.bin`
+// written in this layout (magic `TMAPPDB`, version 1, then the map) before
+// any writer changes the bytes. The crate bump and the format change are
+// not the same commit, and this commit does not bump the crate: nothing
+// here can check an old file against a new encoding.
 const BINARY_MAGIC: &[u8; 7] = b"TMAPPDB";
 const LEB_SIZE: u32 = 252 * 1024;
 

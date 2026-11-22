@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use humantime::format_duration;
+use crate::utils::format_duration;
 use std::{fmt::Display, str::Utf8Error, time::Duration};
 use thiserror::Error;
 use tokio::time::Instant;
@@ -211,7 +211,7 @@ mod tests {
 
         assert!(message.starts_with("Exceeded allowed authentication attempts."));
         assert!(
-            message.contains(&format_duration(Duration::from_secs(seconds)).to_string()),
+            message.contains(&format_duration(Duration::from_secs(seconds))),
             "{message:?} does not quote {seconds}s"
         );
     }

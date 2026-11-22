@@ -789,7 +789,7 @@ mod tests {
     /// against the real acceptor and read back what was negotiated.
     #[test]
     fn the_acceptor_negotiates_http11_and_never_h2() {
-        let dir = tempdir::TempDir::new("bmcd-alpn").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("bmcd-alpn").expect("temp dir");
         let key_path = dir.path().join("key.pem");
         let cert_path = dir.path().join("cert.pem");
         write_self_signed_pair(&key_path, &cert_path);
@@ -937,13 +937,13 @@ mod tests {
 
     /// A temp dir plus the `config::Tls` pointing into it. The dir is returned
     /// because dropping it deletes the files the acceptor needs.
-    fn throwaway_tls_config(name: &str) -> (tempdir::TempDir, config::Tls) {
+    fn throwaway_tls_config(name: &str) -> (tempfile::TempDir, config::Tls) {
         throwaway_tls_config_of(KeyKind::P384, name)
     }
 
     /// The same, on a chosen key type.
-    fn throwaway_tls_config_of(kind: KeyKind, name: &str) -> (tempdir::TempDir, config::Tls) {
-        let dir = tempdir::TempDir::new(name).expect("temp dir");
+    fn throwaway_tls_config_of(kind: KeyKind, name: &str) -> (tempfile::TempDir, config::Tls) {
+        let dir = tempfile::TempDir::with_prefix(name).expect("temp dir");
         let key_path = dir.path().join("key.pem");
         let cert_path = dir.path().join("cert.pem");
         write_self_signed_pair_of(kind, &key_path, &cert_path);

@@ -153,8 +153,8 @@ mod tests {
 
     /// Builds a `/sys/class/net` lookalike. Every value here was copied off a
     /// running board.
-    fn fake_net_class() -> (tempdir::TempDir, PathBuf) {
-        let dir = tempdir::TempDir::new("net_class").expect("tempdir");
+    fn fake_net_class() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::with_prefix("net_class").expect("tempdir");
         let root = dir.path().to_path_buf();
 
         for node in ["node1", "node2", "node3", "node4", "ge0"] {
@@ -243,7 +243,7 @@ mod tests {
     /// reachable, and every compute module is cut off.
     #[tokio::test]
     async fn a_switch_that_did_not_probe_is_reported_as_absent() {
-        let empty = tempdir::TempDir::new("net_class").expect("tempdir");
+        let empty = tempfile::TempDir::with_prefix("net_class").expect("tempdir");
         let ports = read_switch_ports(empty.path()).await;
 
         assert_eq!(ports.len(), 6, "every port is still listed");
@@ -257,7 +257,7 @@ mod tests {
     /// whole port down with it.
     #[tokio::test]
     async fn missing_attributes_do_not_fail_the_port() {
-        let dir = tempdir::TempDir::new("net_class").expect("tempdir");
+        let dir = tempfile::TempDir::with_prefix("net_class").expect("tempdir");
         fs::create_dir_all(dir.path().join("node1")).expect("create port dir");
 
         let node1 = read_switch_ports(dir.path())

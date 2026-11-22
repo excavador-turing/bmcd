@@ -133,7 +133,7 @@ impl StreamingDataService {
                     let duration = Instant::now().saturating_duration_since(start_time);
                     tracing::info!(
                         "worker done. took {} (#{})",
-                        humantime::format_duration(duration),
+                        crate::utils::format_duration(duration),
                         id
                     );
 

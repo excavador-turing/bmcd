@@ -264,12 +264,12 @@ impl Drop for ApplicationPersistency {
 mod tests {
 
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
     use tokio::time::sleep;
 
     #[tokio::test]
     async fn file_write_on_drop() {
-        let tmp_dir = TempDir::new("persistency_test1").unwrap();
+        let tmp_dir = TempDir::with_prefix("persistency_test1").unwrap();
         let bin_file = tmp_dir.path().join("bmcd.bin");
         let keys_with_default = [("test", bincode::serialize(&123u128).unwrap())];
 
@@ -296,7 +296,7 @@ mod tests {
     async fn persistency_monitor_test() {
         tokio::task::spawn_blocking(|| {
             tokio::spawn(async {
-                let tmp_dir = TempDir::new("persistency_test2").unwrap();
+                let tmp_dir = TempDir::with_prefix("persistency_test2").unwrap();
                 let bin_file = tmp_dir.path().join("bmcd.bin");
                 let keys_with_default = [("test", bincode::serialize(&123u128).unwrap())];
                 let persistency = ApplicationPersistency::new(
@@ -335,7 +335,7 @@ mod tests {
     async fn persistency_monitor_timeout_test() {
         tokio::task::spawn_blocking(|| {
             tokio::spawn(async {
-                let tmp_dir = TempDir::new("persistency_test3").unwrap();
+                let tmp_dir = TempDir::with_prefix("persistency_test3").unwrap();
                 let bin_file = tmp_dir.path().join("bmcd.bin");
                 let keys_with_default = [("test", bincode::serialize(&123u128).unwrap())];
                 assert!(!bin_file.exists());
