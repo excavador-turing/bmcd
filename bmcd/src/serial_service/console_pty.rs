@@ -140,8 +140,12 @@ impl ConsolePty {
         remove_stale_link(link)?;
         symlink(&slave_path, link)?;
 
+        // SAFETY: `PtyMaster` owns its descriptor, closes it only on drop, and
+        // `as_raw_fd` always returns that same descriptor.
+        let master = unsafe { AsyncFd::register(master) }?;
+
         Ok(ConsolePty {
-            master: AsyncFd::new(master)?,
+            master,
             slave,
             slave_path,
             link: link.to_path_buf(),
