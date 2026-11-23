@@ -52,6 +52,11 @@ pub enum AuthenticationError {
             they are correct.",
             format_duration(Duration::from_secs(ban_seconds_remaining(*.0))))]
     ExceededAllowedAttempts(Instant),
+    /// The check itself could not run: the stored hash is in a form the
+    /// validator cannot read, or the blocking task died. It says nothing
+    /// about the password offered, so it is never counted against the peer.
+    #[error("the password could not be checked: {0}")]
+    CheckFailed(String),
 }
 
 impl From<serde_json::Error> for AuthenticationError {
@@ -179,6 +184,7 @@ mod tests {
             AuthenticationError::ParseError("nonsense".to_string()),
             AuthenticationError::HttpParseError("nonsense".to_string()),
             AuthenticationError::SchemeNotSupported("Digest".to_string()),
+            AuthenticationError::CheckFailed("unreadable hash".to_string()),
         ] {
             assert_eq!(error.retry_after(), None, "{error}");
         }

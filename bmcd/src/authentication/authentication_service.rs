@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::{
-    authentication_context::{Actor, AuthenticationContext},
+    authentication_context::{Actor, AuthenticationContext, PendingAuthorization},
     authentication_errors::{AuthenticationError, SchemedAuthError},
     factory_password::{FactoryPassword, REFUSAL},
     passwd_validator::UnixValidator,
@@ -28,6 +28,7 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 use futures::StreamExt;
 use serde::Serialize;
+use std::time::Duration;
 use std::{borrow::Cow, rc::Rc, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -200,16 +201,34 @@ where
                 .peer_addr()
                 .unwrap_or_default()
                 .to_string();
-            let mut context = context.lock().await;
-
-            // handle authentication requests and return
+            // The login body is read before the mutex. It is the one
+            // unauthenticated request that carries a body, and holding the
+            // only authentication lock across that read stalls every other
+            // request for as long as the sender likes.
             if request.request().uri().path() == auth_path {
-                return authentication_request(&mut request, &peer, &mut context).await;
+                return authentication_request(&mut request, &peer, &context).await;
             }
 
-            let authorized = match credential_line(&request) {
-                Ok(auth) => context.authorize_request(&peer, &auth).await,
+            // Bearer is decided under the lock. Basic only looks up the hash
+            // there: the crypt runs on the blocking pool with the lock
+            // released, and the lock is taken again to record the result.
+            let pending = match credential_line(&request) {
+                Ok(auth) => context.lock().await.begin_authorization(&peer, &auth).await,
                 Err(e) => Err(e.into_basic_error()),
+            };
+            let authorized = match pending {
+                Ok(PendingAuthorization::Decided(actor)) => Ok(actor),
+                Ok(PendingAuthorization::Password {
+                    username,
+                    password,
+                    hash,
+                }) => {
+                    let outcome =
+                        AuthenticationContext::<UnixValidator>::check_password(hash, password)
+                            .await;
+                    context.lock().await.finish_basic(&peer, username, outcome)
+                }
+                Err(e) => Err(e),
             };
 
             match authorized {
@@ -241,30 +260,109 @@ where
     }
 }
 
+/// About 4 KiB. A login is a username and a password; anything larger is not one.
+const LOGIN_BODY_MAX: usize = 4096;
+/// A few seconds. A sender that stops mid-body does not hold the request open.
+const LOGIN_BODY_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+enum LoginBodyError {
+    TooLarge,
+    TimedOut,
+    Unreadable,
+}
+
+async fn read_login_payload<S>(payload: &mut S, wait: Duration) -> Result<Vec<u8>, LoginBodyError>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, actix_web::error::PayloadError>> + Unpin,
+{
+    let read = async {
+        let mut buffer = Vec::new();
+        while let Some(chunk) = payload.next().await {
+            let bytes = chunk.map_err(|_| LoginBodyError::Unreadable)?;
+            if buffer.len().saturating_add(bytes.len()) > LOGIN_BODY_MAX {
+                return Err(LoginBodyError::TooLarge);
+            }
+            buffer.extend_from_slice(&bytes);
+        }
+        Ok(buffer)
+    };
+    match tokio::time::timeout(wait, read).await {
+        Ok(result) => result,
+        Err(_) => Err(LoginBodyError::TimedOut),
+    }
+}
+
 async fn authentication_request<B>(
     request: &mut ServiceRequest,
     peer: &str,
-    context: &mut AuthenticationContext<UnixValidator>,
+    context: &Arc<Mutex<AuthenticationContext<UnixValidator>>>,
 ) -> Result<ServiceResponse<EitherBody<B>>, Error> {
     tracing::debug!("authentication request");
-    let mut buffer = Vec::new();
-    while let Some(Ok(bytes)) = request.parts_mut().1.next().await {
-        buffer.extend_from_slice(&bytes);
-    }
+    let buffer = {
+        let payload = &mut request.parts_mut().1;
+        read_login_payload(payload, LOGIN_BODY_WAIT).await
+    };
+    let buffer = match buffer {
+        Ok(buffer) => buffer,
+        Err(LoginBodyError::TooLarge) => {
+            return Ok(ServiceResponse::new(
+                request.request().clone(),
+                HttpResponse::PayloadTooLarge()
+                    .body("login body is larger than 4 KiB")
+                    .map_into_right_body(),
+            ));
+        }
+        Err(LoginBodyError::TimedOut) => {
+            return Ok(ServiceResponse::new(
+                request.request().clone(),
+                HttpResponse::RequestTimeout()
+                    .body("login body was not received in time")
+                    .map_into_right_body(),
+            ));
+        }
+        Err(LoginBodyError::Unreadable) => {
+            return forbidden_response(request.request(), "login body could not be read");
+        }
+    };
 
-    let response = match context.authenticate_request(peer, &buffer).await {
-        Ok(session) => authenticated_response(request.request(), session.id.clone(), session),
-        Err(error) => match error.retry_after() {
-            Some(seconds) => too_many_requests_response(request.request(), seconds, error),
-            None => forbidden_response(request.request(), error),
-        },
+    let (username, password) =
+        match AuthenticationContext::<UnixValidator>::credentials_from_body(&buffer) {
+            Ok(credentials) => credentials,
+            Err(error) => return forbidden_response(request.request(), error),
+        };
+
+    // Hash lookup and the ban check are the map. The crypt is not.
+    let hash = {
+        let mut context = context.lock().await;
+        match context.password_hash(peer, &username) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return match error.retry_after() {
+                    Some(seconds) => too_many_requests_response(request.request(), seconds, error),
+                    None => forbidden_response(request.request(), error),
+                };
+            }
+        }
+    };
+    let outcome = AuthenticationContext::<UnixValidator>::check_password(hash, password).await;
+
+    let response = {
+        let mut context = context.lock().await;
+        match context.establish_session(peer, username, outcome).await {
+            Ok(session) => authenticated_response(request.request(), session.id.clone(), session),
+            Err(error) => match error.retry_after() {
+                Some(seconds) => too_many_requests_response(request.request(), seconds, error),
+                None => forbidden_response(request.request(), error),
+            },
+        }
     };
 
     response
 }
 
 /// The credential this request offers, written as an HTTP authorization line
-/// for [`AuthenticationContext::authorize_request`] to take apart.
+/// for [`AuthenticationContext::begin_authorization`] to take apart.
 ///
 /// `Authorization` is where it lives for every client that can set a header.
 /// A browser opening a websocket cannot: the `WebSocket` constructor takes a
@@ -415,7 +513,7 @@ mod tests {
     /// several requests through the one instance.
     fn service(
     ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
-    {
+           + Clone {
         service_with_shadow("/nonexistent/shadow")
     }
 
@@ -426,7 +524,7 @@ mod tests {
     fn service_with_shadow(
         shadow: &str,
     ) -> impl Service<ServiceRequest, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
-    {
+           + Clone {
         let context = build_test_context(
             [(TOKEN.to_string(), Instant::now())],
             [(
@@ -478,6 +576,134 @@ mod tests {
         rest_call_from(peer)
             .insert_header((header::AUTHORIZATION, basic("root", "not the password")))
             .to_srv_request()
+    }
+
+    #[tokio::test]
+    async fn a_login_body_is_capped_at_four_kibibytes() {
+        let mut ok = futures::stream::iter([Ok(bytes::Bytes::from(vec![b'a'; LOGIN_BODY_MAX]))]);
+        let body = read_login_payload(&mut ok, LOGIN_BODY_WAIT).await.unwrap();
+        assert_eq!(body.len(), LOGIN_BODY_MAX);
+
+        let mut too_big =
+            futures::stream::iter([Ok(bytes::Bytes::from(vec![b'a'; LOGIN_BODY_MAX + 1]))]);
+        assert!(matches!(
+            read_login_payload(&mut too_big, LOGIN_BODY_WAIT).await,
+            Err(LoginBodyError::TooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_login_body_that_never_arrives_stops_after_its_deadline() {
+        let mut pending =
+            futures::stream::pending::<Result<bytes::Bytes, actix_web::error::PayloadError>>();
+        let wait = Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let error = read_login_payload(&mut pending, wait).await.unwrap_err();
+        assert!(matches!(error, LoginBodyError::TimedOut));
+        assert!(started.elapsed() >= wait);
+        assert_eq!(LOGIN_BODY_WAIT, Duration::from_secs(5));
+    }
+
+    #[actix_web::test]
+    async fn a_login_body_over_the_cap_is_refused() {
+        let response = call(
+            TestRequest::post()
+                .uri("/api/bmc/authenticate")
+                .peer_addr(PEER.parse().expect("a peer address"))
+                .set_payload(vec![b'a'; LOGIN_BODY_MAX + 1])
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The body is still unread. A token request on the same service must
+    /// answer anyway, which it cannot do while the login holds the mutex.
+    #[actix_web::test]
+    async fn a_slow_login_body_does_not_block_a_token_request() {
+        let auth = service();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let body = format!(r#"{{"username":"root","password":"{PASSWORD}"}}"#);
+        let stream = futures::stream::once(async move {
+            let _ = gate.await;
+            Ok::<_, actix_web::error::PayloadError>(bytes::Bytes::from(body))
+        });
+        let (req, _) = TestRequest::post()
+            .uri("/api/bmc/authenticate")
+            .peer_addr(PEER.parse().expect("a peer address"))
+            .to_srv_request()
+            .into_parts();
+        let login_request = ServiceRequest::from_parts(
+            req,
+            actix_web::dev::Payload::Stream {
+                payload: Box::pin(stream),
+            },
+        );
+        let login = auth.clone().call(login_request);
+        tokio::pin!(login);
+
+        let token = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut login => panic!("the login finished before its body was sent"),
+                response = auth.call(
+                    rest_call()
+                        .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                        .to_srv_request(),
+                ) => response,
+            }
+        })
+        .await
+        .expect("a token request waited on the login body");
+        assert_eq!(token.expect("middleware answers").status(), StatusCode::OK);
+
+        release.send(()).unwrap();
+        let login = login.await.expect("middleware answers");
+        assert_eq!(login.status(), StatusCode::OK);
+    }
+
+    /// A Basic password check runs with the authentication mutex released.
+    ///
+    /// The hash is made slow on purpose (200 000 sha512 rounds). While the
+    /// Basic request is still inside the check, the mutex must be free and the
+    /// runtime thread must still run other futures; with the crypt inline
+    /// under the lock, neither holds and the request finishes first.
+    #[actix_web::test]
+    async fn a_basic_password_check_does_not_hold_the_lock() {
+        let slow = pwhash::sha512_crypt::hash_with("$6$rounds=200000$saltsalt$", PASSWORD)
+            .expect("a shadow hash");
+        let context = Arc::new(Mutex::new(build_test_context(
+            [(TOKEN.to_string(), Instant::now())],
+            [("root".to_string(), slow)],
+        )));
+        let route = Rc::new(fn_service(|request: ServiceRequest| async move {
+            Ok::<_, Error>(request.into_response(HttpResponse::Ok().body("reached the route")))
+        }));
+        let auth = AuthenticationService::new(
+            route,
+            context.clone(),
+            "/api/bmc/authenticate",
+            "test realm",
+            IDENTITY_HEADER.into(),
+            Arc::new(FactoryPassword::new("/nonexistent/shadow")),
+        );
+
+        let basic = auth.call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, basic("root", PASSWORD)))
+                .to_srv_request(),
+        );
+        tokio::pin!(basic);
+        tokio::select! {
+            biased;
+            _ = &mut basic => panic!("the password check finished before it could be observed"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert!(
+            context.try_lock().is_ok(),
+            "the authentication mutex is held across the password check"
+        );
+        let response = basic.await.expect("middleware answers");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A login request: the path the web interface actually uses, and the one

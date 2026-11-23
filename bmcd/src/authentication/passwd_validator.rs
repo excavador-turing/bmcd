@@ -32,11 +32,66 @@ impl PasswordValidator for UnixValidator {
     /// It was debugging scaffolding for the validator itself, which is four
     /// lines and has tests. There is no question it answers that is worth
     /// writing a password derivative to disk for.
+    ///
+    /// A locked or empty entry (`!`, `*`, `!$6$...`) is a wrong password: the
+    /// account cannot log in, and that is not a fault of the board. Any other
+    /// hash `crypt` cannot read is [`AuthenticationError::CheckFailed`], so a
+    /// broken `/etc/shadow` line is reported as that and not counted as a
+    /// guess against whoever tried.
     fn validate(hash: &str, password: &str) -> Result<(), AuthenticationError> {
-        if !pwhash::unix::verify(password, hash) {
+        if hash.is_empty() || hash.starts_with('!') || hash.starts_with('*') {
+            return Err(AuthenticationError::IncorrectCredentials);
+        }
+        let computed = pwhash::unix::crypt(password, hash).map_err(|_| {
+            AuthenticationError::CheckFailed("the stored hash is not in a known format".into())
+        })?;
+        // Constant time over the bytes, as `pwhash::unix::verify` does.
+        let differ = computed.len() != hash.len()
+            || computed
+                .bytes()
+                .zip(hash.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                != 0;
+        if differ {
             Err(AuthenticationError::IncorrectCredentials)
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hash_crypt_cannot_read_is_not_a_wrong_password() {
+        assert_eq!(
+            UnixValidator::validate("$9$nonsense$", "turing"),
+            Err(AuthenticationError::CheckFailed(
+                "the stored hash is not in a known format".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_locked_account_is_a_wrong_password() {
+        for locked in ["", "!", "*", "!$6$saltsalt$abc"] {
+            assert_eq!(
+                UnixValidator::validate(locked, "turing"),
+                Err(AuthenticationError::IncorrectCredentials),
+                "{locked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn right_and_wrong_passwords() {
+        let hash = pwhash::sha512_crypt::hash_with("$6$saltsalt$", "turing").unwrap();
+        assert_eq!(UnixValidator::validate(&hash, "turing"), Ok(()));
+        assert_eq!(
+            UnixValidator::validate(&hash, "nope"),
+            Err(AuthenticationError::IncorrectCredentials)
+        );
     }
 }
