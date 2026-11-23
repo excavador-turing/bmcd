@@ -13,7 +13,6 @@
 // limitations under the License.
 use crate::hal::{helpers::bit_iterator, NodeId};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
 
@@ -89,7 +88,7 @@ impl PowerController {
         let bits = node.to_bitfield();
 
         self.set_power_node(0u8, bits).await?;
-        sleep(Duration::from_secs(1)).await;
+        sleep(crate::hal::POWER_OFF_SETTLE).await;
         self.set_power_node(bits, bits).await?;
         Ok(())
     }

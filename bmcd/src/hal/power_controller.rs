@@ -194,13 +194,13 @@ impl PowerController {
         Ok(node_states)
     }
 
-    /// Reset a given node by setting the reset pin logically high for 1 second
+    /// Reset a given node by switching it off for [`crate::hal::POWER_OFF_SETTLE`]
     pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
         debug!("reset node {:?}", node);
         let bits = node.to_bitfield();
 
         self.set_power_node(0u8, bits).await?;
-        sleep(Duration::from_secs(1)).await;
+        sleep(crate::hal::POWER_OFF_SETTLE).await;
         self.set_power_node(bits, bits).await?;
         Ok(())
     }

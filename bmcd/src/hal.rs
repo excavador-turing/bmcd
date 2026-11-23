@@ -123,6 +123,12 @@ impl UsbMode {
     }
 }
 
+/// How long a node stays unpowered when it is switched off and on again. Its
+/// rails need that long to drain: switched on sooner, a node that was running
+/// may not cold-boot, and only a cold boot reads the USB boot pin. Both the
+/// real HAL and the stubbed one wait this long in `reset_node`.
+pub const POWER_OFF_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Which USB topology the board carries. `UsbMux` is the v2.4 multiplexer,
 /// `UsbHub` the v2.5+ hub. This lives here, next to `NodeId` and `UsbMode`,
 /// rather than in `pin_controller`, because both the real HAL and the stubbed

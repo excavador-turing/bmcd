@@ -574,6 +574,9 @@ impl BmcApplication {
         self.activate_slot(!node.to_bitfield(), node.to_bitfield())
             .await?;
         self.configure_usb_internal(config).await?;
+        // A node that was running needs this long without power to come back
+        // up from cold, and only a cold boot reads the USB boot pin.
+        tokio::time::sleep(crate::hal::POWER_OFF_SETTLE).await;
 
         tracing::info!("Powering on...");
         self.activate_slot(node.to_bitfield(), node.to_bitfield())
