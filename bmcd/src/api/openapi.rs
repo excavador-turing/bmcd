@@ -332,8 +332,8 @@ fn retarget(node: Value) -> Value {
 }
 
 /// `POST /api/bmc?opt=set&type=flash`, which is not a route of its own: it is
-/// the legacy dispatcher's transfer branch, so it is described by hand. The
-/// `GET` spelling is still served with a Bearer token, for older clients.
+/// the legacy dispatcher's transfer branch, so it is described by hand. Its
+/// `GET` spelling is refused with 405.
 fn flash_path() -> Value {
     let param = |name: &str, description: &str| {
         json!({ "name": name, "in": "query", "required": false,
@@ -380,20 +380,9 @@ fn flash_path() -> Value {
             }
         }
     });
-    let mut get = post.clone();
-    get["operationId"] = json!("legacyFlashNodeGet");
-    get["deprecated"] = json!(true);
-    get["summary"] = json!("Write an image to a node over GET (older clients)");
-    get["description"] = json!(
-        "The same as the POST, still served for older clients, but only with an \
-         `Authorization: Bearer` header. Any other credential, or none, is 405 with \
-         `Allow: POST`. Every other `opt=set` type follows the same rule."
-    );
-    get["security"] = json!([{ "bearer": [] }]);
-    get["responses"]["405"] = json!({ "description": "Sent without a Bearer token: use POST." });
     post["responses"]["403"] =
         json!({ "description": "`Sec-Fetch-Site` is `cross-site` or `same-site`." });
-    json!({ "post": post, "get": get })
+    json!({ "post": post })
 }
 
 /// Backup, logout and the upload cancel: state changes outside the alias
@@ -403,7 +392,6 @@ fn session_paths() -> Vec<(String, Value)> {
         "description": "A refusal, RFC 9457.",
         "content": { "application/problem+json": { "schema": component_ref("Problem") } }
     });
-    let gone = json!({ "description": "Sent without a Bearer token: use POST." });
     let cross = json!({ "description": "`Sec-Fetch-Site` is `cross-site` or `same-site`." });
     let backup_ok = json!({
         "description": "A gzip'd tar of the overlay, streamed. Left out: `etc/shadow`, \
@@ -421,23 +409,12 @@ fn session_paths() -> Vec<(String, Value)> {
     vec![
         (
             "/api/bmc/backup".to_string(),
-            json!({
-                "post": {
-                    "summary": "Download a backup of the board's configuration",
-                    "operationId": "postBackup",
-                    "responses": { "200": backup_ok.clone(), "403": cross.clone(),
-                                   "default": problem.clone() }
-                },
-                "get": {
-                    "summary": "Backup over GET (older clients)",
-                    "operationId": "getBackup",
-                    "deprecated": true,
-                    "description": "Served only with an `Authorization: Bearer` header.",
-                    "security": [{ "bearer": [] }],
-                    "responses": { "200": backup_ok, "405": gone.clone(),
-                                   "default": problem.clone() }
-                }
-            }),
+            json!({ "post": {
+                "summary": "Download a backup of the board's configuration",
+                "operationId": "postBackup",
+                "responses": { "200": backup_ok, "403": cross.clone(),
+                               "default": problem.clone() }
+            } }),
         ),
         (
             "/api/bmc/logout".to_string(),
@@ -458,24 +435,12 @@ fn session_paths() -> Vec<(String, Value)> {
         ),
         (
             "/api/bmc/upload/{handle}/cancel".to_string(),
-            json!({
-                "post": {
-                    "summary": "Cancel the transfer in progress",
-                    "operationId": "postUploadCancel",
-                    "parameters": handle.clone(),
-                    "responses": { "200": cancel_ok.clone(), "403": cross,
-                                   "default": problem.clone() }
-                },
-                "get": {
-                    "summary": "Cancel over GET (older clients)",
-                    "operationId": "getUploadCancel",
-                    "deprecated": true,
-                    "description": "Served only with an `Authorization: Bearer` header.",
-                    "parameters": handle,
-                    "security": [{ "bearer": [] }],
-                    "responses": { "200": cancel_ok, "405": gone, "default": problem }
-                }
-            }),
+            json!({ "post": {
+                "summary": "Cancel the transfer in progress",
+                "operationId": "postUploadCancel",
+                "parameters": handle,
+                "responses": { "200": cancel_ok, "403": cross, "default": problem }
+            } }),
         ),
     ]
 }
@@ -1257,8 +1222,9 @@ pub fn document() -> Value {
             "title": "Turing Pi 2 BMC",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "The board management controller of a Turing Pi 2, as built by the excavador-turing fork. \
-                            Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
-                            which older clients speak and which is not going away.\n\n\
+                            Every operation here is also reachable in the legacy form `/api/bmc?opt=&type=`, \
+                            which older clients speak and which is not going away: `GET` for a read, \
+                            `POST` for `opt=set`.\n\n\
                             **A board still on its factory password answers 403 to everything here** except \
                             `/authenticate`, `/access`, `/access/password`, `GET /storage` and \
                             `POST /storage/repair` (a board in safe mode is always on the factory \
@@ -1273,8 +1239,7 @@ pub fn document() -> Value {
                             `tpi` reads the local token the daemon writes to `/run/bmcd/local-token` at \
                             every start, accepted from loopback only. The firmware health probe is the \
                             static page at `https://127.0.0.1/`, not this API. State changes are POST \
-                            (`?opt=set` included); their GET forms are served only with a Bearer token, \
-                            for older clients, and answer 405 otherwise. A state change whose \
+                            (`?opt=set` included); their GET forms answer 405. A state change whose \
                             `Sec-Fetch-Site` is `cross-site` or `same-site` is 403, and Basic \
                             authentication is refused on any request carrying `Sec-Fetch-*`, `Origin` \
                             or `Referer`.",
@@ -1342,12 +1307,9 @@ mod tests {
     /// the alias table stays a deliberate act with its reason written down,
     /// which is the whole point of the assertion below.
     const NOT_ALIASES: &[(&str, &str)] = &[
-        ("/api/bmc", "get"),
         ("/api/bmc", "post"),
-        ("/api/bmc/backup", "get"),
         ("/api/bmc/backup", "post"),
         ("/api/bmc/logout", "post"),
-        ("/api/bmc/upload/{handle}/cancel", "get"),
         ("/api/bmc/upload/{handle}/cancel", "post"),
         ("/api/bmc/access", "get"),
         ("/api/bmc/access/password", "post"),

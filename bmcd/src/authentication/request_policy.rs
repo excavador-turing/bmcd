@@ -26,7 +26,8 @@ const API: &str = "/api/bmc";
 /// A request that changes state on the board.
 ///
 /// Every method other than `GET`, `HEAD` and `OPTIONS` is one. So are the
-/// three `GET` forms older clients still send ([`is_get_state_change`]).
+/// three `GET` forms older clients send ([`is_get_state_change`]), which the
+/// middleware refuses.
 pub fn is_state_change(method: &Method, path: &str, query: &str) -> bool {
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         is_get_state_change(path, query)
@@ -35,7 +36,7 @@ pub fn is_state_change(method: &Method, path: &str, query: &str) -> bool {
     }
 }
 
-/// The state changes that are still routed on `GET` for older clients:
+/// The state changes older clients send on `GET`, refused with 405:
 /// `?opt=set` on `/api/bmc` (every type, including the flash and firmware
 /// transfer), `/api/bmc/upload/{handle}/cancel` and `/api/bmc/backup`.
 ///
