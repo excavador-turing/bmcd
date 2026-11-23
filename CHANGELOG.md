@@ -10,6 +10,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A node is kept off for five seconds before it is powered on again.** A
+  running CM5 rides through a cut of about a tenth of a second and then does
+  not start: one that was on when a flash began never answered in its ROM
+  ("did not appear"), and CM5s halted with `poweroff` stayed dark when the
+  daemon switched them off and on. Off for five seconds, each booted. The wait
+  only follows a real switch from on to off, so a node that is already off is
+  flashed or powered on at once. A reset now takes five seconds instead of one;
+  whether one second was already enough for a CM5 was not established.
+
 ## [2.47.0] — 2026-11-21
 
 The daemon reads the latch shadow word from the kernel's sysfs attributes, and

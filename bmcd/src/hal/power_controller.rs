@@ -18,6 +18,8 @@ use super::{
 use anyhow::Context;
 use gpiod::{Chip, Lines, Options, Output};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
 use std::{str::FromStr, time::Duration};
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
@@ -56,6 +58,13 @@ const LATCH_ATX_BIT: u32 = 0;
 /// Latch bit of the enable line of node 1; node n is `NODE1_EN_BIT - (n - 1)`.
 const NODE1_EN_BIT: u32 = 8;
 
+/// How long a node stays off before it is powered on again. A CM5 that was
+/// running holds up on its own supply through a short cut and then does not
+/// start: cut for about a tenth of a second (the flash path, or the off and on
+/// of a daemon start) it stayed dark, or never answered in its ROM; off for
+/// five seconds it booted every time. A CM4 does not mind the wait.
+const MIN_OFF: Duration = Duration::from_secs(5);
+
 // This structure is a thin layer that abstracts away the interaction details
 // with Linux's power subsystem.
 pub struct PowerController {
@@ -64,6 +73,8 @@ pub struct PowerController {
     sysfs_reset: PathBuf,
     /// Whether the board has the latch and its shadow word.
     latching: bool,
+    /// When each node last went from on to off, for [`MIN_OFF`].
+    last_off: [Mutex<Option<Instant>>; 4],
 }
 
 impl PowerController {
@@ -129,6 +140,7 @@ impl PowerController {
             sysfs_power,
             sysfs_reset,
             latching: has_latch,
+            last_off: Default::default(),
         })
     }
 
@@ -151,9 +163,21 @@ impl PowerController {
 
         for (idx, state) in updates {
             trace!("setting power of node {}. state:{}", idx + 1, state);
+            let was_on = self.enable[idx].get_values(0u8)? & 1 == 1;
+            if state == 1 && !was_on {
+                let off_since = *self.last_off[idx].lock().expect("not poisoned");
+                let wait = remaining_off_time(off_since, Instant::now(), MIN_OFF);
+                if !wait.is_zero() {
+                    debug!("node {} keeps off for {:?} more", idx + 1, wait);
+                    sleep(wait).await;
+                }
+            }
             set_mode(idx + 1, state).await?;
             sleep(Duration::from_millis(100)).await;
             self.enable[idx].set_values(state)?;
+            if state == 0 && was_on {
+                *self.last_off[idx].lock().expect("not poisoned") = Some(Instant::now());
+            }
         }
 
         Ok(())
@@ -194,13 +218,13 @@ impl PowerController {
         Ok(node_states)
     }
 
-    /// Reset a given node by setting the reset pin logically high for 1 second
+    /// Reset a given node: off, then on again once it has been off for
+    /// [`MIN_OFF`].
     pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
         debug!("reset node {:?}", node);
         let bits = node.to_bitfield();
 
         self.set_power_node(0u8, bits).await?;
-        sleep(Duration::from_secs(1)).await;
         self.set_power_node(bits, bits).await?;
         Ok(())
     }
@@ -363,6 +387,14 @@ fn read_latch_power_state() -> anyhow::Result<u8> {
     read_latch_power_state_from(Path::new(LATCH_SYSFS), read_latch_words_dev_mem)
 }
 
+/// How much longer a node that went off at `off_since` must stay off. Zero for
+/// a node that has not been switched off by this daemon.
+fn remaining_off_time(off_since: Option<Instant>, now: Instant, min_off: Duration) -> Duration {
+    off_since
+        .map(|t| min_off.saturating_sub(now.saturating_duration_since(t)))
+        .unwrap_or_default()
+}
+
 /// `read_latch_power_state` with the sysfs directory and the `/dev/mem` read
 /// given, so that a test can stand in for both.
 fn read_latch_power_state_from(
@@ -381,6 +413,22 @@ fn read_latch_power_state_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_stays_off_for_the_rest_of_the_minimum() {
+        let t = Instant::now();
+        let min = Duration::from_secs(5);
+        assert_eq!(remaining_off_time(None, t, min), Duration::ZERO);
+        assert_eq!(remaining_off_time(Some(t), t, min), min);
+        assert_eq!(
+            remaining_off_time(Some(t), t + Duration::from_secs(2), min),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            remaining_off_time(Some(t), t + Duration::from_secs(9), min),
+            Duration::ZERO
+        );
+    }
 
     /// ATX on, the four slot rails on, the four enable latches asserted (low):
     /// what the board B had when it was read, `0x1f`.
