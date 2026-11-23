@@ -55,6 +55,9 @@ const LATCH_SHADOW_ADDR: usize = 0x0709_010c;
 const LATCH_ATX_BIT: u32 = 0;
 /// Latch bit of the enable line of node 1; node n is `NODE1_EN_BIT - (n - 1)`.
 const NODE1_EN_BIT: u32 = 8;
+/// Where the kernel's node power devices are, `node1-power` to `node4-power`.
+/// Their `state` attribute is what [`set_mode`] last wrote.
+const POWER_DEVICES: &str = "/sys/bus/platform/devices";
 
 // This structure is a thin layer that abstracts away the interaction details
 // with Linux's power subsystem.
@@ -101,12 +104,19 @@ impl PowerController {
         // moment until the power state was applied, and it made every later
         // read of the lines say "all off". Ask for what the board is doing
         // instead, which for a cold board is 0 anyway.
+        //
+        // A v2.4 board has no latch, but the kernel's node power devices keep
+        // the state the last daemon set for as long as the BMC runs. Without
+        // asking them, every restart of the daemon drove all four lines to 0
+        // and cut the power of every running node.
         let live = if has_latch {
             read_latch_power_state()
                 .map_err(|e| warn!("cannot read the latch shadow: {:#}", e))
                 .ok()
         } else {
-            None
+            read_power_device_state(Path::new(POWER_DEVICES))
+                .map_err(|e| warn!("cannot read the node power devices: {:#}", e))
+                .ok()
         };
         let initial = live.unwrap_or(0);
         let request = |port: gpiod::LineId, idx: usize| {
@@ -363,6 +373,29 @@ fn read_latch_power_state() -> anyhow::Result<u8> {
     read_latch_power_state_from(Path::new(LATCH_SYSFS), read_latch_words_dev_mem)
 }
 
+/// Which nodes the kernel's node power devices say are enabled, for a board
+/// without a latch.
+///
+/// # Returns
+///
+/// * `Ok(bit-field)` where bit(n) = 1 means node n's device is `enabled`.
+/// * `Err(e)` when a device is missing or says something else, so that the
+///   caller falls back rather than guessing about one node.
+fn read_power_device_state(dir: &Path) -> anyhow::Result<u8> {
+    let mut state = 0u8;
+    for node in 0..4 {
+        let path = dir.join(format!("node{}-power/state", node + 1));
+        let value = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+        match value.trim() {
+            "enabled" => state |= 1 << node,
+            "disabled" => {}
+            other => anyhow::bail!("{}: unexpected state {:?}", path.display(), other),
+        }
+    }
+    debug!("node power devices: powered nodes {:#06b}", state);
+    Ok(state)
+}
+
 /// `read_latch_power_state` with the sysfs directory and the `/dev/mem` read
 /// given, so that a test can stand in for both.
 fn read_latch_power_state_from(
@@ -381,6 +414,32 @@ fn read_latch_power_state_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn power_devices(states: [&str; 4]) -> tempdir::TempDir {
+        let d = tempdir::TempDir::new("node-power").unwrap();
+        for (i, state) in states.iter().enumerate() {
+            let dev = d.path().join(format!("node{}-power", i + 1));
+            std::fs::create_dir(&dev).unwrap();
+            std::fs::write(dev.join("state"), format!("{state}\n")).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn power_devices_give_the_running_nodes() {
+        let d = power_devices(["enabled", "disabled", "enabled", "enabled"]);
+        assert_eq!(read_power_device_state(d.path()).unwrap(), 0b1101);
+        let d = power_devices(["disabled"; 4]);
+        assert_eq!(read_power_device_state(d.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn power_devices_that_cannot_be_read_are_an_error_not_a_guess() {
+        let d = power_devices(["enabled", "enabled", "bogus", "enabled"]);
+        assert!(read_power_device_state(d.path()).is_err());
+        let d = tempdir::TempDir::new("node-power").unwrap();
+        assert!(read_power_device_state(d.path()).is_err());
+    }
 
     /// ATX on, the four slot rails on, the four enable latches asserted (low):
     /// what the board B had when it was read, `0x1f`.

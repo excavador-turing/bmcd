@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Restarting the daemon on a v2.4 board no longer power-cycles every node.**
+  A v2.4 board has no latch to read back, so the daemon requested the four
+  enable lines at 0, which cut the power of every running node, then read them
+  as all off, took that for a cold boot and switched the persisted nodes back
+  on. It now requests the lines at what the kernel's node power devices
+  (`/sys/bus/platform/devices/nodeN-power/state`) were last set to: the state
+  the previous daemon left, kept for as long as the BMC runs. This is the v2.4
+  half of #58, which did the same for latching boards from the latch shadow.
+  A BMC reboot still powers the modules down on a v2.4 board; that is the
+  hardware, and then the devices read `disabled` and the persisted state is
+  restored as before.
+
 ## [2.47.0] — 2026-11-21
 
 The daemon reads the latch shadow word from the kernel's sysfs attributes, and
