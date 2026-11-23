@@ -36,7 +36,7 @@ use actix_files::file_extension_to_mime;
 use actix_multipart::Multipart;
 use actix_web::guard::{fn_guard, GuardContext};
 use actix_web::http::{header, StatusCode};
-use actix_web::{post, route, web, HttpMessage, HttpRequest, HttpResponse, Responder};
+use actix_web::{post, web, HttpMessage, HttpRequest, HttpResponse, Responder};
 use anyhow::Context;
 use async_compression::Level;
 use board_info::{self, BoardInfoAttribute};
@@ -75,14 +75,8 @@ pub fn config(cfg: &mut web::ServiceConfig) {
                     .guard(fn_guard(flash_status_guard))
                     .to(handle_flash_status),
             )
-            // The transfer is a state change like any other `opt=set`: POST,
-            // or GET with a Bearer token for older clients. The middleware
-            // decides which (`request_policy`); this route has no say.
-            .route(
-                web::get()
-                    .guard(fn_guard(flash_guard))
-                    .to(handle_transfer_request),
-            )
+            // The transfer is a state change like any other `opt=set`: POST
+            // only. The middleware refuses its GET form (`request_policy`).
             .route(
                 web::post()
                     .guard(fn_guard(flash_guard))
@@ -248,9 +242,8 @@ fn backup_stream(root: PathBuf) -> impl futures::Stream<Item = io::Result<bytes:
 }
 
 /// `POST /api/bmc/backup`: the overlay, streamed, without the account hashes,
-/// the TLS keys or the SSH host keys. `GET` is still routed for older clients, and the
-/// middleware serves it only with a Bearer token.
-#[route("/backup", method = "GET", method = "POST")]
+/// the TLS keys or the SSH host keys.
+#[post("/backup")]
 async fn backup_handler() -> HttpResponse {
     let now = chrono::Local::now();
     let content_disposition = format!(
@@ -1527,9 +1520,7 @@ pub fn try_map_sha256(value: Option<&String>) -> LegacyResult<Option<bytes::Byte
     Ok(sha)
 }
 
-/// `POST`, or `GET` with a Bearer token for older clients: the middleware
-/// decides.
-#[route("/upload/{handle}/cancel", method = "GET", method = "POST")]
+#[post("/upload/{handle}/cancel")]
 async fn cancel_file_upload(ss: web::Data<StreamingDataService>) -> impl Responder {
     ss.cancel_all().await;
     HttpResponse::Ok().finish()

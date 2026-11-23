@@ -485,9 +485,9 @@ fn is_browser_call(request: &HttpRequest) -> bool {
 ///
 /// * A state change that `Sec-Fetch-Site` says came from another site or
 ///   another origin of this one: 403. `same-origin`, `none` or no header pass.
-/// * A state change on `GET` (`?opt=set`, an upload cancel, a backup) without
-///   an `Authorization: Bearer` header: 405, use POST. Older clients that
-///   send a Bearer token keep working for this release.
+/// * A state change on `GET` (`?opt=set`, an upload cancel, a backup): 405,
+///   use POST, whatever the credential. tpi and BMC-UI retry a 405 once as
+///   GET for older boards; here that retry is refused too.
 /// * Basic authentication on a browser request: 401 with a Bearer challenge,
 ///   so the browser never caches a password it would attach to an `<img>`.
 fn policy_refusal<B>(
@@ -513,19 +513,11 @@ fn policy_refusal<B>(
             HttpResponse::Forbidden().body("a state change from another site is refused"),
         );
     }
-    if state_change
-        && matches!(*method, Method::GET | Method::HEAD)
-        && authorization
-            .and_then(request_policy::bearer_token)
-            .is_none()
-    {
+    if state_change && matches!(*method, Method::GET | Method::HEAD) {
         return refuse(
             HttpResponse::MethodNotAllowed()
                 .insert_header((header::ALLOW, "POST"))
-                .body(
-                    "this request changes state: send it as POST. GET is served only with \
-                     an Authorization: Bearer token, for older clients",
-                ),
+                .body("this request changes state: send it as POST"),
         );
     }
     if authorization.is_some_and(request_policy::is_basic)
@@ -1380,25 +1372,19 @@ mod tests {
                 "{method} {uri} must stay closed on a factory board"
             );
         }
-        // The GET spelling with Basic is refused before the gate is asked;
-        // with a token the gate still closes it.
+        // The GET spelling is refused before the gate is asked, whatever the
+        // credential.
         let get = "/api/bmc?opt=set&type=reboot";
-        assert_eq!(
-            call_on_factory_board(
-                call_as(TestRequest::get().uri(get), Some(basic("root", PASSWORD))),
-                &shadow
-            )
-            .await,
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-        assert_eq!(
-            call_on_factory_board(
-                call_as(TestRequest::get().uri(get), Some(format!("Bearer {TOKEN}"))),
-                &shadow
-            )
-            .await,
-            StatusCode::FORBIDDEN
-        );
+        for credential in [basic("root", PASSWORD), format!("Bearer {TOKEN}")] {
+            assert_eq!(
+                call_on_factory_board(
+                    call_as(TestRequest::get().uri(get), Some(credential)),
+                    &shadow
+                )
+                .await,
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
     }
 
     /// A wrong password on a factory board is a wrong password, not a lecture
@@ -1472,8 +1458,7 @@ mod tests {
     }
 
     /// Contract C2: the transfer route was the one GET that skipped the
-    /// refusal. Without a Bearer header it is a 405 now, for every credential
-    /// that is not one.
+    /// refusal. It is a 405 now, with any credential or none.
     #[actix_web::test]
     async fn firmware_on_get_without_bearer_is_refused() {
         let uri = "/api/bmc?opt=set&type=firmware&file=tp2.tpu&length=1";
@@ -1499,9 +1484,10 @@ mod tests {
         }
     }
 
-    /// The transition: an older client with a token still works on GET.
+    /// The transition is over: a token does not make a GET state change
+    /// acceptable either. Every refusal says to use POST.
     #[actix_web::test]
-    async fn get_opt_set_with_bearer_is_still_served() {
+    async fn get_opt_set_with_bearer_is_refused() {
         for uri in [
             "/api/bmc?opt=set&type=power&node1=1",
             "/api/bmc?opt=set&type=firmware&file=tp2.tpu&length=1",
@@ -1514,7 +1500,15 @@ mod tests {
                     .to_srv_request(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{uri}"
+            );
         }
     }
 
