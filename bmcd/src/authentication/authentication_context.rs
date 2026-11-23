@@ -112,39 +112,17 @@ where
         Err(AuthenticationError::TokenExpired(instant))
     }
 
-    fn validate_credentials(
-        &mut self,
-        peer: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<(), AuthenticationError> {
-        self.ban_patrol.patrole_ban(peer)?;
-
-        match self
-            .passwds
-            .get(username)
-            .ok_or(AuthenticationError::IncorrectCredentials)
-            .and_then(|pass| P::validate(pass, password))
-        {
-            Ok(_) => {
-                tracing::debug!("{username} validated successfully");
-                self.ban_patrol.clear_penalties(peer);
-                Ok(())
-            }
-            Err(AuthenticationError::IncorrectCredentials) => Err(self
-                .ban_patrol
-                .penalize(peer)
-                .err()
-                .unwrap_or(AuthenticationError::IncorrectCredentials)),
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn authorize_basic(
+    /// The Basic credential's user and the stored hash, under the lock.
+    ///
+    /// The password is not checked here: `sha512_crypt` takes long enough on
+    /// the board that running it under the only authentication mutex stalls
+    /// every other request. [`Self::check_password`] runs it after the lock
+    /// is released, and [`Self::finish_basic`] records the result.
+    fn basic_hash(
         &mut self,
         peer: &str,
         credentials: &str,
-    ) -> Result<String, AuthenticationError> {
+    ) -> Result<PendingAuthorization, AuthenticationError> {
         let decoded = general_purpose::STANDARD.decode(credentials)?;
         let utf8 = std::str::from_utf8(&decoded)?;
         let Some((user, pass)) = utf8.split_once(':') else {
@@ -152,36 +130,38 @@ where
                 "basic authentication formatted wrong".to_string(),
             ));
         };
-
-        self.validate_credentials(peer, user, pass)?;
-        Ok(user.to_string())
+        let hash = self.password_hash(peer, user)?;
+        Ok(PendingAuthorization::Password {
+            username: user.to_string(),
+            password: pass.to_string(),
+            hash,
+        })
     }
 
-    /// Authorise a request and say who it is.
+    /// Authorise a request as far as the map can, under the lock.
     ///
-    /// The username comes back rather than being discarded, because an audit
-    /// line that cannot name the operator is a log line.
-    pub async fn authorize_request(
+    /// A bearer token is decided here. A Basic credential comes back as
+    /// [`PendingAuthorization::Password`]: the caller releases the lock, runs
+    /// [`Self::check_password`], and takes the lock again for
+    /// [`Self::finish_basic`].
+    pub async fn begin_authorization(
         &mut self,
         peer: &str,
         http_authorization_line: &str,
-    ) -> Result<Actor, SchemedAuthError> {
+    ) -> Result<PendingAuthorization, SchemedAuthError> {
         match http_authorization_line.split_once(' ') {
             Some(("Bearer", token)) => self
                 .authorize_bearer(peer, token)
                 .await
-                .map(|name| Actor::User {
-                    name,
-                    scheme: "bearer",
+                .map(|name| {
+                    PendingAuthorization::Decided(Actor::User {
+                        name,
+                        scheme: "bearer",
+                    })
                 })
                 .map_err(AuthenticationError::into_bearer_error),
             Some(("Basic", credentials)) => self
-                .authorize_basic(peer, credentials)
-                .await
-                .map(|name| Actor::User {
-                    name,
-                    scheme: "basic",
-                })
+                .basic_hash(peer, credentials)
                 .map_err(AuthenticationError::into_basic_error),
             Some((auth, _)) => {
                 Err(AuthenticationError::SchemeNotSupported(auth.to_string()).into_unknown_error())
@@ -193,21 +173,121 @@ where
         }
     }
 
-    pub async fn authenticate_request(
+    /// Record a Basic password check, under the lock again.
+    pub fn finish_basic(
         &mut self,
         peer: &str,
-        body: &[u8],
-    ) -> Result<Session, AuthenticationError> {
-        let credentials = serde_json::from_slice::<Login>(body)?;
+        username: String,
+        outcome: Result<(), AuthenticationError>,
+    ) -> Result<Actor, SchemedAuthError> {
+        self.record_password_check(peer, outcome)
+            .map(|()| Actor::User {
+                name: username,
+                scheme: "basic",
+            })
+            .map_err(AuthenticationError::into_basic_error)
+    }
 
-        self.validate_credentials(peer, &credentials.username, &credentials.password)?;
+    /// The password check, on the blocking pool and without the lock.
+    pub async fn check_password(hash: String, password: String) -> Result<(), AuthenticationError> {
+        tokio::task::spawn_blocking(move || P::validate(&hash, &password))
+            .await
+            .unwrap_or_else(|e| Err(AuthenticationError::CheckFailed(e.to_string())))
+    }
+
+    /// The ban and penalty bookkeeping for a finished password check.
+    ///
+    /// Only a wrong password is a penalty. A check that could not run
+    /// ([`AuthenticationError::CheckFailed`]) says nothing about the password
+    /// offered and is passed back unchanged, neither counted nor cleared.
+    fn record_password_check(
+        &mut self,
+        peer: &str,
+        outcome: Result<(), AuthenticationError>,
+    ) -> Result<(), AuthenticationError> {
+        self.ban_patrol.patrole_ban(peer)?;
+        match outcome {
+            Ok(()) => {
+                self.ban_patrol.clear_penalties(peer);
+                Ok(())
+            }
+            Err(AuthenticationError::IncorrectCredentials) => Err(self
+                .ban_patrol
+                .penalize(peer)
+                .err()
+                .unwrap_or(AuthenticationError::IncorrectCredentials)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Authorise a request and say who it is, all under one borrow.
+    ///
+    /// The handler runs [`Self::begin_authorization`] and
+    /// [`Self::finish_basic`] itself, with the password check between them
+    /// outside the lock. Only the tests use this.
+    #[cfg(test)]
+    pub async fn authorize_request(
+        &mut self,
+        peer: &str,
+        http_authorization_line: &str,
+    ) -> Result<Actor, SchemedAuthError> {
+        match self
+            .begin_authorization(peer, http_authorization_line)
+            .await?
+        {
+            PendingAuthorization::Decided(actor) => Ok(actor),
+            PendingAuthorization::Password {
+                username,
+                password,
+                hash,
+            } => self.finish_basic(peer, username, P::validate(&hash, &password)),
+        }
+    }
+
+    pub fn credentials_from_body(body: &[u8]) -> Result<(String, String), AuthenticationError> {
+        let credentials = serde_json::from_slice::<Login>(body)?;
+        Ok((credentials.username, credentials.password))
+    }
+
+    /// The stored hash for `username`, after the ban check.
+    ///
+    /// An unknown user is penalised here. The password check itself is the
+    /// caller's, so `sha512_crypt` does not run while the authentication
+    /// mutex is held.
+    pub fn password_hash(
+        &mut self,
+        peer: &str,
+        username: &str,
+    ) -> Result<String, AuthenticationError> {
+        self.ban_patrol.patrole_ban(peer)?;
+        match self.passwds.get(username) {
+            Some(hash) => Ok(hash.clone()),
+            None => Err(self
+                .ban_patrol
+                .penalize(peer)
+                .err()
+                .unwrap_or(AuthenticationError::IncorrectCredentials)),
+        }
+    }
+
+    /// Records the password result and, on success, inserts the session.
+    ///
+    /// Called again under the mutex after the password check has finished.
+    /// A check that could not run is reported and not counted as a guess.
+    pub async fn establish_session(
+        &mut self,
+        peer: &str,
+        username: String,
+        outcome: Result<(), AuthenticationError>,
+    ) -> Result<Session, AuthenticationError> {
+        self.record_password_check(peer, outcome)?;
 
         let token: String = rng()
             .sample_iter(&Alphanumeric)
             .take(64)
             .map(char::from)
             .collect();
-        self.new_and_remove_expired_tokens(token.clone(), credentials.username.clone())
+        self.new_and_remove_expired_tokens(token.clone(), username.clone())
             .await;
 
         Ok(Session {
@@ -216,9 +296,36 @@ where
             // the token.
             name: "User Session".to_string(),
             description: "User Session".to_string(),
-            username: credentials.username,
+            username,
         })
     }
+
+    /// The three login steps in one call, without the lock release between
+    /// them. Only the tests use it; the handler runs the steps itself.
+    #[cfg(test)]
+    pub async fn authenticate_request(
+        &mut self,
+        peer: &str,
+        body: &[u8],
+    ) -> Result<Session, AuthenticationError> {
+        let (username, password) = Self::credentials_from_body(body)?;
+        let hash = self.password_hash(peer, &username)?;
+        let outcome = P::validate(&hash, &password);
+        self.establish_session(peer, username, outcome).await
+    }
+}
+
+/// What [`AuthenticationContext::begin_authorization`] left to do.
+pub enum PendingAuthorization {
+    /// Decided under the lock (a bearer token).
+    Decided(Actor),
+    /// A Basic credential whose password is still to be checked, outside the
+    /// lock.
+    Password {
+        username: String,
+        password: String,
+        hash: String,
+    },
 }
 
 /// Who a request is, for the audit line.
