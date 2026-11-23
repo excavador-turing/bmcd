@@ -10,6 +10,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A CM5 can be flashed.** A module whose ROM answers as `0a5c:2712` (BCM2712)
+  used to time out with "the module's USB boot device ... did not appear":
+  only the BCM2711's `0a5c:2711` was recognised, and `rustpiboot` knows no
+  BCM2712. The new `rpiboot-2712` backend speaks Raspberry Pi's `usbboot`
+  protocol itself: `bootcode5.bin` to the ROM, then a file server that looks up
+  what the bootloader asks for instead of answering with one embedded file.
+  The module boots a ramdisk that exports its eMMC as USB mass storage, which
+  is found as SCSI vendor `mmcblk0` on the node's port. Flashing and
+  `advanced msd` both work this way. The module is followed through each
+  re-enumeration by its port chain, never by bus or by "the first BCM2712".
+- **`tools/cm5-payload`** builds and installs what a CM5 boots, from
+  Raspberry Pi's `usbboot` at a pinned commit, checked by sha256, with a
+  ramdisk of Debian's static busybox rebuilt around a small `init`. It is
+  about 12 MB, too much for the firmware image, so it lives on the overlay at
+  `/mnt/overlay/rpiboot-2712`. Without it a CM5 flash fails naming the missing
+  files; a CM4 needs none of it. Verified on a v2.4 board: two CM5s flashed,
+  eMMC exposed 14 s after power-on.
+
+### Changed
+
+- **The boot device timeout names `0a5c:2712`** alongside the Rockchip and
+  BCM2711 IDs.
+
 ## [2.47.0] — 2026-11-21
 
 The daemon reads the latch shadow word from the kernel's sysfs attributes, and

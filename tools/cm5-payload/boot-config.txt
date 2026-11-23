@@ -1,0 +1,18 @@
+# config.txt inside boot.img, read by the CM5 bootloader once it has loaded
+# the image as a ramdisk. Upstream's, less everything that is not a BCM2712.
+[all]
+kernel=kernel8.img
+initramfs rootfs.cpio.zst
+enable_uart=1
+uart_2ndstage=1
+disable_overscan=1
+dtoverlay=dwc2,dr_mode=peripheral
+# The console on GPIO14/15, where a carrier board such as the Turing Pi wires
+# the node's UART; on a BCM2712 serial0 is otherwise the debug UART.
+dtparam=uart0=on
+dtparam=uart0_console
+
+[pi5]
+arm_freq=500
+gpu_freq=500
+dtparam=pciex1

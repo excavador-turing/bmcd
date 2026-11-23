@@ -13,8 +13,9 @@
 // limitations under the License.
 mod rockusb;
 mod rpiboot;
+mod rpiboot_2712;
 pub mod topology;
-use self::{rockusb::RockusbBoot, rpiboot::RpiBoot};
+use self::{rockusb::RockusbBoot, rpiboot::RpiBoot, rpiboot_2712::RpiBoot2712};
 use crate::hal::NodeId;
 use async_trait::async_trait;
 use rusb::GlobalContext;
@@ -86,7 +87,11 @@ impl NodeDrivers {
         }
 
         NodeDrivers {
-            backends: vec![Box::new(RpiBoot {}), Box::new(RockusbBoot {})],
+            backends: vec![
+                Box::new(RpiBoot {}),
+                Box::new(RpiBoot2712::new()),
+                Box::new(RockusbBoot {}),
+            ],
             topology,
         }
     }
@@ -244,7 +249,7 @@ fn timeout_message(node: u8, waited: Duration, others: &[String]) -> String {
         format!("{} ms", waited.as_millis())
     };
     let head = format!(
-        "node {node}: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+        "node {node}: the module's USB boot device (Rockchip 2207:350b, Raspberry Pi 0a5c:2711 or 0a5c:2712) \
          did not appear within {waited}"
     );
     if others.is_empty() {
@@ -480,7 +485,7 @@ mod wait_tests {
         let m = e.to_string();
         assert_eq!(
             m,
-            "node 2: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+            "node 2: the module's USB boot device (Rockchip 2207:350b, Raspberry Pi 0a5c:2711 or 0a5c:2712) \
              did not appear within 20 ms; other USB devices present: 1a86:7523. If one of them is a \
              device in the node's mini-PCIe slot (nodes 1 and 2), it shares the USB lines used \
              for flashing; remove it and retry"
@@ -503,7 +508,7 @@ mod wait_tests {
         .unwrap_err();
         assert_eq!(
             e.to_string(),
-            "node 3: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+            "node 3: the module's USB boot device (Rockchip 2207:350b, Raspberry Pi 0a5c:2711 or 0a5c:2712) \
              did not appear within 5 ms"
         );
     }

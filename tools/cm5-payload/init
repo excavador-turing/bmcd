@@ -1,0 +1,79 @@
+#!/bin/sh
+# PID 1 of the CM5 flashing ramdisk: export the module's storage over USB as
+# mass storage, the way Raspberry Pi's mass-storage-gadget64 does, without the
+# systemd, LVM and flashrom that make that ramdisk 55 MB.
+#
+# Each LUN's inquiry string is the kernel's device name, so the BMC sees the
+# eMMC as SCSI vendor "mmcblk0" -- which is what bmcd looks for.
+export PATH=/bin
+
+# Into the kernel log as well as the console: printk reaches the UART
+# synchronously, so the last line said survives a panic.
+say() {
+    echo "cm5-payload: $*"
+    echo "cm5-payload: $*" > /dev/kmsg
+}
+say "init started"
+
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t configfs configfs /sys/kernel/config
+
+for m in dwc2 libcomposite usb_f_mass_storage; do
+    insmod "/lib/modules/$m.ko" || say "insmod $m failed"
+done
+
+n=0
+while [ ! -b /dev/mmcblk0 ] && [ ! -b /dev/nvme0n1 ] && [ "$n" -lt 30 ]; do
+    say "waiting for storage (${n}s)"
+    sleep 1
+    n=$((n + 1))
+done
+
+g=/sys/kernel/config/usb_gadget/cm5
+mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409"
+echo 0x0a5c > "$g/idVendor"
+echo 0x0104 > "$g/idProduct"
+echo 0x0100 > "$g/bcdDevice"
+echo 0x0200 > "$g/bcdUSB"
+serial=$(sed -n 's/^Serial[[:space:]]*: *//p' /proc/cpuinfo)
+echo "${serial:-0}" > "$g/strings/0x409/serialnumber"
+echo "Raspberry Pi" > "$g/strings/0x409/manufacturer"
+echo "CM5 storage (bmcd)" > "$g/strings/0x409/product"
+echo "MSD" > "$g/configs/c.1/strings/0x409/configuration"
+echo 250 > "$g/configs/c.1/MaxPower"
+
+id=0
+for dev in mmcblk0 nvme0n1; do
+    [ -b "/dev/$dev" ] || continue
+    f="$g/functions/mass_storage.usb$id"
+    mkdir -p "$f"
+    echo 1 > "$f/stall"
+    echo 0 > "$f/lun.0/cdrom"
+    echo 0 > "$f/lun.0/ro"
+    echo 0 > "$f/lun.0/nofua"
+    echo "/dev/$dev" > "$f/lun.0/file"
+    echo "$dev" > "$f/lun.0/inquiry_string"
+    ln -s "$f" "$g/configs/c.1/"
+    say "exporting /dev/$dev"
+    id=$((id + 1))
+done
+[ "$id" -gt 0 ] || say "no storage found; the BMC will time out"
+
+n=0
+udc=
+while [ -z "$udc" ] && [ "$n" -lt 15 ]; do
+    udc=$(ls /sys/class/udc 2>/dev/null)
+    [ -n "$udc" ] || sleep 1
+    n=$((n + 1))
+done
+if [ -n "$udc" ]; then
+    echo "$udc" > "$g/UDC"
+    say "bound to $udc"
+else
+    say "no USB device controller appeared"
+fi
+
+while :; do sleep 3600; done
