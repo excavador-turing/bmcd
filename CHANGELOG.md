@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.50.2] — 2026-11-24
+
+A security release: the serial console WebSocket refuses a handshake opened from
+another site. Found in our own review of 2.50.1.
+
 ### Security
 
 - **The serial console WebSocket refuses a handshake opened from another
