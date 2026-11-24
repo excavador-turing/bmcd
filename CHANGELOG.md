@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.49.0] — 2026-11-24
+
+The release that ends the transition 2.48.0 began: a state change over GET is
+refused whatever the credential, so the clients (`tpi` 2.0, BMC-UI 4.8.0) must
+be on POST first. It also sends a Content-Security-Policy with the web
+interface, and records two dependency decisions.
+
+Thanks to Daniel Steinhauf ([@danste22](https://github.com/danste22)) for
+BMC-Firmware#109 and its fix (#73, carried by #83, his commit is in the history
+under his name), and for the review that found the rest (BMC-Firmware#93,
+#99).
+
 ### Breaking changes
 
 - **Every state change over GET is refused, whatever the credential.** 2.48.0
@@ -20,7 +32,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The backup, the cancel and the transfer are routed on POST only, and the
   OpenAPI document no longer lists their GET forms. A workstation `tpi` must be
   2.0 or newer, a separately served BMC-UI must be 4.8.0 or newer, and scripts
-  must use `curl -X POST`. (#73, carried by its replacement pull request;
+  must use `curl -X POST`. (#73, carried by #83;
   BMC-Firmware#109, found by Daniel Steinhauf
   ([@danste22](https://github.com/danste22)), who also wrote the fix.)
 
@@ -35,7 +47,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of reach: the newest actix-web (4.20.0) still requires `cookie ^0.16`. To be
   revisited when an actix-web release moves to a fixed cookie. Found by the
   weekly advisories job that Daniel Steinhauf ([@danste22](https://github.com/danste22))
-  asked for in BMC-Firmware#93.
+  asked for in BMC-Firmware#93. (#80)
 - **The interface is served with a script-restricting Content-Security-Policy.**
   The UI responses carried only `frame-ancestors 'none'`; they now send
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
@@ -52,9 +64,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   interface is served by a fleet pod, that pod's policy governs the page and
   the board only answers API calls, which a CSP does not restrict. A custom
   `www` bundle that needs more (an external host, an inline script) has to be
-  built to this policy. Refs BMC-Firmware#99; found in the review by Daniel
-  Steinhauf ([@danste22](https://github.com/danste22)).
-- bincode 1 stays for `bmcd.bin`, on purpose: see `deny.toml` (RUSTSEC-2025-0141).
+  built to this policy. (#81, BMC-Firmware#99; found in the review by Daniel
+  Steinhauf ([@danste22](https://github.com/danste22)).)
+- **bincode 1 stays for `bmcd.bin`, on purpose:** see `deny.toml`
+  (RUSTSEC-2025-0141). (#82)
 
 ## [2.48.0] — 2026-11-24
 
