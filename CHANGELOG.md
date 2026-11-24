@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.50.1] — 2026-11-24
+
+A security release: a percent-encoded path could get past the refusal of a
+state change over `GET`/`HEAD` and the cross-site refusal (BMC-Firmware#132),
+and `bmcd.bin` was renamed into place without a flush (BMC-Firmware#130). Both
+were reported by adberger ([@adberger](https://github.com/adberger)), who found
+them with a deterministic simulation test of the board and by reading the code.
+Thank you.
+
 ### Security
 
 - **A percent-encoded path no longer slips past the GET and cross-site
