@@ -83,10 +83,6 @@ impl NodeId {
     pub fn to_bitfield(self) -> u8 {
         1 << self as u8
     }
-
-    pub fn to_inverse_bitfield(self) -> u8 {
-        0b1111 & !(1 << self as u8)
-    }
 }
 
 impl Display for NodeId {
