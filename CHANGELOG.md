@@ -10,6 +10,137 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.48.0] — 2026-11-24
+
+A security release. It carries the fixes from a review of the BMC's web and
+command interface, and several of them change what a client may send, so read
+the breaking changes before updating a board that scripts or older clients
+talk to.
+
+Thanks to Daniel Steinhauf ([@danste22](https://github.com/danste22)) for a
+careful security review of the BMC (BMC-Firmware#88–#101, #109, #110, #112) and
+for the fixes in this release: #64, #65, #66, #70 (merged through #76), #71
+(through #78), #72 (through #77) and #74. His commits are in the history under
+his name.
+
+### Breaking changes
+
+- **A firmware file name must be one safe path component.** For
+  `type=firmware`, a `file` outside `[A-Za-z0-9._-]` (a space, brackets, a
+  slash, `;`) or `.` or `..` is refused with 400 before anything is written;
+  a second browser download named `tp2-bmc-firmware (1).tpu` has to be renamed
+  first. A node flash never uses the name as a path, so `image (1).img` is
+  still accepted there. (#64, BMC-Firmware#88)
+- **The login body is capped.** `POST /api/bmc/authenticate` with a body over
+  4 KiB answers 413, and one that is not complete within 5 seconds answers
+  408. (#65, BMC-Firmware#89)
+- **A state change over GET needs a Bearer token, and is refused otherwise.**
+  Every `opt=set` type on `/api/bmc`, the upload cancel and the backup are
+  state changes, and they are POST now. Their GET forms are still served for
+  one more release, but only with an `Authorization: Bearer` header, so that
+  older `tpi` and BMC-UI keep working; with Basic or with no credential they
+  answer 405 with `Allow: POST`. Scripts should use `curl -X POST`. The GET
+  forms go in a later release, once the clients send POST. (#72 through #77,
+  BMC-Firmware#99)
+- **Scripts on the board need the local token.** The loopback exemption is
+  gone: a request from `127.0.0.1` with no credential answers 401 like any
+  other. At every start the daemon writes a 64-character token to
+  `/run/bmcd/local-token` (directory 0700, file 0600) and accepts it as a
+  Bearer token from a loopback peer only. It does not expire, a password
+  change does not drop it, and a restart replaces it:
+  `Authorization: Bearer $(cat /run/bmcd/local-token)`. The `tpi` on the board
+  does this from the matching `tpi` release.
+- **Basic is refused on a browser's request.** A request that carries
+  `Origin`, `Referer` or any `Sec-Fetch-*` header is refused when it
+  authenticates with Basic: use the login form (Bearer).
+- **A cross-site state change answers 403.** A state change whose
+  `Sec-Fetch-Site` is `cross-site` or `same-site` is refused, whatever the
+  credential.
+- **A password change ends every session, the caller's included.** BMC-UI
+  tabs and cached `tpi` tokens sign in again with the new password. (The code
+  already did this; the API text said sessions keep working.) The new
+  `POST /api/bmc/logout` revokes just the token that sends it.
+- **A backup no longer holds secrets.** It leaves out `etc/shadow`,
+  `etc/shadow-`, `etc/gshadow*`, every `.pem` or `*key*` under `etc/ssl`, and
+  the SSH host keys (`etc/ssh/ssh_host_*`, everything under `etc/dropbear/`).
+  A restore only writes what the archive holds, so the board it goes back onto
+  keeps its own password, certificate and host keys. A failure part-way now
+  aborts the download instead of ending a short archive behind a 200.
+- **HTTP/2 is gone.** The listener spoke HTTP/1.1 only in practice (ALPN never
+  selected h2), and now the HTTP/2 code is not in the daemon. Browsers and
+  `curl` are unaffected; a client that forces h2
+  (`curl --http2-prior-knowledge`) fails. (#71 through #78, BMC-Firmware#93)
+- **A flash starts about one second later.** A node that was running is now
+  held off for one second before it is switched on to flash, the time a reset
+  already waits; a node that had not powered down in a fraction of a second
+  never read the USB boot pin, and the flash failed with "USB boot device did
+  not appear". (#74, BMC-Firmware#112)
+
+### Security
+
+- **A caller-chosen firmware name no longer reaches a shell.** It was joined
+  onto the staging directory and interpolated into `sh -c`, so an absolute
+  path or `../` wrote outside it and shell characters in a URL's last segment
+  became part of the command. `osupdate` now runs with the path as one argument
+  and no shell. (#64, BMC-Firmware#88)
+- **Logging in no longer holds the one authentication lock while the body is
+  read or the password is hashed.** The login handler held it across an
+  unbounded read and a `sha512_crypt`; the body is now read first (see the
+  cap above), the hash is checked on the blocking pool without the lock, and
+  the lock is taken again only to update the session map. Basic is split the
+  same way, and the middleware no longer holds the lock while the route runs.
+  A stored hash that `crypt` cannot read is a check failure, not a wrong
+  password. (#65, BMC-Firmware#89)
+- **A page on another site can no longer change the board through the
+  browser's stored Basic credentials**, and the UI responses send
+  `frame-ancestors 'none'`, `nosniff` and `X-Frame-Options: DENY`.
+  (#72 through #77, BMC-Firmware#99)
+- **The serial history is off the unsound ring buffer.** `circular-buffer` 0.1
+  can leave its pointers on uninitialised memory if a drop panics; the serial
+  log uses the 2.0 fixed buffer. `humantime` (unmaintained, RUSTSEC-2026-0542)
+  is replaced by a small formatter, and the lockfile is refreshed inside the
+  current requirements, so the patched crates are in. (#71 through #78,
+  #66; BMC-Firmware#93, #91)
+
+### Fixed
+
+- **A switch command no longer blocks a worker, and a client that goes away
+  mid-change no longer lets the next one interleave.** `ip` and `bridge` ran
+  on an async worker while the switch lock was held; they now run on a blocking
+  thread, and the lock is not held across the wait. The turn that makes switch
+  changes one at a time now travels with the commands rather than with the
+  request: when a client disconnected in the middle of an apply or a revert,
+  the turn was released while the commands kept running, the next change
+  could interleave, and the running configuration was never recorded. Now the
+  change finishes and records itself, and the next one waits. Reading the switch
+  back from the kernel after a failed apply also runs on a blocking thread.
+  (#70 through #76, BMC-Firmware#96)
+- **A firmware copy that stops deletes its staging directory.** (#76)
+- **The shadow watcher no longer panics or stops.** When the file is replaced
+  or the watch fails it builds the watch again with backoff and reloads, so
+  password changes keep being noticed. (#76)
+- **A persistency value that cannot be read or written is an error the API
+  reports**, instead of a panic or a silent default; only the console speeds at
+  startup fall back to 115200, with the error logged. (#76)
+
+### Changed
+
+- **CI reports advisories on their own.** `cargo deny check advisories` runs
+  in a job of its own that reports and does not block pull requests, plus a
+  weekly run on `hive` that does fail, so a new RUSTSEC entry no longer turns
+  every pull request red. `deny.toml` lists the advisories that are known,
+  each with its reason (actix-files RUSTSEC-2026-0443, Windows short names
+  only; bincode RUSTSEC-2025-0141, waiting for a reader of the existing
+  `bmcd.bin`; chrono RUSTSEC-2026-0543, unmaintained, not vulnerable). (#78)
+- **The release profile is fat LTO with one codegen unit** (it was thin LTO
+  with 16), which makes the armv7 binary about 21 % smaller (11,185,280 to
+  8,777,724 bytes, stripped). Buildroot overrides the release profile for every
+  cargo package (`CARGO_PROFILE_RELEASE_LTO=false`, 16 codegen units,
+  `opt-level` 2), so the board image does not get the smaller binary from this
+  change; that needs a separate firmware change. (#78)
+- **The tests use `tempfile` instead of `tempdir`**, which also drops
+  `remove_dir_all` from the dependency tree. (#78)
+
 ## [2.47.0] — 2026-11-21
 
 The daemon reads the latch shadow word from the kernel's sysfs attributes, and
