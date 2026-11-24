@@ -1599,7 +1599,7 @@ mod test {
 
     #[test]
     fn a_backup_omits_hashes_and_keys_and_keeps_links() {
-        let root = tempdir::TempDir::new("overlay").unwrap();
+        let root = tempfile::TempDir::with_prefix("overlay").unwrap();
         let etc = root.path().join("etc");
         let certs = etc.join("ssl/certs");
         let private = etc.join("ssl/private");
@@ -1661,7 +1661,7 @@ mod test {
 
     #[tokio::test]
     async fn a_backup_that_succeeds_is_a_complete_gzip() {
-        let root = tempdir::TempDir::new("overlay-ok").unwrap();
+        let root = tempfile::TempDir::with_prefix("overlay-ok").unwrap();
         std::fs::write(root.path().join("hostname"), "bmc").unwrap();
         let items: Vec<_> = backup_stream(root.path().to_path_buf()).collect().await;
         let mut gz = Vec::new();

@@ -2138,7 +2138,7 @@ mod tests {
     /// worker would hang the test at the gate instead of failing it.
     #[tokio::test]
     async fn a_change_whose_request_is_dropped_still_finishes_before_the_next_one_starts() {
-        let dir = tempdir::TempDir::new("switch-dropped-request").expect("temp dir");
+        let dir = tempfile::TempDir::with_prefix("switch-dropped-request").expect("temp dir");
         let gate = GateExec::new();
         let service = Arc::new(
             SwitchService::load(dir.path().join("switch.json"))
