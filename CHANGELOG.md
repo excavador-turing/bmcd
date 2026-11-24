@@ -10,6 +10,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`sha2`, `crc` and `crc32fast` are built at `opt-level = 3`.** The release
+  profile stays `"z"` (size) for everything else; these three crates run the
+  per-byte loops of a flash (the SHA-256 of the image as it streams in, the
+  CRC-64 of what is written to the node, the CRC-32 of the board information
+  EEPROM), where size-optimised code is slowest, and cost a few KB at level 3. Suggested by Daniel Steinhauf
+  ([@danste22](https://github.com/danste22)) in BMC-Firmware#93. Since
+  BMC-Firmware#117 the firmware build leaves this profile alone, so it is what
+  reaches the board. (BMC-Firmware#93)
+- **The RK1 flash path uses `rockusb` 0.4.** `rockusb` 0.2.0 to 0.4.0, the
+  library that puts an RK1 (RK3588) into USB download mode and loads its SPL
+  loader before the eMMC is written; the bytes sent to the board are the same.
+  Written by Daniel Steinhauf ([@danste22](https://github.com/danste22)) in
+  [#85](https://github.com/excavador-turing/bmcd/pull/85), who flashed an RK1
+  three times with it (step 3 of BMC-Firmware#93). New in the lock:
+  `maybe-async-cfg` and the proc-macro crates it builds with (`manyhow`,
+  `proc-macro-utils`, `pulldown-cmark`, `syn` 1), and `strum` 0.28; `thiserror`
+  1 goes. All come from crates.io and passed `cargo deny`.
+
 ## [2.49.0] — 2026-11-24
 
 The release that ends the transition 2.48.0 began: a state change over GET is
