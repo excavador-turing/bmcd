@@ -11,9 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::hal::{helpers::bit_iterator, NodeId};
+use crate::hal::helpers::bit_iterator;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use tokio::time::sleep;
 use tracing::debug;
 
 /// Simulated counterpart of [`crate::hal::PowerController`].
@@ -30,9 +29,6 @@ use tracing::debug;
 /// * `power_led()` and `status_led()` record the requested state and are
 ///   readable back through [`PowerController::simulated_leds`]. Nothing is
 ///   written to `/sys/class/leds`.
-/// * `reset_node()` goes through the same off/on sequence as the real
-///   controller, including the one-second wait, so a caller that races it
-///   races it the same way here.
 ///
 /// There is no fabricated telemetry anywhere in this file: every value a
 /// caller can read back is one this process was told to set.
@@ -80,17 +76,6 @@ impl PowerController {
     /// only report what this process has set since it started.
     pub fn get_power_node(&self) -> anyhow::Result<u8> {
         Ok(self.enable.load(Ordering::SeqCst))
-    }
-
-    /// Reset a given node by setting the reset pin logically high for 1 second
-    pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
-        debug!("stub: reset node {:?}", node);
-        let bits = node.to_bitfield();
-
-        self.set_power_node(0u8, bits).await?;
-        sleep(crate::hal::POWER_OFF_SETTLE).await;
-        self.set_power_node(bits, bits).await?;
-        Ok(())
     }
 
     pub async fn power_led(&self, on: bool) -> anyhow::Result<()> {

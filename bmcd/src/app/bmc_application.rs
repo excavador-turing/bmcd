@@ -32,7 +32,7 @@ use std::ffi::c_ulong;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -236,11 +236,56 @@ fn power_transition(activated_nodes: u8, idx: usize, new_state: u8) -> Option<bo
     (new_state != current_state).then_some(new_state == 1)
 }
 
+/// The keys of the daemon's store, with the values a board that has never run
+/// it starts from.
+fn persistency_builder() -> PersistencyBuilder {
+    PersistencyBuilder::default()
+        .register_key(ACTIVATED_NODES_KEY, &0u8)
+        .register_key(USB_CONFIG, &UsbConfig::UsbA(NodeId::Node1))
+        .register_key(NODE_INFO_KEY, &NodeInfos::default())
+        .register_key(NODE1_USB_MODE, &false)
+        .register_key(
+            COOLING_DEVICES,
+            &CoolingMap::with_capacity(COOLING_CAPACITY),
+        )
+}
+
+/// A reset of a node that is off. A caller's mistake, answered as a 409: the
+/// node's state does not allow it, and the message says what to do. Decided
+/// by this type and not by reading the message.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{0} is off, so there is nothing to reset; switch it on first")]
+pub struct NodeIsOff(pub NodeId);
+
+/// What [`BmcApplication::power_off_for_cycle`] hands back: the node, and how
+/// many times anything had set its power by then. Spent by
+/// [`BmcApplication::power_on_unless_changed`], which switches the node back
+/// on only when the count is still the same.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerTicket {
+    node: NodeId,
+    epoch: u64,
+}
+
 pub struct BmcApplication {
     pub(super) pin_controller: PinController,
     pub(super) power_controller: PowerController,
     pub(super) app_db: ApplicationPersistency,
     node_drivers: NodeDrivers,
+    /// Serialises every change of node power: the stored state and the rails
+    /// are written together under it, so two requests cannot interleave and
+    /// leave the state saying one thing and the rails doing another. It is held
+    /// for the writes of one change only, never while waiting out
+    /// [`Self::power_settle`].
+    power_lock: tokio::sync::Mutex<()>,
+    /// How many times each node's power has been set, one counter per node.
+    /// Bumped under `power_lock` by every request that names the node, so a
+    /// sequence that switches a node off, waits, and switches it on (a reset,
+    /// the end of a flash) can tell whether anybody else touched the node while
+    /// it waited. Never held across an `.await`.
+    power_epochs: std::sync::Mutex<[u64; 4]>,
+    /// How long a node stays unpowered in such a sequence.
+    power_settle: Duration,
     /// The console ports, once they are open: a new serial speed is applied
     /// to them as it is stored. Set once by [`Self::attach_serial`].
     serial: OnceLock<Arc<SerialConnections>>,
@@ -252,15 +297,7 @@ impl BmcApplication {
         let is_legacy_dts = matches!(model_string, Ok(model) if model.contains("v2.4"));
         let pin_controller = PinController::new(is_legacy_dts).context("pin_controller")?;
         let power_controller = PowerController::new(is_legacy_dts).context("power_controller")?;
-        let app_db = PersistencyBuilder::default()
-            .register_key(ACTIVATED_NODES_KEY, &0u8)
-            .register_key(USB_CONFIG, &UsbConfig::UsbA(NodeId::Node1))
-            .register_key(NODE_INFO_KEY, &NodeInfos::default())
-            .register_key(NODE1_USB_MODE, &false)
-            .register_key(
-                COOLING_DEVICES,
-                &CoolingMap::with_capacity(COOLING_CAPACITY),
-            )
+        let app_db = persistency_builder()
             .write_timeout(database_write_timeout)
             .build()
             .await?;
@@ -272,11 +309,44 @@ impl BmcApplication {
             power_controller,
             app_db,
             node_drivers,
+            power_lock: tokio::sync::Mutex::new(()),
+            power_epochs: std::sync::Mutex::new([0; 4]),
+            power_settle: crate::hal::POWER_OFF_SETTLE,
             serial: OnceLock::new(),
         };
 
         instance.initialize().await?;
         Ok(instance)
+    }
+
+    /// A daemon on the simulated board, with its store in `dir` and waiting
+    /// `power_settle` between a switch-off and a switch-on. Not `initialize`d:
+    /// that reads sysfs and starts the cooling governor, and a test has the
+    /// power state to itself.
+    #[cfg(all(test, feature = "stubbed"))]
+    pub(crate) async fn for_test(dir: &std::path::Path, power_settle: Duration) -> Self {
+        let app_db = persistency_builder()
+            .build_at(dir.join("bmcd.bin"))
+            .await
+            .expect("a store in a temporary directory");
+        Self {
+            pin_controller: PinController::new(false).expect("stub pin controller"),
+            power_controller: PowerController::new(false).expect("stub power controller"),
+            app_db,
+            node_drivers: NodeDrivers::new(),
+            power_lock: tokio::sync::Mutex::new(()),
+            power_epochs: std::sync::Mutex::new([0; 4]),
+            power_settle,
+            serial: OnceLock::new(),
+        }
+    }
+
+    /// The rails of the simulated board, as `get_power_node` reads them.
+    #[cfg(all(test, feature = "stubbed"))]
+    pub(crate) fn rails(&self) -> u8 {
+        self.power_controller
+            .get_power_node()
+            .expect("the stub reads back")
     }
 
     /// toggles the power state of the nodes. When `inverse_toggle` == true, and
@@ -299,6 +369,9 @@ impl BmcApplication {
     /// returns Err(e) on an internal gpio error or when there is an error
     /// writing power LED status.
     pub async fn toggle_power_states(&self, inverse_toggle: bool) -> anyhow::Result<()> {
+        // The state is read and written under one hold of the lock, so a
+        // request that lands in between cannot be toggled over.
+        let _power = self.power_lock.lock().await;
         let node_values = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
 
         let mut on = node_values == 0;
@@ -307,7 +380,7 @@ impl BmcApplication {
         }
 
         let node_values = if on { 0b1111 } else { 0b0000 };
-        self.activate_slot(node_values, 0b1111).await
+        self.activate_slot_locked(node_values, 0b1111).await
     }
 
     async fn initialize(&self) -> anyhow::Result<()> {
@@ -421,12 +494,19 @@ impl BmcApplication {
     /// module is inserted at that slot. Failing to call this method means that
     /// this slot is not considered for power up and power down commands.
     pub async fn activate_slot(&self, node_states: u8, mask: u8) -> anyhow::Result<()> {
+        let _power = self.power_lock.lock().await;
+        self.activate_slot_locked(node_states, mask).await
+    }
+
+    /// [`Self::activate_slot`] for a caller that already holds `power_lock`.
+    async fn activate_slot_locked(&self, node_states: u8, mask: u8) -> anyhow::Result<()> {
         trace!(
             "activate slot. node_states={:#06b}, mask={:#06b}",
             node_states,
             mask
         );
         ensure!(mask != 0);
+        self.count_power_request(mask);
 
         let state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
         let new_state = (state & !mask) | (node_states & mask);
@@ -448,6 +528,72 @@ impl BmcApplication {
         self.power_controller
             .set_power_node(node_states, mask)
             .await
+    }
+
+    /// Counts one request against every node in `mask`, whether or not it
+    /// changes what the node is doing: a power-off for a node that is already
+    /// off still says what the caller wants, and has to cancel a switch-on that
+    /// is waiting.
+    fn count_power_request(&self, mask: u8) {
+        let mut epochs = self
+            .power_epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (idx, epoch) in epochs.iter_mut().enumerate() {
+            if mask & (1 << idx) != 0 {
+                *epoch = epoch.wrapping_add(1);
+            }
+        }
+    }
+
+    fn power_epoch(&self, node: NodeId) -> u64 {
+        self.power_epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[node as usize]
+    }
+
+    /// Switches `node` off, through the same path as a power request, and
+    /// returns the ticket that [`Self::power_on_unless_changed`] needs to
+    /// switch it on again.
+    pub async fn power_off_for_cycle(&self, node: NodeId) -> anyhow::Result<PowerTicket> {
+        let _power = self.power_lock.lock().await;
+        self.power_off_locked(node).await
+    }
+
+    async fn power_off_locked(&self, node: NodeId) -> anyhow::Result<PowerTicket> {
+        self.activate_slot_locked(0, node.to_bitfield()).await?;
+        Ok(PowerTicket {
+            node,
+            epoch: self.power_epoch(node),
+        })
+    }
+
+    /// Waits out the settle time, then [`Self::power_on_unless_changed`]. The
+    /// wait holds no lock.
+    pub async fn power_on_after_settle(&self, ticket: PowerTicket) -> anyhow::Result<bool> {
+        sleep(self.power_settle).await;
+        self.power_on_unless_changed(ticket).await
+    }
+
+    /// Switches the node of `ticket` back on, unless something else has set its
+    /// power since the ticket was issued: a power-off that arrived while it
+    /// waited stays the last word, and so does a power-on, which has already
+    /// done it.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` when the node was switched on, `Ok(false)` when it was left
+    /// as the other request set it.
+    pub async fn power_on_unless_changed(&self, ticket: PowerTicket) -> anyhow::Result<bool> {
+        let bit = ticket.node.to_bitfield();
+        // The check and the switch-on are one hold of the lock. A power-off
+        // that comes after it is applied after the rails are on, and wins.
+        let _power = self.power_lock.lock().await;
+        if self.power_epoch(ticket.node) != ticket.epoch {
+            return Ok(false);
+        }
+        self.activate_slot_locked(bit, bit).await?;
+        Ok(true)
     }
 
     #[instrument(skip(self))]
@@ -545,8 +691,33 @@ impl BmcApplication {
         Ok(())
     }
 
+    /// Resets a node: off, [`Self::power_settle`] without power, on.
+    ///
+    /// Both switches go through the same path and the same lock as a request to
+    /// switch the node, so the power the API reports is what the rails do: the
+    /// node reads off while it is held off, and on again when it is back. The
+    /// lock is not held while waiting, so a power request is not delayed by a
+    /// reset; one that names this node cancels the switch-on that is waiting,
+    /// and a power-off therefore leaves the node off.
+    ///
+    /// A node that is off is refused with [`NodeIsOff`]: there is nothing to
+    /// reset, and switching it on would be a power-on the caller did not ask
+    /// for.
     pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
-        self.power_controller.reset_node(node).await
+        debug!("reset node {:?}", node);
+        // The check and the switch-off are one hold of the lock.
+        let ticket = {
+            let _power = self.power_lock.lock().await;
+            if !self.get_node_power(node).await? {
+                return Err(NodeIsOff(node).into());
+            }
+            self.power_off_locked(node).await?
+        };
+
+        if !self.power_on_after_settle(ticket).await? {
+            info!("reset of {node}: its power was set meanwhile, left as that request set it");
+        }
+        Ok(())
     }
 
     pub async fn node_in_msd(&self, node: NodeId) -> anyhow::Result<PathBuf> {
@@ -586,7 +757,7 @@ impl BmcApplication {
         self.configure_usb_internal(config).await?;
         // A node that was running needs this long without power to come back
         // up from cold, and only a cold boot reads the USB boot pin.
-        tokio::time::sleep(crate::hal::POWER_OFF_SETTLE).await;
+        tokio::time::sleep(self.power_settle).await;
 
         tracing::info!("Powering on...");
         self.activate_slot(node.to_bitfield(), node.to_bitfield())
@@ -934,5 +1105,167 @@ mod tests {
         assert_eq!(powered_nodes(0b0000), Vec::<usize>::new());
         assert_eq!(powered_nodes(0b1010), vec![2, 4]);
         assert_eq!(powered_nodes(0b1111), vec![1, 2, 3, 4]);
+    }
+}
+
+/// The power paths on the simulated board. They need the `stubbed` HAL: the
+/// real one opens the board's gpio chips.
+#[cfg(all(test, feature = "stubbed"))]
+mod power_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Long enough that a test can look at a node while it is held off, short
+    /// enough that the suite does not wait on it.
+    const SETTLE: Duration = Duration::from_millis(400);
+    /// A point well inside [`SETTLE`].
+    const MID_SETTLE: Duration = Duration::from_millis(100);
+
+    async fn board() -> (Arc<BmcApplication>, TempDir) {
+        let dir = TempDir::with_prefix("bmcd-power").unwrap();
+        let bmc = Arc::new(BmcApplication::for_test(dir.path(), SETTLE).await);
+        (bmc, dir)
+    }
+
+    async fn reported(bmc: &BmcApplication, node: NodeId) -> bool {
+        bmc.get_node_power(node).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reset_of_a_node_that_is_off_is_refused_and_changes_nothing() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b0100, 0b1111).await.unwrap();
+
+        let err = bmc.reset_node(NodeId::Node2).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<NodeIsOff>(), Some(&NodeIsOff(NodeId::Node2)));
+        assert!(!reported(&bmc, NodeId::Node2).await);
+        assert_eq!(bmc.rails(), 0b0100, "the rails are where they were");
+        // and the node that is on was not touched by the refusal.
+        assert!(reported(&bmc, NodeId::Node3).await);
+    }
+
+    #[tokio::test]
+    async fn a_reset_holds_the_node_off_and_reports_it_then_brings_it_back() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node2).await }
+        });
+        tokio::time::sleep(MID_SETTLE).await;
+        assert!(!reported(&bmc, NodeId::Node2).await, "off while held off");
+        assert_eq!(bmc.rails(), 0b1101, "only node 2 is held off");
+
+        reset.await.unwrap().unwrap();
+        assert!(reported(&bmc, NodeId::Node2).await);
+        assert_eq!(bmc.rails(), 0b1111);
+    }
+
+    #[tokio::test]
+    async fn a_power_off_during_a_reset_wins() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node2).await }
+        });
+        tokio::time::sleep(MID_SETTLE).await;
+        // The node already reads off; the request still has to count.
+        bmc.activate_slot(0b0000, 0b0010).await.unwrap();
+
+        reset.await.unwrap().unwrap();
+        assert!(!reported(&bmc, NodeId::Node2).await);
+        assert_eq!(bmc.rails(), 0b1101, "the rail stays off");
+        // The reset did not touch the other nodes.
+        assert!(reported(&bmc, NodeId::Node1).await);
+    }
+
+    #[tokio::test]
+    async fn a_power_off_of_the_whole_board_during_a_reset_wins() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node4).await }
+        });
+        tokio::time::sleep(MID_SETTLE).await;
+        bmc.toggle_power_states(false).await.unwrap();
+
+        reset.await.unwrap().unwrap();
+        assert_eq!(bmc.rails(), 0);
+        assert!(!reported(&bmc, NodeId::Node4).await);
+    }
+
+    #[tokio::test]
+    async fn a_power_on_during_a_reset_ends_with_the_node_on() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b0010, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node2).await }
+        });
+        tokio::time::sleep(MID_SETTLE).await;
+        bmc.activate_slot(0b0010, 0b0010).await.unwrap();
+        assert_eq!(bmc.rails(), 0b0010, "switched on at once, not after the wait");
+
+        reset.await.unwrap().unwrap();
+        assert!(reported(&bmc, NodeId::Node2).await);
+        assert_eq!(bmc.rails(), 0b0010);
+    }
+
+    #[tokio::test]
+    async fn a_request_for_another_node_does_not_cancel_a_reset() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node2).await }
+        });
+        tokio::time::sleep(MID_SETTLE).await;
+        bmc.activate_slot(0b0000, 0b0100).await.unwrap();
+
+        reset.await.unwrap().unwrap();
+        assert_eq!(bmc.rails(), 0b1011, "node 2 is back, node 3 is off");
+    }
+
+    #[tokio::test]
+    async fn a_power_request_is_not_held_up_by_a_reset() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let reset = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { bmc.reset_node(NodeId::Node1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Nobody holds the lock while the reset waits, so this answers well
+        // before the reset's wait is over.
+        let started = std::time::Instant::now();
+        bmc.activate_slot(0b0000, 0b1000).await.unwrap();
+        assert!(started.elapsed() < SETTLE / 2, "{:?}", started.elapsed());
+
+        reset.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ticket_switches_the_node_on_only_while_nothing_else_touched_it() {
+        let (bmc, _dir) = board().await;
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+
+        let ticket = bmc.power_off_for_cycle(NodeId::Node3).await.unwrap();
+        assert_eq!(bmc.rails(), 0b1011);
+        assert!(bmc.power_on_unless_changed(ticket).await.unwrap());
+        assert_eq!(bmc.rails(), 0b1111);
+
+        let ticket = bmc.power_off_for_cycle(NodeId::Node3).await.unwrap();
+        bmc.activate_slot(0b0000, 0b0100).await.unwrap();
+        assert!(!bmc.power_on_unless_changed(ticket).await.unwrap());
+        assert_eq!(bmc.rails(), 0b1011);
     }
 }

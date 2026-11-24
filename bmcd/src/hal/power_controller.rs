@@ -11,10 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use super::{
-    helpers::{bit_iterator, load_lines},
-    NodeId,
-};
+use super::helpers::{bit_iterator, load_lines};
 use anyhow::Context;
 use gpiod::{Chip, Lines, Options, Output};
 use std::path::{Path, PathBuf};
@@ -192,17 +189,6 @@ impl PowerController {
         }
 
         Ok(node_states)
-    }
-
-    /// Reset a given node by switching it off for [`crate::hal::POWER_OFF_SETTLE`]
-    pub async fn reset_node(&self, node: NodeId) -> anyhow::Result<()> {
-        debug!("reset node {:?}", node);
-        let bits = node.to_bitfield();
-
-        self.set_power_node(0u8, bits).await?;
-        sleep(crate::hal::POWER_OFF_SETTLE).await;
-        self.set_power_node(bits, bits).await?;
-        Ok(())
     }
 
     pub async fn power_led(&self, on: bool) -> anyhow::Result<()> {

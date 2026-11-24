@@ -80,7 +80,7 @@ on the `(type, is_set)` pair. A missing `opt` or `type` is a 400, and so is a
 | `power` | power nodes on and off |
 | `reboot` | reboot the BMC |
 | `reload` | restart the daemon (`/etc/init.d/S94bmcd restart`) |
-| `reset` | pulse a node's reset line |
+| `reset` | switch a node off for a second and on again; 409 when the node is off |
 | `sdcard` | format the card |
 | `uart` | write a line to a node's serial port |
 | `usb` | set USB host/device routing |

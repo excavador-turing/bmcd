@@ -16,7 +16,7 @@ use crate::app::staging_lock::StageLock;
 use crate::hal::{NodeId, UsbRoute};
 use crate::streaming_data_service::data_transfer::DataTransfer;
 use crate::utils::WriteMonitor;
-use anyhow::bail;
+use anyhow::{bail, Context};
 use crc::{Crc, CRC_64_REDIS};
 use humansize::{format_size, DECIMAL};
 use nix::sys::statvfs::{statvfs, FsFlags};
@@ -66,6 +66,12 @@ fn widen<T: Into<u64>>(value: T) -> u64 {
     value.into()
 }
 
+/// Whether a node is switched back on when its flash is over: only when it was
+/// on before, and only when the flash succeeded.
+fn switch_back_on(was_on: bool, flashed: bool) -> bool {
+    was_on && flashed
+}
+
 /// Where a parked image goes, and where the catalogue's `local` source reads.
 /// The two must agree: an image parked anywhere else is invisible.
 const PARK_MOUNT: &str = "/mnt/sdcard";
@@ -107,21 +113,33 @@ impl UpgradeWorker {
 
     /// Logic to program a given OS image to a node. Uses a [`DataTransfer`]
     /// abstraction as source of the image data. The transfer can be interrupted
-    /// at any time when the `CancellationToken` is cancelled. When a transfer
-    /// is interrupted or failed, it will always powers off the Node and
-    /// restores the USB mode equally to a successful flow would.
+    /// at any time when the `CancellationToken` is cancelled.
+    ///
+    /// The node is switched off to flash it. Whatever happens, the USB mode is
+    /// put back as it was. A node that was on before the flash is switched back
+    /// on after a successful one, so it boots the new image; a node that was off
+    /// stays off. After a failed or cancelled flash the node is left off, so a
+    /// half-written image does not boot.
     pub async fn flash_node(
         mut self,
         bmc: Arc<BmcApplication>,
         node: NodeId,
     ) -> anyhow::Result<()> {
+        // Read before anything switches the node off: afterwards the stored
+        // state says what the flash did to it, not what it was doing.
+        let was_on = bmc
+            .get_node_power(node)
+            .await
+            .with_context(|| format!("reading the power state of {node} before the flash"))?;
+
         let device = match bmc.node_in_flash(node, UsbRoute::Bmc, &self.cancel).await {
             Ok(device) => device,
             Err(e) => {
                 // The node was powered and routed for flashing before the
                 // device failed to show up: put it back, and never let a
                 // failure of the cleanup hide why the flash failed.
-                if let Err(c) = Self::restore(&bmc, node).await {
+                tracing::warn!("flashing {node} did not start ({e:#}), leaving it off");
+                if let Err(c) = Self::restore(&bmc, node, false).await {
                     tracing::error!("restoring node {node} after a failed start: {c:#}");
                 }
                 return Err(e);
@@ -148,23 +166,45 @@ impl UpgradeWorker {
         }
         .await;
 
-        if let Ok(()) = result {
-            tracing::info!("Flashing {node} successful, restoring USB & power settings.");
+        let switch_on = switch_back_on(was_on, result.is_ok());
+        match &result {
+            Ok(()) => tracing::info!("Flashing {node} successful, restoring USB & power settings."),
+            Err(e) => {
+                tracing::warn!("flashing {node} failed ({e:#}), restoring USB, leaving it off")
+            }
         }
 
         // disregarding the result, set the BMC in the finalized state.
-        Self::restore(&bmc, node).await?;
+        let switched_on = Self::restore(&bmc, node, switch_on).await?;
+        match (switched_on, switch_on, result.is_ok()) {
+            (true, _, _) => tracing::info!("{node} switched back on: it was on before the flash"),
+            (false, true, _) => tracing::warn!(
+                "{node} left off: its power was set while the flash was being wrapped up"
+            ),
+            (false, false, true) => tracing::info!("{node} left off: it was off before the flash"),
+            (false, false, false) => tracing::warn!("{node} left off: the flash did not succeed"),
+        }
         result
     }
 
-    /// Power the node off and put USB back the way it was.
-    async fn restore(bmc: &BmcApplication, node: NodeId) -> anyhow::Result<()> {
-        bmc.activate_slot(node.to_inverse_bitfield(), node.to_bitfield())
-            .await?;
+    /// Switches the node off and puts USB back the way it was. When
+    /// `switch_on`, the node is then held off for the settle time and switched
+    /// on again with the USB boot pin released, so it boots from what it was
+    /// flashed with; a power request for the node in the meantime is the last
+    /// word.
+    ///
+    /// # Returns
+    ///
+    /// Whether the node was switched on.
+    async fn restore(bmc: &BmcApplication, node: NodeId, switch_on: bool) -> anyhow::Result<bool> {
+        let ticket = bmc.power_off_for_cycle(node).await?;
         bmc.usb_boot(node, false).await?;
         let (mode, _) = bmc.get_usb_mode().await?;
         bmc.configure_usb(mode).await?;
-        Ok(())
+        if switch_on {
+            return bmc.power_on_after_settle(ticket).await;
+        }
+        Ok(false)
     }
 
     async fn try_write_node(
@@ -671,6 +711,14 @@ mod test {
     }
 
     #[test]
+    fn only_a_node_that_was_on_is_switched_back_on_and_only_after_a_good_flash() {
+        assert!(switch_back_on(true, true));
+        assert!(!switch_back_on(true, false), "a failed flash leaves it off");
+        assert!(!switch_back_on(false, true), "an idle node stays off");
+        assert!(!switch_back_on(false, false));
+    }
+
+    #[test]
     fn staging_dir_is_removed_when_the_guard_drops() {
         let parent = TempDir::with_prefix("staging_parent").unwrap();
         let dir = parent.path().join("image");
@@ -779,5 +827,78 @@ mod tests {
         assert_eq!(tag_from_ota_name("tp2-bmc-firmware-ota-v2.3.0.img"), None);
         assert_eq!(tag_from_ota_name("tp2-bmc-firmware-ota-.tpu"), None);
         assert_eq!(tag_from_ota_name(""), None);
+    }
+}
+
+/// What the end of a flash does to the node, on the simulated board.
+#[cfg(all(test, feature = "stubbed"))]
+mod restore_tests {
+    use super::*;
+    use crate::app::bmc_application::UsbConfig;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    /// A board whose node 2 is in the state a flash leaves it in: powered, with
+    /// the USB boot pin high, and the USB mode stored from before the flash.
+    async fn flashed_board() -> (Arc<BmcApplication>, TempDir) {
+        let dir = TempDir::with_prefix("bmcd-restore").unwrap();
+        let bmc = Arc::new(BmcApplication::for_test(dir.path(), SETTLE).await);
+        bmc.configure_usb(UsbConfig::UsbA(NodeId::Node1))
+            .await
+            .unwrap();
+        bmc.activate_slot(0b1111, 0b1111).await.unwrap();
+        bmc.usb_boot(NodeId::Node2, true).await.unwrap();
+        (bmc, dir)
+    }
+
+    #[tokio::test]
+    async fn a_node_that_was_on_is_switched_back_on() {
+        let (bmc, _dir) = flashed_board().await;
+
+        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, true).await.unwrap();
+
+        assert!(on);
+        assert_eq!(bmc.rails(), 0b1111);
+        assert!(bmc.get_node_power(NodeId::Node2).await.unwrap());
+        assert_eq!(bmc.pin_controller.simulated_usb_boot(), 0, "boot pin released");
+        assert_eq!(
+            bmc.get_usb_mode().await.unwrap().0,
+            UsbConfig::UsbA(NodeId::Node1),
+            "USB is back the way it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_was_off_or_failed_stays_off_with_usb_restored() {
+        let (bmc, _dir) = flashed_board().await;
+
+        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, false).await.unwrap();
+
+        assert!(!on);
+        assert_eq!(bmc.rails(), 0b1101, "node 2 off, the others untouched");
+        assert!(!bmc.get_node_power(NodeId::Node2).await.unwrap());
+        assert_eq!(bmc.pin_controller.simulated_usb_boot(), 0);
+        assert_eq!(
+            bmc.get_usb_mode().await.unwrap().0,
+            UsbConfig::UsbA(NodeId::Node1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_power_off_while_the_flash_is_wrapped_up_wins() {
+        let (bmc, _dir) = flashed_board().await;
+
+        let restore = tokio::spawn({
+            let bmc = bmc.clone();
+            async move { UpgradeWorker::restore(&bmc, NodeId::Node2, true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        bmc.activate_slot(0b0000, 0b0010).await.unwrap();
+
+        assert!(!restore.await.unwrap().unwrap());
+        assert_eq!(bmc.rails(), 0b1101);
+        assert!(!bmc.get_node_power(NodeId::Node2).await.unwrap());
     }
 }

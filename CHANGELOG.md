@@ -17,6 +17,10 @@ installs found them, and one from Daniel Steinhauf
 ([@danste22](https://github.com/danste22)). The scripts that do the work are in
 BMC-Firmware; this is the daemon's half. Thank you both.
 
+Two fixes to how the daemon handles a node's power, reported by Daniel
+Steinhauf ([@danste22](https://github.com/danste22), BMC-Firmware#122) and
+[@adberger](https://github.com/adberger) (BMC-Firmware#129). Thank you both.
+
 ### Added
 
 - **`POST opt=set&type=firmware_unstage` cancels a staged update**
@@ -60,6 +64,34 @@ BMC-Firmware; this is the daemon's half. Thank you both.
   boot did not complete; staged vX discarded" when a power cut left the notes of
   an update that never booted (BMC-Firmware#131, Adrian Berger); that line is
   not an attempt.
+- **A node that was running is switched back on after a flash.** The end of a
+  flash used to switch the node off whatever it had been doing, so a node that
+  was running stayed dark until somebody switched it on, and a script that
+  flashed and then waited for the node to boot waited forever. The daemon now
+  notes whether the node was on before it switches it off to flash. After a
+  successful flash (and the CRC check, when it runs) a node that was on is held
+  off for the settle time and switched on again with the USB boot pin released,
+  so it boots the new image; a node that was off stays off. After a failed or
+  cancelled flash the node is left off, so a half-written image does not boot,
+  and the log says why. The log line for the end of a flash now says what
+  happened to the node: "switched back on" or "left off", with the reason.
+  **Behaviour change:** anyone who relied on a flashed node staying off must
+  switch it off before flashing. (BMC-Firmware#122)
+- **`type=reset` goes through the same path as a power request.** The reset
+  drove the rails directly and never touched the power state the API reports,
+  so a reset of a node that was off powered it on while the API still said off,
+  and a power-off sent during a reset was undone when the reset turned the rail
+  back on: the API said off and the module ran. Now a reset and a power request
+  are serialised by one lock and recorded the same way, and the lock is held for
+  the writes only, never while the node is held off. The node reads off while it
+  is held off and on again when it is back. A power request that names the node
+  during a reset cancels the switch-on that is waiting, so a power-off leaves the
+  node off and the state says off. (BMC-Firmware#129)
+- **A reset of a node that is off is refused with a 409** ("Node 2 is off, so
+  there is nothing to reset; switch it on first"), where it used to power the
+  node on. BMC-UI already disables the reset button for a node that is off.
+  **Behaviour change:** a client that used `type=reset` to switch a node on must
+  use `type=power`. (BMC-Firmware#129)
 
 ## [2.50.2] — 2026-11-24
 

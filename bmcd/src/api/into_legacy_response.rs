@@ -99,6 +99,15 @@ impl From<anyhow::Error> for LegacyResponse {
             return LegacyResponse::bad_request(refusal.to_string());
         }
 
+        // The request is well formed and the node's state does not allow it:
+        // a 409, not a failure of the board.
+        if let Some(refusal) = e
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::app::bmc_application::NodeIsOff>())
+        {
+            return LegacyResponse::Error(StatusCode::CONFLICT, refusal.to_string().into());
+        }
+
         let status = if e
             .root_cause()
             .is::<crate::app::cooling_device::CoolingRequestError>()
@@ -262,6 +271,28 @@ mod status_tests {
             LegacyResponse::bad_request("no").error_response().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// A reset of a node that is off is a refusal of the request, not a
+    /// failure of the board, and the message is the whole answer.
+    #[test]
+    fn resetting_a_node_that_is_off_is_a_409() {
+        use crate::app::bmc_application::NodeIsOff;
+        use crate::hal::NodeId;
+        use anyhow::Context;
+
+        let bare: LegacyResponse = anyhow::Error::new(NodeIsOff(NodeId::Node2)).into();
+        assert_eq!(bare.status_code(), StatusCode::CONFLICT);
+        assert_eq!(
+            bare.to_string(),
+            "Node 2 is off, so there is nothing to reset; switch it on first"
+        );
+
+        let wrapped: LegacyResponse = Err::<(), _>(NodeIsOff(NodeId::Node3))
+            .context("reset node")
+            .unwrap_err()
+            .into();
+        assert_eq!(wrapped.status_code(), StatusCode::CONFLICT);
     }
 
     /// Anything that is not an error still reads as one here, because reaching

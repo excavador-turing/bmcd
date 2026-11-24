@@ -69,7 +69,17 @@ impl PersistencyBuilder {
 
     /// Construct an [`ApplicationPersistency`] object.
     pub async fn build(self) -> anyhow::Result<ApplicationPersistency> {
-        ApplicationPersistency::new(self.keys, BIN_DATA, self.write_timeout).await
+        self.build_at(BIN_DATA).await
+    }
+
+    /// [`Self::build`] with the store at `path` instead of the board's own
+    /// file, so that a test can run the application against a directory of
+    /// its own.
+    pub async fn build_at(
+        self,
+        path: impl Into<PathBuf>,
+    ) -> anyhow::Result<ApplicationPersistency> {
+        ApplicationPersistency::new(self.keys, path, self.write_timeout).await
     }
 }
 
