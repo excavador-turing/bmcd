@@ -8,6 +8,11 @@ on:
   push:
     branches: [hive]
   pull_request:
+  # Advisories are published against code that did not change. The advisories
+  # job below runs weekly for that reason, on the default branch, and is the
+  # only job that runs on this trigger.
+  schedule:
+    - cron: '17 5 * * 1'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,6 +33,7 @@ permissions:
 jobs:
   cargo:
     name: fmt, clippy, build, test
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -97,6 +103,7 @@ jobs:
 
   cross:
     name: cross-compile for the board
+    if: github.event_name != 'schedule'
     # Pinned, not ubuntu-latest. The armhf packages below come from
     # ports.ubuntu.com for the *same release* as this runner, and multiarch
     # requires libudev1:amd64 and libudev1:armhf at identical versions. On
@@ -203,7 +210,8 @@ jobs:
             --workspace --all-targets --locked
 
   cargo-deny:
-    name: advisories, licences, bans, sources
+    name: licences, bans, sources
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -216,4 +224,24 @@ jobs:
       # passed on v2 without that change.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check advisories bans licenses sources
+          command: check bans licenses sources
+
+  # A new RUSTSEC entry can land at any time, against a lockfile nobody has
+  # touched. Held to the same standard as the job above, it would turn every
+  # open pull request red the day it is published, and nobody could merge
+  # until the dependency was dealt with. So on a pull request or a push this
+  # job reports and does not block (`continue-on-error`), and the weekly run
+  # on `hive` fails visibly, which is where a new advisory is meant to be
+  # noticed. deny.toml lists the advisories that are known, and why each is
+  # accepted.
+  advisories:
+    name: advisories (reported, not blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
