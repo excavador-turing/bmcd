@@ -18,9 +18,11 @@ use crate::app::bmc_application::NodeInfoUpdate;
 use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::bmc_info::{get_fs_stat, get_net_interfaces, get_primary_info, get_storage_info};
 use crate::app::firmware_catalog;
-use crate::app::firmware_info::get_firmware_slots;
+use crate::app::firmware_info::{get_firmware_slots, FirmwareSlots};
 use crate::app::firmware_sources;
+use crate::app::firmware_unstage;
 use crate::app::health_info::get_health;
+use crate::app::staging_lock::{StageLock, StageLockError};
 use crate::app::switch_info::get_switch_ports;
 use crate::app::thermal_info::get_thermal_state;
 use crate::app::transfer_action::InitializeTransfer;
@@ -420,6 +422,7 @@ async fn dispatch_inner(
         ("firmware_sources", true) => set_firmware_sources(query).await,
         ("firmware_available", false) => get_firmware_available(query).await.into(),
         ("firmware_install", true) => install_firmware(query).await,
+        ("firmware_unstage", true) => unstage_firmware().await,
         ("ntp", false) => get_ntp().await.into(),
         ("ntp", true) => set_ntp(query).await,
         ("hostname", false) => get_hostname().await.into(),
@@ -625,6 +628,16 @@ async fn get_firmware_available(query: Query) -> impl Into<LegacyResponse> {
 /// and the command line is what a person falls back to when the interface is
 /// the thing that broke.
 ///
+/// One stager at a time: the staging lock is taken first, shared with the
+/// upload path and the scripts, and a second request is a 409 "an update is
+/// being staged" (BMC-Firmware#127). `tpi-selfupdate` is told the lock is held
+/// and does not take it again.
+///
+/// `force=1` means what it says on the upload path: cancel what is staged,
+/// then stage this (see [`unstage_for_force`]). It used to skip bmcd's own
+/// check and run `tpi-selfupdate`, which has no force option and refused, so
+/// the 409 offered something the daemon then declined (BMC-Firmware#128).
+///
 /// Local candidates do NOT come through here: those are a file that already
 /// exists, and the existing transfer endpoint installs them without a
 /// download.
@@ -641,18 +654,18 @@ async fn install_firmware(query: Query) -> LegacyResponse {
         return LegacyResponse::bad_request(format!("no source called {source_id:?}"));
     };
 
+    // Taken before the question "is something staged", which is only a true
+    // answer while no other stager is between "started" and "armed". Held
+    // until this function returns, `tpi-selfupdate` included.
+    let lock = match StageLock::try_acquire() {
+        Ok(lock) => lock,
+        Err(e) => return stage_lock_refusal(e),
+    };
+
     // The same refusal the transfer endpoint makes, for the same reason:
     // osupdate writes into the volume nextboot points at.
-    if !query.contains_key("force") {
-        let slots = get_firmware_slots(firmware_version().await).await;
-        if slots.update_staged == Some(true) {
-            return LegacyResponse::Error(
-                StatusCode::CONFLICT,
-                "an update is already staged for the next boot; reboot to take it, \
-                 or pass force=1 to replace it"
-                    .into(),
-            );
-        }
+    if let Err(refusal) = unstage_for_force(&lock, query.contains_key("force")).await {
+        return refusal;
     }
 
     let mut args: Vec<String> = vec!["--tag".into(), version.clone()];
@@ -677,12 +690,10 @@ async fn install_firmware(query: Query) -> LegacyResponse {
         args.push("--allow-downgrade".into());
     }
 
-    let result = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("/sbin/tpi-selfupdate")
-            .args(&args)
-            .output()
-    })
-    .await;
+    let mut command = std::process::Command::new("/sbin/tpi-selfupdate");
+    command.args(&args);
+    lock.mark_held(&mut command);
+    let result = tokio::task::spawn_blocking(move || command.output()).await;
 
     match result {
         Ok(Ok(output)) if output.status.success() => LegacyResponse::ok(json!({
@@ -710,6 +721,87 @@ async fn install_firmware(query: Query) -> LegacyResponse {
             format!("install task failed: {e}").into(),
         ),
     }
+}
+
+/// What a client is told when something is staged and it asked for another
+/// image. The three ways out, in the order a person wants them.
+fn already_staged_message(slots: &FirmwareSlots) -> String {
+    let staged = slots
+        .staged
+        .as_ref()
+        .and_then(|s| s.version.clone())
+        .unwrap_or_else(|| "an image".to_string());
+    format!(
+        "{staged} is already staged for the next boot; reboot to take it, cancel it with \
+         type=firmware_unstage, or pass force=1 to cancel it and stage this one"
+    )
+}
+
+/// A refused lock as a response: 409 when somebody else is staging, 500 when
+/// the lock itself cannot be taken.
+fn stage_lock_refusal(error: StageLockError) -> LegacyResponse {
+    match error {
+        StageLockError::Busy => {
+            LegacyResponse::Error(StatusCode::CONFLICT, error.to_string().into())
+        }
+        StageLockError::Io { .. } => {
+            LegacyResponse::Error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string().into())
+        }
+    }
+}
+
+/// The "already staged" rule, for both ways of staging, under the staging
+/// lock the caller holds.
+///
+/// Nothing staged: nothing to do. Something staged: refuse with a 409 that
+/// names the three ways out -- or, with `force`, cancel it first and let the
+/// caller go on to stage the new image.
+///
+/// `force=1` is "unstage, then install", on both paths, and the two paths
+/// agree because this is the one place that decides it. The alternative -- skip
+/// the check and write over the staged volume -- is what the upload path used
+/// to do: `osupdate` then removed `rootfs_new` while `nextboot` still pointed
+/// at it, the one moment of the design with nothing sound to boot. If the
+/// install that follows fails, nothing is staged: that is the price of
+/// "replace", and it leaves the board booting what it runs, never an image
+/// that was half written.
+async fn unstage_for_force(lock: &StageLock, force: bool) -> Result<(), LegacyResponse> {
+    let slots = get_firmware_slots(firmware_version().await).await;
+    if slots.update_staged != Some(true) {
+        return Ok(());
+    }
+    if !force {
+        return Err(LegacyResponse::Error(
+            StatusCode::CONFLICT,
+            already_staged_message(&slots).into(),
+        ));
+    }
+    firmware_unstage::unstage(lock)
+        .await
+        .map_err(|refusal| LegacyResponse::Error(refusal.status, refusal.message.into()))
+}
+
+/// Cancels a staged update: the next boot starts the firmware that is
+/// running, and `firmware_slots` reports nothing staged (BMC-Firmware#124).
+///
+/// POST only, like every state change (`request_policy` refuses the GET
+/// form). It takes the staging lock first, so an install that is still
+/// writing is a 409 instead of being cancelled under its own feet, and
+/// `osunstage` clears `nextboot` before it removes the notes. Idempotent:
+/// with nothing staged it answers 200 with the same document.
+///
+/// Answers like `firmware_slots`, so a client sees the result without a
+/// second request.
+async fn unstage_firmware() -> LegacyResponse {
+    let lock = match StageLock::try_acquire() {
+        Ok(lock) => lock,
+        Err(e) => return stage_lock_refusal(e),
+    };
+    if let Err(refusal) = firmware_unstage::unstage(&lock).await {
+        return LegacyResponse::Error(refusal.status, refusal.message.into());
+    }
+    drop(lock);
+    json!(get_firmware_slots(firmware_version().await).await).into()
 }
 
 /// Whether a newer firmware release exists on either channel.
@@ -1273,6 +1365,20 @@ async fn handle_transfer_request(
             ("firmware park service".to_string(), UpgradeCommand::OsPark)
         }
         Some("firmware") => {
+            // One stager at a time (BMC-Firmware#127): taken here, before a
+            // byte is sent, and held by the transfer's worker until the image
+            // is armed. A second request is a 409, not a second writer.
+            let lock = StageLock::try_acquire().map_err(stage_lock_refusal)?;
+            // The transfer service holds one transfer. Replacing a running one
+            // cancels its copy but not an `osupdate` already writing, so a
+            // firmware transfer is refused while any other is running.
+            if ss.is_transferring().await {
+                return Err(LegacyResponse::Error(
+                    StatusCode::CONFLICT,
+                    "a transfer is already running; wait for it to finish or cancel it first"
+                        .into(),
+                ));
+            }
             // Refuse to stage a second image over one that is already armed.
             //
             // `osupdate` writes into the volume `nextboot` points at, so
@@ -1284,28 +1390,13 @@ async fn handle_transfer_request(
             //
             // `force` exists because the refusal must not become a trap: a
             // board whose staged image is known bad needs a way forward that
-            // is not a reboot onto it.
-            if !query.contains_key("force") {
-                let slots = get_firmware_slots(firmware_version().await).await;
-                if slots.update_staged == Some(true) {
-                    let staged = slots
-                        .staged
-                        .as_ref()
-                        .and_then(|s| s.version.clone())
-                        .unwrap_or_else(|| "an image".to_string());
-                    return Err(LegacyResponse::Error(
-                        StatusCode::CONFLICT,
-                        format!(
-                            "{staged} is already staged for the next boot; reboot to take it, \
-                             or pass force=1 to replace it"
-                        )
-                        .into(),
-                    ));
-                }
-            }
+            // is not a reboot onto it. It cancels the staged update first
+            // (`firmware_unstage`), then stages this one: the same meaning
+            // on `firmware_install`.
+            unstage_for_force(&lock, query.contains_key("force")).await?;
             (
                 "firmware upgrade service".to_string(),
-                UpgradeCommand::OsUpgrade,
+                UpgradeCommand::OsUpgrade(lock),
             )
         }
         Some("flash") => {
@@ -1327,7 +1418,15 @@ async fn handle_transfer_request(
     let transfer_request =
         InitializeTransfer::new(process_name, upgrade_command, data_transfer, do_crc);
 
-    let handle = ss.request_transfer(transfer_request.try_into()?).await?;
+    // A firmware transfer never replaces a running one; a node flash keeps
+    // doing so, as it always has.
+    let firmware = matches!(query.get("type").map(String::as_str), Some("firmware"));
+    let handle = if firmware {
+        ss.request_exclusive_transfer(transfer_request.try_into()?)
+            .await?
+    } else {
+        ss.request_transfer(transfer_request.try_into()?).await?
+    };
     let json = json!({"handle": handle});
     Ok(json.to_string())
 }
@@ -2366,5 +2465,81 @@ mod test {
             std::str::from_utf8(&body).expect("utf8"),
             r#"{"response":[{"result":{"cooling":[],"sensors":[]}}]}"#
         );
+    }
+
+    fn slots_with_staged(version: Option<&str>) -> FirmwareSlots {
+        FirmwareSlots {
+            present: true,
+            running: None,
+            rollback: None,
+            update_staged: Some(true),
+            nextboot: Some("bootmode=postupdate".to_string()),
+            last_promotion: None,
+            promotion_history: None,
+            staged: version.map(|v| StagedImage {
+                version: Some(v.to_string()),
+                ..StagedImage::default()
+            }),
+        }
+    }
+
+    /// `firmware_install` used to say "pass force=1 to replace it" and then
+    /// refuse force=1 (BMC-Firmware#128). The refusal now names all three ways
+    /// out, and each of them exists on both paths.
+    #[test]
+    fn the_already_staged_refusal_names_every_way_out() {
+        let message = already_staged_message(&slots_with_staged(Some("v2.57.0")));
+        assert!(
+            message.starts_with("v2.57.0 is already staged"),
+            "{message}"
+        );
+        assert!(message.contains("reboot to take it"), "{message}");
+        assert!(message.contains("type=firmware_unstage"), "{message}");
+        assert!(message.contains("force=1"), "{message}");
+        // And never the advice that was wrong.
+        assert!(!message.to_lowercase().contains("power"), "{message}");
+    }
+
+    #[test]
+    fn an_unnamed_staged_image_is_still_named_something() {
+        let message = already_staged_message(&slots_with_staged(None));
+        assert!(
+            message.starts_with("an image is already staged"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_busy_lock_is_a_409_and_any_other_lock_failure_is_a_500() {
+        assert_eq!(
+            stage_lock_refusal(StageLockError::Busy),
+            LegacyResponse::Error(
+                StatusCode::CONFLICT,
+                "an update is being staged; try again when it has finished".into()
+            )
+        );
+        let io = stage_lock_refusal(StageLockError::Io {
+            path: PathBuf::from("/run/firmware-stage.lock"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        });
+        assert!(
+            matches!(&io, LegacyResponse::Error(status, message)
+                if *status == StatusCode::INTERNAL_SERVER_ERROR
+                    && message.contains("/run/firmware-stage.lock")),
+            "{io:?}"
+        );
+    }
+
+    /// `firmware_unstage` is a state change like any `opt=set`: it must not be
+    /// routed to the transfer machinery, which claims every `type` that starts
+    /// with `firmware` unless the whole value is compared.
+    #[test]
+    fn firmware_unstage_is_not_the_transfer_machinery() {
+        let query = "opt=set&type=firmware_unstage";
+        assert_eq!(query_param(query, "type"), Some("firmware_unstage"));
+        assert!(!matches!(
+            query_param(query, "type"),
+            Some("flash" | "firmware")
+        ));
     }
 }

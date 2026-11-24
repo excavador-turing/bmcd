@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::bmc_application::BmcApplication;
+use super::staging_lock::StageLock;
 use super::upgrade_worker::UpgradeWorker;
 use crate::hal::NodeId;
 use crate::streaming_data_service::data_transfer::DataTransfer;
@@ -72,7 +73,10 @@ impl TryInto<TransferRequest> for InitializeTransfer {
 }
 
 pub enum UpgradeCommand {
-    OsUpgrade,
+    /// Stage the uploaded image. Carries the staging lock the request took:
+    /// it is held for as long as the transfer runs, which is what keeps a
+    /// second stager out (BMC-Firmware#127).
+    OsUpgrade(StageLock),
     /// Write the image to the SD card and stop, so it appears in the
     /// catalogue rather than installing itself.
     OsPark,
@@ -85,7 +89,7 @@ impl UpgradeCommand {
         upgrade_worker: UpgradeWorker,
     ) -> BoxFuture<'static, Result<(), anyhow::Error>> {
         match self {
-            UpgradeCommand::OsUpgrade => Box::pin(upgrade_worker.os_update()),
+            UpgradeCommand::OsUpgrade(lock) => Box::pin(upgrade_worker.os_update(lock)),
             UpgradeCommand::OsPark => Box::pin(upgrade_worker.os_park()),
             UpgradeCommand::Module(bmc, node) => Box::pin(upgrade_worker.flash_node(node, bmc)),
         }

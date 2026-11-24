@@ -310,6 +310,13 @@ pub(crate) static ALIASES: &[Alias] = &[
         document_param: None,
         summary: "Stage a version from a source for the next boot",
     },
+    Alias {
+        method: Method::Post,
+        path: "/firmware/unstage",
+        ty: "firmware_unstage",
+        document_param: None,
+        summary: "Cancel a staged update: the next boot starts the running firmware",
+    },
 ];
 
 /// Registers every alias and the document that describes them. Called from

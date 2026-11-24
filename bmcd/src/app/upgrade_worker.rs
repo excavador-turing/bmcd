@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::app::bmc_application::BmcApplication;
+use crate::app::staging_lock::StageLock;
 use crate::hal::{NodeId, UsbRoute};
 use crate::streaming_data_service::data_transfer::DataTransfer;
 use crate::utils::WriteMonitor;
@@ -72,6 +73,11 @@ const PARK_DIR: &str = "/mnt/sdcard/firmware";
 /// Directory created under the chosen staging location, removed again when
 /// `osupdate` returns.
 pub(crate) const UPGRADE_DIR_NAME: &str = "os_upgrade";
+/// The staged-version note, written into the staging directory and handed to
+/// `osupdate`, which installs it before it arms `nextboot`. The name holds a
+/// `~`, which an image name cannot (`firmware_image_name`), so the two can
+/// never be the same file.
+const STAGED_NOTE_FILE: &str = "~staged-firmware";
 const BLOCK_WRITE_SIZE: usize = BLOCK_READ_SIZE; // 512Kib
 const BLOCK_READ_SIZE: usize = 524288; // 512Kib
 
@@ -290,7 +296,15 @@ impl UpgradeWorker {
         Ok(())
     }
 
-    pub async fn os_update(mut self) -> anyhow::Result<()> {
+    /// Writes the uploaded image into the spare volume and arms it.
+    ///
+    /// `lock` is the staging lock, taken by the request that started this
+    /// transfer and held until this function returns: the upload, the write
+    /// and the note are one staging, and nothing else may stage meanwhile
+    /// (BMC-Firmware#127). It is moved in rather than taken here because the
+    /// refusal has to reach the client that asked, as a 409, before any bytes
+    /// are sent.
+    pub async fn os_update(mut self, lock: StageLock) -> anyhow::Result<()> {
         let file_name = self.data_transfer.file_name()?.to_owned();
         require_image_name(&file_name)?;
         // Read the size before the reader is taken: on a URL transfer it is the
@@ -320,24 +334,41 @@ impl UpgradeWorker {
         let mut writer = WriteMonitor::new(&mut file, &mut self.written_sender, &crc);
         copy_or_cancel(source, &mut writer, &self.cancel).await?;
 
-        let result = spawn_blocking(move || osupdate_command(&os_update_img).status()).await?;
+        // Record WHICH image is being staged, so the web interface can name the
+        // pending version instead of only reporting that something is pending.
+        // `tpi-selfupdate` writes the same note for the path it owns; this is
+        // the upload path.
+        //
+        // Written BEFORE `osupdate` runs and handed to it: `osupdate` installs
+        // it, syncs it and only then arms `nextboot`. It used to be written
+        // here after `osupdate` returned, and a reboot or a power cut between
+        // the two armed an image whose note did not exist, which the promotion
+        // gate then judged without its version check (BMC-Firmware#126). Never
+        // fatal: without a note `osupdate` writes a minimal one of its own.
+        let note = staging_dir.join(STAGED_NOTE_FILE);
+        let note = match write_staged_note(&note, &file_name.to_string_lossy()).await {
+            Ok(()) => Some(note),
+            Err(e) => {
+                tracing::warn!("could not record the staged version: {e}");
+                None
+            }
+        };
+
+        let mut command = osupdate_command(&os_update_img, note.as_deref());
+        // This process holds the staging lock for the whole of the transfer;
+        // `osupdate` must not try to take it from underneath its own parent.
+        lock.mark_held(&mut command);
+        let result = spawn_blocking(move || command.status()).await?;
 
         let success = result?;
         if !success.success() {
             bail!("failed firmware upgrade ({})", success);
         }
 
-        // Record WHICH image is now staged, so the web interface can name the
-        // pending version instead of only reporting that something is pending.
-        // `tpi-selfupdate` writes the same note for the path it owns; this is
-        // the upload path. Written only after `osupdate` succeeded, so a note
-        // never claims an image that was not staged, and never fatal -- the
-        // upgrade has happened by this point and failing it here would report
-        // a false failure for a board that is correctly armed.
-        if let Err(e) = write_staged_note(&file_name.to_string_lossy()).await {
-            tracing::warn!("could not record the staged version: {e}");
-        }
-
+        // `lock` is a parameter, so it is dropped after every local, the
+        // `RemoveStagingDir` guard included: the directory every upload shares
+        // is gone before the next stager may create it again. The first
+        // transfer to finish used to delete the second's image from under it.
         Ok(())
     }
 }
@@ -354,12 +385,6 @@ impl Drop for RemoveStagingDir {
         }
     }
 }
-
-/// Where the staged version is recorded for the API to report. Owned by
-/// `S99postupdate`, which removes it once it has promoted or rejected the
-/// image; both firmware images mount `/mnt/overlay`, so the note survives the
-/// reboot it describes.
-const STAGED_NOTE: &str = "/mnt/overlay/staged-firmware";
 
 /// The release filename shape this fork publishes, used to recover a tag from
 /// an uploaded file.
@@ -393,11 +418,15 @@ fn require_image_name(name: &std::ffi::OsStr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `osupdate` takes the image path as an argument. The path is never
-/// interpolated into a shell command.
-fn osupdate_command(image: &Path) -> Command {
+/// `osupdate` takes the image path as an argument, and optionally the note it
+/// is to install as the staged-version note. Neither is ever interpolated into
+/// a shell command.
+fn osupdate_command(image: &Path, note: Option<&Path>) -> Command {
     let mut command = Command::new("osupdate");
     command.arg(image);
+    if let Some(note) = note {
+        command.arg(note);
+    }
     command
 }
 
@@ -414,9 +443,20 @@ pub(crate) fn tag_from_ota_name(file_name: &str) -> Option<&str> {
     (!tag.is_empty()).then_some(tag)
 }
 
-/// Writes the staged-image note. `KEY=VALUE`, the same shape the firmware's
-/// `tpi-selfupdate` writes and `firmware_info` reads.
-async fn write_staged_note(file_name: &str) -> std::io::Result<()> {
+/// Writes the staged-image note to `path`. `KEY=VALUE`, the same shape the
+/// firmware's `tpi-selfupdate` writes and `firmware_info` reads.
+///
+/// This is only the file `osupdate` is handed; `osupdate` installs it on the
+/// overlay (where the gate and `firmware_info` read it) before it arms
+/// `nextboot`, and adds the mark that says the gateway note came first.
+async fn write_staged_note(path: &Path, file_name: &str) -> std::io::Result<()> {
+    let running = crate::api::legacy::firmware_version().await;
+    tokio::fs::write(path, staged_note(file_name, running.as_deref())).await
+}
+
+/// The body of the note. Split from the write so it can be tested without a
+/// board.
+fn staged_note(file_name: &str, running: Option<&str>) -> String {
     let mut note = String::new();
     if let Some(tag) = tag_from_ota_name(file_name) {
         note.push_str(&format!("VERSION={tag}\n"));
@@ -435,10 +475,10 @@ async fn write_staged_note(file_name: &str) -> std::io::Result<()> {
     // is why the interface said "Rollback: version not readable" -- honest,
     // and useless to somebody deciding whether to press Reboot. Recording it
     // here lets the gate carry it forward on promotion.
-    if let Some(running) = crate::api::legacy::firmware_version().await {
+    if let Some(running) = running {
         note.push_str(&format!("REPLACES={running}\n"));
     }
-    tokio::fs::write(STAGED_NOTE, note).await
+    note
 }
 
 /// Selects the directory to stage a firmware image in. Returns the first entry
@@ -671,9 +711,52 @@ mod tests {
     #[test]
     fn osupdate_is_not_a_shell() {
         let image = PathBuf::from("/tmp/os_upgrade/firmware.tpu");
-        let command = osupdate_command(&image);
+        let command = osupdate_command(&image, None);
         assert_eq!(command.get_program(), "osupdate");
         assert_eq!(command.get_args().collect::<Vec<_>>(), [image.as_os_str()]);
+    }
+
+    /// The note is the second argument, as `osupdate IMAGE [NOTE]` takes it.
+    #[test]
+    fn osupdate_is_handed_the_note_to_install() {
+        let image = PathBuf::from("/tmp/os_upgrade/firmware.tpu");
+        let note = PathBuf::from("/tmp/os_upgrade/~staged-firmware");
+        let command = osupdate_command(&image, Some(&note));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [image.as_os_str(), note.as_os_str()]
+        );
+    }
+
+    /// The note file shares a directory with the image, so its name must be one
+    /// no image can have.
+    #[test]
+    fn the_note_file_name_cannot_be_an_image_name() {
+        assert!(firmware_image_name(STAGED_NOTE_FILE).is_err());
+    }
+
+    #[test]
+    fn the_staged_note_names_the_tag_the_file_and_what_it_replaces() {
+        let note = staged_note("tp2-bmc-firmware-ota-v2.57.0.tpu", Some("v2.55.0"));
+        let lines: Vec<&str> = note.lines().collect();
+        assert!(lines.contains(&"VERSION=v2.57.0"), "{note}");
+        assert!(
+            lines.contains(&"FILE=tp2-bmc-firmware-ota-v2.57.0.tpu"),
+            "{note}"
+        );
+        assert!(lines.contains(&"SOURCE=upload"), "{note}");
+        assert!(lines.contains(&"REPLACES=v2.55.0"), "{note}");
+        assert!(lines.iter().any(|l| l.starts_with("STAGED_AT=")), "{note}");
+    }
+
+    /// An image that is not named like a release has a file and no version,
+    /// and saying so beats inventing one.
+    #[test]
+    fn a_hand_built_image_has_a_file_and_no_version() {
+        let note = staged_note("my-build.tpu", None);
+        assert!(!note.contains("VERSION="), "{note}");
+        assert!(!note.contains("REPLACES="), "{note}");
+        assert!(note.contains("FILE=my-build.tpu\n"), "{note}");
     }
 
     #[test]

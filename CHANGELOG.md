@@ -10,6 +10,57 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Update safety. Five reports against the firmware's update path, four of them
+from Adrian Berger ([@adberger](https://github.com/adberger)), whose
+deterministic simulation of a board under power cuts, reboots and concurrent
+installs found them, and one from Daniel Steinhauf
+([@danste22](https://github.com/danste22)). The scripts that do the work are in
+BMC-Firmware; this is the daemon's half. Thank you both.
+
+### Added
+
+- **`POST opt=set&type=firmware_unstage` cancels a staged update**
+  (BMC-Firmware#124, Daniel Steinhauf). The next boot starts the firmware that
+  is running, and `firmware_slots` reports nothing staged. POST only, like every
+  state change; also `POST /api/bmc/firmware/unstage`, documented in the OpenAPI
+  document. It runs the firmware's `/sbin/osunstage`, which clears `nextboot`
+  *before* it removes the notes. It takes the staging lock first, so an install
+  that is still writing is a 409, and it is a 409 too while the new firmware is
+  being checked on its first boot. With nothing staged it is not an error and
+  answers 200. It answers with the slots document, so a client sees the result
+  without a second request.
+- **One staging lock** (BMC-Firmware#127, Adrian Berger). The upload path,
+  `firmware_install` and the firmware's scripts share one `flock` on
+  `/run/firmware-stage.lock`. A second stager gets a 409 `an update is being
+  staged; try again when it has finished`, taken before any byte is sent.
+
+### Changed
+
+- **`force=1` means "cancel what is staged, then stage this", on both
+  `type=firmware` and `firmware_install`** (BMC-Firmware#128, Adrian Berger).
+  `firmware_install` answered 409 "pass force=1 to replace it" and then, with
+  `force=1`, skipped its own check and ran `tpi-selfupdate`, which has no force
+  option and refused with a 400. Both endpoints now cancel the staged update
+  first (the same operation as `firmware_unstage`, under the lock) and go on to
+  stage; the 409 names all three ways out: reboot, `firmware_unstage`, `force=1`.
+  If the install that follows fails, nothing is staged and the board boots what
+  it runs. The upload path used to write over the staged volume with `nextboot`
+  still pointing at it.
+- **A firmware transfer is refused while another transfer is running**
+  (BMC-Firmware#127). `request_transfer` replaced the running transfer;
+  dropping its context cancels its copy but not an `osupdate` already writing.
+  A node flash keeps replacing, as before.
+- **The upload path hands `osupdate` its staged-version note, instead of
+  writing it afterwards** (BMC-Firmware#126, Adrian Berger). `osupdate` installs
+  it and syncs it before it arms `nextboot`; a reboot or a power cut between the
+  two used to arm an image with no note, and the promotion gate then skipped its
+  version check. The note body is unchanged.
+- **The promotion history counts "tentative boot; checking" lines**, not any
+  line containing "tentative boot". `S99postupdate` now also writes "tentative
+  boot did not complete; staged vX discarded" when a power cut left the notes of
+  an update that never booted (BMC-Firmware#131, Adrian Berger); that line is
+  not an attempt.
+
 ## [2.50.2] — 2026-11-24
 
 A security release: the serial console WebSocket refuses a handshake opened from

@@ -368,7 +368,7 @@ async fn read_nextboot() -> (Option<bool>, Option<String>) {
 /// hand and wrote on a website, where it went stale the next day.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct PromotionHistory {
-    /// Boots that ran the gate at all: one per "tentative boot" line.
+    /// Boots that ran the gate at all: one per "tentative boot; checking" line.
     pub attempts: u64,
     /// Of those, the ones the gate refused.
     pub rolled_back: u64,
@@ -387,8 +387,11 @@ pub struct PromotionHistory {
 /// bound cannot be read into memory whole.
 const PROMOTION_LOG_MAX: u64 = 1024 * 1024;
 
-/// Marks a boot that ran the gate.
-const ATTEMPT_MARKER: &str = "tentative boot";
+/// Marks a boot that ran the gate. The whole phrase, not "tentative boot": the
+/// script also says "tentative boot did not complete; staged vX discarded"
+/// when a power cut left notes behind, and that line is a housekeeping
+/// decision, not an attempt (BMC-Firmware#131).
+const ATTEMPT_MARKER: &str = "tentative boot; checking";
 /// Marks the gate refusing the image it booted.
 const ROLLBACK_MARKER: &str = "rolling back to the volume";
 
@@ -582,6 +585,28 @@ mod tests {
         assert!(read_promotion_history(&dir.path().join("absent.log"))
             .await
             .is_none());
+    }
+
+    /// The line the script writes on a normal boot that finds the notes of an
+    /// update that never booted. It says "tentative boot" and is not an
+    /// attempt: counting it made a board that lost power during a tentative
+    /// boot look as if it had run the gate twice.
+    #[tokio::test]
+    async fn a_discarded_staging_is_not_an_attempt() {
+        let dir = TempDir::with_prefix("promotion").expect("tempdir");
+        let log = dir.path().join("postupdate.log");
+        tokio::fs::write(
+            &log,
+            "x postupdate: tentative boot; checking this image before making it permanent\n\
+             y postupdate: tentative boot did not complete; staged v2.57.0 discarded (nextboot is not armed)\n",
+        )
+        .await
+        .expect("write");
+        let history = read_promotion_history(&log).await.expect("read");
+        assert_eq!(
+            (history.attempts, history.rolled_back, history.promoted),
+            (1, 0, 1)
+        );
     }
 
     /// A gate cut off before it decided leaves an attempt with no verdict.

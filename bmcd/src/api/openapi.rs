@@ -53,7 +53,7 @@ fn known_params(alias: &Alias) -> &'static [(&'static str, &'static str)] {
         ("firmware_install", Method::Post) => &[
             ("source", "a source id from GET /firmware/sources"),
             ("version", "a version that source offers"),
-            ("force", "`1` replaces an image that is already staged"),
+            ("force", "`1` cancels an update that is already staged (as `POST /firmware/unstage` does) and then stages this one; without it a staged update is a 409"),
             ("allow_downgrade", "`1` for a version that is not newer than the running one"),
         ],
         ("power", Method::Post) => &[
@@ -1088,6 +1088,25 @@ pub fn document() -> Value {
             Some((_, schema)) if alias.method == Method::Get => {
                 operation["responses"]["200"]["content"]["application/json"]["schema"] =
                     schema.clone();
+            }
+            // The one write that answers with a document: the slots as they
+            // are after the cancel, so a client sees the result without a
+            // second request. Refusals are the problem document every
+            // operation carries; these two are 409s a client branches on.
+            _ if alias.ty == "firmware_unstage" => {
+                operation["responses"]["200"]["description"] = json!(
+                    "Nothing is staged any more: the same document as `GET /firmware/slots`, \
+                     with `update_staged` false. Cancelling when nothing is staged is not an \
+                     error and answers the same."
+                );
+                operation["responses"]["200"]["content"]["application/json"]["schema"] =
+                    component_ref("FirmwareSlots");
+                operation["responses"]["409"] = json!({
+                    "description": "Refused: an install is still writing (`an update is being \
+                                    staged`), or the new firmware is being checked on its first \
+                                    boot. Nothing was changed; try again when it has finished.",
+                    "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } }
+                });
             }
             _ if UNTYPED.contains(&alias.path) => {
                 operation["responses"]["200"]["description"] = json!(

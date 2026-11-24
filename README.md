@@ -72,6 +72,8 @@ on the `(type, is_set)` pair. A missing `opt` or `type` is a 400, and so is a
 |---|---|
 | `clear_usb_boot` | clear the USB boot pin |
 | `cooling` | set a fan speed |
+| `firmware_install` | stage a version from a configured source (`source`, `version`; `allow_downgrade=1`; `force=1` cancels what is staged first). One stager at a time: a second is a 409 (*this fork*) |
+| `firmware_unstage` | cancel a staged update: the next boot starts the running firmware. A 409 while an install is writing or the new firmware is being checked; answers like `firmware_slots` (*this fork*) |
 | `network` | reset the network interface |
 | `node_to_msd` | expose a node as a mass-storage device |
 | `nodeinfo` | deprecated, answers 501 |

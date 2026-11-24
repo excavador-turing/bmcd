@@ -220,6 +220,8 @@ mod tests {
         for query in [
             "opt=set&type=power&node1=1",
             "opt=set&type=firmware&file=a.tpu&length=1",
+            "opt=set&type=firmware_unstage",
+            "opt=set&type=firmware_install&source=a&version=v1.0.0",
             "opt=set&type=flash&node=0&file=x",
             "type=power&opt=%73et",
         ] {

@@ -53,6 +53,44 @@ impl StreamingDataService {
         &self,
         request: TransferRequest,
     ) -> Result<u32, StreamingServiceError> {
+        self.start_transfer(request, false).await
+    }
+
+    /// Like [`Self::request_transfer`], but refuses while a transfer is running
+    /// instead of replacing it ([`StreamingServiceError::Busy`]).
+    ///
+    /// For a firmware transfer. Replacing the running one drops its context,
+    /// which cancels its copy -- but not an `osupdate` already running in
+    /// `spawn_blocking`, which carries on writing the spare volume while a
+    /// second one starts (BMC-Firmware#127). The check and the start are one
+    /// critical section, so two requests cannot both pass it.
+    pub async fn request_exclusive_transfer(
+        &self,
+        request: TransferRequest,
+    ) -> Result<u32, StreamingServiceError> {
+        self.start_transfer(request, true).await
+    }
+
+    /// Whether a transfer is running: started and not yet finished, failed,
+    /// cancelled or timed out.
+    pub async fn is_transferring(&self) -> bool {
+        matches!(*self.status.lock().await, StreamingState::Transferring(_))
+    }
+
+    async fn start_transfer(
+        &self,
+        request: TransferRequest,
+        exclusive: bool,
+    ) -> Result<u32, StreamingServiceError> {
+        // Held from the check to the new state, so two requests cannot both
+        // find the service idle.
+        let mut status = self.status.lock().await;
+        if exclusive {
+            if let StreamingState::Transferring(running) = &*status {
+                return Err(StreamingServiceError::Busy(running.process_name.clone()));
+            }
+        }
+
         let mut rng = rand::rng();
         let id = rng.random();
 
@@ -74,7 +112,7 @@ impl StreamingDataService {
 
         self.execute_worker(&context, request.worker).await;
         Self::cancel_request_on_timeout(self.status.clone());
-        *self.status.lock().await = StreamingState::Transferring(context);
+        *status = StreamingState::Transferring(context);
 
         Ok(id)
     }
@@ -224,6 +262,9 @@ pub enum StreamingServiceError {
     WrongState(String, String),
     #[error("unauthorized request for handle")]
     HandlesDoNotMatch,
+    /// A firmware transfer was asked for while another transfer is running.
+    #[error("a transfer is already running ({0}); wait for it to finish or cancel it first")]
+    Busy(String),
     #[error("IO error")]
     IoError(#[from] std::io::Error),
     #[error(
@@ -238,6 +279,7 @@ impl From<StreamingServiceError> for LegacyResponse {
         let status_code = match value {
             StreamingServiceError::WrongState(_, _) => StatusCode::BAD_REQUEST,
             StreamingServiceError::HandlesDoNotMatch => StatusCode::BAD_REQUEST,
+            StreamingServiceError::Busy(_) => StatusCode::CONFLICT,
             StreamingServiceError::IoError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             StreamingServiceError::SenderTaken => StatusCode::BAD_REQUEST,
         };
@@ -282,4 +324,100 @@ pub struct TransferRequest {
     pub progress_watcher: watch::Receiver<u64>,
     pub worker: BoxFuture<'static, anyhow::Result<()>>,
     pub cancel: CancellationToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    /// A transfer whose worker runs until `release` is sent, with no data
+    /// sender (so the ten-second "nobody sent anything" timeout never fires).
+    fn request(name: &str, hold: oneshot::Receiver<()>) -> TransferRequest {
+        let (_sender, progress_watcher) = watch::channel(0u64);
+        TransferRequest {
+            process_name: name.to_string(),
+            size: 1,
+            sender: None,
+            progress_watcher,
+            worker: Box::pin(async move {
+                let _ = hold.await;
+                Ok(())
+            }),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    async fn until_idle(service: &StreamingDataService) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.is_transferring().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the transfer should have finished");
+    }
+
+    /// The race in BMC-Firmware#127: a second firmware transfer replaced the
+    /// first, whose `osupdate` carried on writing the spare volume.
+    #[tokio::test]
+    async fn an_exclusive_transfer_is_refused_while_one_runs() {
+        let service = StreamingDataService::new();
+        let (release_first, hold_first) = oneshot::channel();
+        service
+            .request_exclusive_transfer(request("first", hold_first))
+            .await
+            .expect("the first starts");
+        assert!(service.is_transferring().await);
+
+        let (_release_second, hold_second) = oneshot::channel();
+        let refused = service
+            .request_exclusive_transfer(request("second", hold_second))
+            .await;
+        match refused {
+            Err(StreamingServiceError::Busy(running)) => assert_eq!(running, "first"),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        // The one that was running is still the one that is.
+        assert!(service.is_transferring().await);
+
+        release_first.send(()).expect("the worker is still waiting");
+        until_idle(&service).await;
+
+        let (_release_third, hold_third) = oneshot::channel();
+        service
+            .request_exclusive_transfer(request("third", hold_third))
+            .await
+            .expect("once the first has finished the next may start");
+    }
+
+    /// A node flash keeps its old meaning: it replaces a running transfer.
+    #[tokio::test]
+    async fn a_plain_transfer_still_replaces_the_running_one() {
+        let service = StreamingDataService::new();
+        let (_release_first, hold_first) = oneshot::channel();
+        service
+            .request_transfer(request("first", hold_first))
+            .await
+            .expect("first");
+        let (_release_second, hold_second) = oneshot::channel();
+        service
+            .request_transfer(request("second", hold_second))
+            .await
+            .expect("second replaces it");
+        assert!(service.is_transferring().await);
+    }
+
+    #[test]
+    fn busy_is_a_409_that_names_the_running_transfer() {
+        let response: LegacyResponse =
+            StreamingServiceError::Busy("firmware upgrade service".to_string()).into();
+        match response {
+            LegacyResponse::Error(status, message) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(message.contains("firmware upgrade service"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
 }
