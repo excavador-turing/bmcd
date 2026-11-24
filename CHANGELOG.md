@@ -40,6 +40,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `www` bundle that needs more (an external host, an inline script) has to be
   built to this policy. Refs BMC-Firmware#99; found in the review by Daniel
   Steinhauf ([@danste22](https://github.com/danste22)).
+- bincode 1 stays for `bmcd.bin`, on purpose: see `deny.toml` (RUSTSEC-2025-0141).
 
 ## [2.48.0] — 2026-11-24
 
