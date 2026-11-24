@@ -10,6 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **RUSTSEC-2026-0594 (`cookie` 0.16, via actix-web) is accepted, with the
+  reason in `deny.toml`.** The advisory is AES-GCM nonce reuse in
+  `PrivateJar::add` and `add_original` after `fork()`. That API exists only
+  behind cookie's `private` feature, which actix-web does not enable (the
+  lockfile has no `aes-gcm`), bmcd sets no cookies and authenticates with
+  Bearer tokens, and the daemon does not fork. The fixed cookie 0.18.3 is out
+  of reach: the newest actix-web (4.20.0) still requires `cookie ^0.16`. To be
+  revisited when an actix-web release moves to a fixed cookie. Found by the
+  weekly advisories job that Daniel Steinhauf ([@danste22](https://github.com/danste22))
+  asked for in BMC-Firmware#93.
+
 ## [2.48.0] — 2026-11-24
 
 A security release. It carries the fixes from a review of the BMC's web and
