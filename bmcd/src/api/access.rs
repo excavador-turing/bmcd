@@ -316,7 +316,9 @@ async fn set_password(
     match result {
         Ok(Ok(output)) if output.status.success() => {
             // The shadow watcher drops sessions when the hash changes. Drop
-            // them here as well, so a token cannot outlive this call.
+            // them here as well, so a token cannot outlive this call. That
+            // includes the caller's own: it signs in again with the new
+            // password, and the API text says so.
             auth.clear_sessions().await;
             tracing::info!(
                 "password changed for {} by {}",

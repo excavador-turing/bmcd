@@ -94,7 +94,9 @@ compare the whole parameter value -- a `type` that merely *starts* with
 `firmware` was being swallowed by the transfer machinery. The
 transfer itself is not query-string RPC: `POST /api/bmc/upload/{handle}` streams
 the bytes and `GET /api/bmc/upload/{handle}/cancel` aborts it. Alongside those
-sit `GET /api/bmc/backup` (a tar of `/mnt/overlay/upper`),
+sit `POST /api/bmc/backup` (a tar of `/mnt/overlay/upper`, without the account
+hashes, the TLS keys and the SSH host keys, so a restore keeps the board's current
+ones; the `GET` form is still served with a Bearer token for one release),
 `POST /api/bmc/serial/status`, and the serial websocket at `/api/bmc/serial/ws`.
 There is no `GET /api/bmc/info`: it answers 401 unauthenticated, which makes it
 look like a route, and once authenticated it falls through to the SPA and

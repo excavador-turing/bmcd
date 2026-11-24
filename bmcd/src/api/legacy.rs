@@ -143,9 +143,14 @@ const OVERLAY_UPPER: &str = "/mnt/overlay/upper";
 
 /// Paths a backup must not contain. Relative to the overlay upper directory.
 ///
-/// The account hashes (`etc/shadow`, its `-` backup, `etc/gshadow*`) and
-/// anything under `etc/ssl` that is a `.pem` or has `key` in its name: the
-/// daemon's private key and any other.
+/// The account hashes (`etc/shadow`, its `-` backup, `etc/gshadow*`),
+/// anything under `etc/ssl` that is a `.pem` or has `key` in its name (the
+/// daemon's private key and any other), and the SSH host keys:
+/// `etc/ssh/ssh_host_*` (OpenSSH) and everything under `etc/dropbear/`.
+///
+/// A restore only writes what the archive holds, so the board it is restored
+/// onto keeps the keys it has; a backup is not a way to clone a board's
+/// identity onto another.
 fn is_backup_secret(rel: &Path) -> bool {
     let parts: Vec<String> = rel
         .components()
@@ -164,6 +169,14 @@ fn is_backup_secret(rel: &Path) -> bool {
             .map(|n| n.to_ascii_lowercase())
             .unwrap_or_default();
         return name.ends_with(".pem") || name.contains("key");
+    }
+    if parts.len() > 2 && parts[0] == "etc" && parts[1] == "dropbear" {
+        return true;
+    }
+    if parts.len() > 2 && parts[0] == "etc" && parts[1] == "ssh" {
+        return parts
+            .last()
+            .is_some_and(|name| name.starts_with("ssh_host_"));
     }
     false
 }
@@ -234,8 +247,8 @@ fn backup_stream(root: PathBuf) -> impl futures::Stream<Item = io::Result<bytes:
     )
 }
 
-/// `POST /api/bmc/backup`: the overlay, streamed, without the account hashes
-/// or private keys. `GET` is still routed for older clients, and the
+/// `POST /api/bmc/backup`: the overlay, streamed, without the account hashes,
+/// the TLS keys or the SSH host keys. `GET` is still routed for older clients, and the
 /// middleware serves it only with a Bearer token.
 #[route("/backup", method = "GET", method = "POST")]
 async fn backup_handler() -> HttpResponse {
@@ -1590,8 +1603,12 @@ mod test {
         let etc = root.path().join("etc");
         let certs = etc.join("ssl/certs");
         let private = etc.join("ssl/private");
+        let ssh = etc.join("ssh");
+        let dropbear = etc.join("dropbear");
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(&dropbear).unwrap();
         for secret in ["shadow", "shadow-", "gshadow", "gshadow-"] {
             std::fs::write(etc.join(secret), "secret").unwrap();
         }
@@ -1599,6 +1616,17 @@ mod test {
         std::fs::write(certs.join("bmcd_cert.pem"), "cert").unwrap();
         std::fs::write(private.join("server.key"), "key").unwrap();
         std::fs::write(etc.join("hostname"), "bmc").unwrap();
+        // The host keys stay on the board; the rest of their directories goes.
+        for host in [
+            "ssh_host_ed25519_key",
+            "ssh_host_ed25519_key.pub",
+            "ssh_host_rsa_key",
+        ] {
+            std::fs::write(ssh.join(host), "host").unwrap();
+        }
+        std::fs::write(ssh.join("sshd_config"), "Port 22").unwrap();
+        std::fs::write(dropbear.join("dropbear_ed25519_host_key"), "host").unwrap();
+        std::fs::write(dropbear.join("dropbear.conf"), "conf").unwrap();
         // A link to a secret outside the overlay is stored as a link, not
         // followed into the archive.
         std::os::unix::fs::symlink("/etc/passwd", etc.join("localtime")).unwrap();
@@ -1608,6 +1636,7 @@ mod test {
         let names = archive_names(builder.into_inner().unwrap());
 
         assert!(names.iter().any(|(n, _)| n == "etc/hostname"));
+        assert!(names.iter().any(|(n, _)| n == "etc/ssh/sshd_config"));
         assert!(names
             .iter()
             .any(|(n, t)| n == "etc/localtime" && *t == tar::EntryType::Symlink));
@@ -1615,6 +1644,8 @@ mod test {
             assert!(!name.contains("shadow"), "{name}");
             assert!(!name.ends_with(".pem"), "{name}");
             assert!(!name.contains("key"), "{name}");
+            assert!(!name.contains("ssh_host_"), "{name}");
+            assert!(!name.starts_with("etc/dropbear/"), "{name}");
         }
     }
 

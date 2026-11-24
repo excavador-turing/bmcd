@@ -407,7 +407,10 @@ fn session_paths() -> Vec<(String, Value)> {
     let cross = json!({ "description": "`Sec-Fetch-Site` is `cross-site` or `same-site`." });
     let backup_ok = json!({
         "description": "A gzip'd tar of the overlay, streamed. Left out: `etc/shadow`, \
-            `etc/shadow-`, `etc/gshadow*`, and every `.pem` or `*key*` under `etc/ssl`. \
+            `etc/shadow-`, `etc/gshadow*`, every `.pem` or `*key*` under `etc/ssl`, the SSH \
+            host keys (`etc/ssh/ssh_host_*` and everything under `etc/dropbear/`). A restore \
+            writes only what the archive holds, so the board it goes back onto keeps its \
+            current host keys, TLS keys and account hashes. \
             Symlinks are stored as links and overlay whiteouts are kept. A failure part-way \
             aborts the response, so the download fails rather than ending short.",
         "content": { "application/gzip": { "schema": { "type": "string", "format": "binary" } } }
@@ -442,7 +445,8 @@ fn session_paths() -> Vec<(String, Value)> {
                 "summary": "Revoke the bearer token this request carries",
                 "operationId": "postLogout",
                 "description": "The `Bearer` scheme is matched case-insensitively. Other \
-                    sessions are not touched; a password change drops all of them.",
+                    sessions are not touched; a password change ends all of them, the \
+                    caller's included.",
                 "security": [{ "bearer": [] }],
                 "responses": {
                     "204": { "description": "The token is revoked." },
@@ -524,8 +528,9 @@ fn access_paths() -> Vec<(String, Value)> {
                 "description": "The CURRENT password is required, including from an operator a \
                                 proxy vouched for: a certificate proves the gateway trusts you, \
                                 not that you hold this board's console. At least 12 characters, \
-                                counted as characters rather than bytes. Existing sessions keep \
-                                working -- a token outlives the password it was minted from.",
+                                counted as characters rather than bytes. A successful change ends \
+                                EVERY session, the caller's included: the next request needs the \
+                                new password, on `POST /api/bmc/authenticate`.",
                 "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                     "type": "object",
                     "required": ["username", "current_password", "new_password"],
