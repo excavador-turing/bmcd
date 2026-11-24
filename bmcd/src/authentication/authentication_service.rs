@@ -498,6 +498,9 @@ fn routed_path(request: &ServiceRequest) -> &str {
 ///   one on the wire; see [`request_policy::is_percent_encoded`]. The
 ///   remaining checks read the routed path as well, so they hold on their
 ///   own.
+/// * A WebSocket handshake opened from another site (`Sec-Fetch-Site`, or an
+///   `Origin` that is not the `Host`): 403. See
+///   [`request_policy::is_cross_site_handshake`].
 /// * A state change that `Sec-Fetch-Site` says came from another site or
 ///   another origin of this one: 403. `same-origin`, `none` or no header pass.
 /// * A state change on `GET` (`?opt=set`, an upload cancel, a backup): 405,
@@ -526,6 +529,16 @@ fn policy_refusal<B>(
         tracing::warn!("refused {method} {raw_path}: the path is percent-encoded");
         return refuse(
             HttpResponse::BadRequest().body("the path of an API request is not percent-encoded"),
+        );
+    }
+    // A WebSocket handshake is a GET, so the state-change checks below do not
+    // see it, and the browser does not apply the same-origin policy to it.
+    // The serial console reads and writes a node's UART: another site may
+    // not open it, with a credential the browser attached by itself or not.
+    if is_websocket_handshake(request.head()) && request_policy::is_cross_site_handshake(headers) {
+        tracing::warn!("refused a cross-site WebSocket handshake on {path}");
+        return refuse(
+            HttpResponse::Forbidden().body("a WebSocket opened from another site is refused"),
         );
     }
     let state_change = request_policy::is_state_change(method, path, query);
@@ -1844,6 +1857,122 @@ mod tests {
         assert_eq!(status_from(&app, request).await, StatusCode::UNAUTHORIZED);
         let request = set_request(Method::POST, "/api/bmc?opt=set&type=power&node1=1");
         assert_eq!(status_from(&app, request).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A browser's handshake, as a page on this origin opens it: the
+    /// subprotocol token and the headers a browser adds.
+    fn browser_handshake() -> TestRequest {
+        handshake().insert_header((header::SEC_WEBSOCKET_PROTOCOL, subprotocols()))
+    }
+
+    /// A page on another site, or a sibling host of this one, may not open
+    /// the serial console, whatever it offers.
+    #[actix_web::test]
+    async fn a_cross_site_handshake_is_refused() {
+        for site in ["cross-site", "same-site"] {
+            let response = call(
+                browser_handshake()
+                    .insert_header(("Sec-Fetch-Site", site))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{site}");
+        }
+        // Without a credential too: the refusal comes before it is read.
+        let response = call(
+            handshake()
+                .insert_header(("Sec-Fetch-Site", "cross-site"))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn a_same_origin_handshake_is_served() {
+        for site in ["same-origin", "none"] {
+            let response = call(
+                browser_handshake()
+                    .insert_header(("Sec-Fetch-Site", site))
+                    .insert_header(("Origin", "https://bmc.local"))
+                    .insert_header((header::HOST, "bmc.local"))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{site}");
+        }
+    }
+
+    /// A browser without `Sec-Fetch-Site`: the `Origin` is compared with the
+    /// `Host`.
+    #[actix_web::test]
+    async fn without_fetch_site_the_origin_is_compared_with_the_host() {
+        for (origin, host, status) in [
+            ("https://evil.example", "bmc.local", StatusCode::FORBIDDEN),
+            ("https://bmc.local:8443", "bmc.local", StatusCode::FORBIDDEN),
+            ("https://bmc.local", "bmc.local:8443", StatusCode::FORBIDDEN),
+            ("https://sibling.local", "bmc.local", StatusCode::FORBIDDEN),
+            ("null", "bmc.local", StatusCode::FORBIDDEN),
+            ("https://bmc.local", "bmc.local", StatusCode::OK),
+            ("https://BMC.local:443", "bmc.local", StatusCode::OK),
+            ("https://bmc.local:8443", "bmc.local:8443", StatusCode::OK),
+        ] {
+            let response = call(
+                browser_handshake()
+                    .insert_header(("Origin", origin))
+                    .insert_header((header::HOST, host))
+                    .to_srv_request(),
+            )
+            .await;
+            assert_eq!(response.status(), status, "{origin} vs {host}");
+        }
+    }
+
+    /// `tpi` and `curl` send neither header: unchanged.
+    #[actix_web::test]
+    async fn a_handshake_that_is_not_from_a_browser_is_served() {
+        let response = call(
+            handshake()
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The refusal is `policy_refusal`'s, which `call` runs before the
+    /// certificate-and-identity-header branch, so a request that connection
+    /// would have authenticated is refused too. (A test request cannot carry
+    /// connection data, so this asks `policy_refusal` itself.)
+    #[actix_web::test]
+    async fn the_policy_refuses_a_cross_site_handshake_before_any_identity() {
+        let request = handshake()
+            .insert_header((IDENTITY_HEADER, "person@example.com"))
+            .insert_header(("Sec-Fetch-Site", "same-site"))
+            .to_srv_request();
+        let refusal = policy_refusal::<BoxBody>(&request, "test realm").expect("refused");
+        assert_eq!(refusal.status(), StatusCode::FORBIDDEN);
+
+        let request = handshake()
+            .insert_header((IDENTITY_HEADER, "person@example.com"))
+            .insert_header(("Sec-Fetch-Site", "same-origin"))
+            .to_srv_request();
+        assert!(policy_refusal::<BoxBody>(&request, "test realm").is_none());
+    }
+
+    /// Reads from another site stay as they were, and so does a GET that only
+    /// looks like a handshake.
+    #[actix_web::test]
+    async fn only_a_handshake_is_held_to_the_origin_rule() {
+        let response = call(
+            rest_call()
+                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .insert_header(("Sec-Fetch-Site", "cross-site"))
+                .insert_header(("Origin", "https://evil.example"))
+                .to_srv_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Contract C3: Basic is refused on any browser request, even with the

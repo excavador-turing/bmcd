@@ -16,7 +16,10 @@
 //! looks at a credential: is it a state change, is it from a browser, is it
 //! cross-site. One place, read by the middleware, so a route cannot opt out.
 
-use actix_web::http::{header::HeaderMap, Method};
+use actix_web::http::{
+    header::{self, HeaderMap},
+    Method,
+};
 use actix_web::web;
 use std::collections::HashMap;
 
@@ -100,6 +103,86 @@ pub fn is_cross_site(headers: &HeaderMap) -> bool {
         .is_some_and(|site| {
             site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("same-site")
         })
+}
+
+/// A WebSocket handshake that another site opened.
+///
+/// `is_cross_site` is applied to state changes, and a handshake is a `GET`, so
+/// the serial console (`/api/bmc/serial/ws`, which reads and writes a node's
+/// UART) was open to a page on another site whenever the browser attached the
+/// credential by itself: behind a reverse proxy that authenticates with a
+/// client certificate and names the person in a header, the browser sends
+/// no token of its own. A WebSocket is not bound by the same-origin policy,
+/// so the daemon has to ask.
+///
+/// * `Sec-Fetch-Site` present: only `same-origin` and `none` pass.
+/// * Otherwise `Origin` present (a browser too old for `Sec-Fetch-Site`):
+///   its host and port must be those of the `Host` header. Scheme is not
+///   compared, the host is case-insensitive, and a missing port is the
+///   default of the origin's scheme. `Origin: null` and anything that does
+///   not parse are another site.
+/// * Neither header: not a browser (`tpi`, `curl`), as before.
+pub fn is_cross_site_handshake(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return !site.to_str().is_ok_and(|site| {
+            site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none")
+        });
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    !origin
+        .to_str()
+        .ok()
+        .zip(host)
+        .is_some_and(|(origin, host)| origin_is_host(origin, host))
+}
+
+/// `Origin` (`scheme://host[:port]`) names the same host and port as `Host`.
+fn origin_is_host(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return false,
+    };
+    match (split_authority(authority), split_authority(host)) {
+        (Some((origin_host, origin_port)), Some((host_host, host_port))) => {
+            origin_host == host_host
+                && origin_port.unwrap_or(default_port) == host_port.unwrap_or(default_port)
+        }
+        _ => false,
+    }
+}
+
+/// `host`, `host:port` or `[v6]:port`, with the host lowercased.
+fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
+    let authority = authority.trim();
+    if authority.is_empty() || authority.contains(['/', '@', '?', '#', ' ']) {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (address, after) = rest.split_once(']')?;
+        let port = match after {
+            "" => None,
+            after => Some(after.strip_prefix(':')?),
+        };
+        (format!("[{address}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host.to_string(), Some(port)),
+            Some(_) => return None,
+            None => (authority.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = port.map(str::parse::<u16>).transpose().ok()?;
+    Some((host.to_ascii_lowercase(), port))
 }
 
 /// The token of an `Authorization: Bearer <token>` line. The scheme is
@@ -293,6 +376,94 @@ mod tests {
         )])));
         assert!(!is_cross_site(&headers(&[("sec-fetch-site", "none")])));
         assert!(!is_cross_site(&headers(&[])));
+    }
+
+    #[test]
+    fn a_handshake_from_another_site_is_cross_site() {
+        for site in ["cross-site", "same-site", "Cross-Site", "", "unknown"] {
+            let mut map = HeaderMap::new();
+            map.insert(
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_str(site).unwrap(),
+            );
+            assert!(is_cross_site_handshake(&map), "{site:?}");
+        }
+        for site in ["same-origin", "none", "Same-Origin"] {
+            let mut map = HeaderMap::new();
+            map.insert(
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_str(site).unwrap(),
+            );
+            assert!(!is_cross_site_handshake(&map), "{site:?}");
+        }
+    }
+
+    /// `Sec-Fetch-Site` wins when it is there: an `Origin` that matches the
+    /// `Host` does not rescue a request the browser says is cross-site.
+    #[test]
+    fn fetch_site_decides_before_origin() {
+        assert!(is_cross_site_handshake(&headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://bmc.local"),
+            ("host", "bmc.local"),
+        ])));
+        assert!(!is_cross_site_handshake(&headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://evil.example"),
+            ("host", "bmc.local"),
+        ])));
+    }
+
+    #[test]
+    fn without_fetch_site_the_origin_must_be_the_host() {
+        // Not a browser: no Origin, no Sec-Fetch-Site.
+        assert!(!is_cross_site_handshake(&headers(&[("host", "bmc.local")])));
+        assert!(!is_cross_site_handshake(&headers(&[])));
+
+        for (origin, host) in [
+            ("https://bmc.local", "bmc.local"),
+            ("https://BMC.local", "bmc.LOCAL"),
+            ("https://bmc.local:443", "bmc.local"),
+            ("https://bmc.local", "bmc.local:443"),
+            ("http://bmc.local", "bmc.local:80"),
+            ("https://bmc.local:8443", "bmc.local:8443"),
+            ("wss://bmc.local", "bmc.local"),
+            ("https://192.168.1.50", "192.168.1.50"),
+            ("https://[fd00::1]:8443", "[fd00::1]:8443"),
+            ("https://[FD00::1]", "[fd00::1]:443"),
+        ] {
+            assert!(
+                !is_cross_site_handshake(&headers(&[("origin", origin), ("host", host)])),
+                "{origin} vs {host}"
+            );
+        }
+        for (origin, host) in [
+            ("https://evil.example", "bmc.local"),
+            ("https://bmc.local:8443", "bmc.local"),
+            ("https://bmc.local", "bmc.local:8443"),
+            ("http://bmc.local", "bmc.local:443"),
+            ("https://bmc.local.evil.example", "bmc.local"),
+            ("https://evil.example/bmc.local", "bmc.local"),
+            ("https://bmc.local@evil.example", "bmc.local"),
+            ("https://sibling.local", "bmc.local"),
+            ("https://[fd00::2]", "[fd00::1]"),
+            ("null", "bmc.local"),
+            ("", "bmc.local"),
+            ("bmc.local", "bmc.local"),
+            ("file://bmc.local", "bmc.local"),
+            ("https://bmc.local", ""),
+            ("https://bmc.local:99999", "bmc.local"),
+        ] {
+            assert!(
+                is_cross_site_handshake(&headers(&[("origin", origin), ("host", host)])),
+                "{origin} vs {host}"
+            );
+        }
+        // An Origin and no Host at all cannot be shown to match.
+        assert!(is_cross_site_handshake(&headers(&[(
+            "origin",
+            "https://bmc.local"
+        )])));
     }
 
     #[test]

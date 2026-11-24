@@ -10,6 +10,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **The serial console WebSocket refuses a handshake opened from another
+  site.** `/api/bmc/serial/ws` reads and writes a node's UART. A handshake is
+  a `GET`, so the cross-site refusal, which is applied to state changes, did
+  not see it, and a browser does not hold a WebSocket to the same-origin
+  policy. Behind a reverse proxy that authenticates with a client certificate
+  the browser sends no token of its own, so a page on another site, or on a
+  sibling host of the same site, could open the console. Directly on the board
+  it was not reachable this way: the web interface puts a bearer token in the
+  subprotocol and a browser's Basic credential is refused. A handshake whose
+  `Sec-Fetch-Site` is anything but `same-origin` or `none` is now 403, and
+  without that header (an older browser) so is one whose `Origin` is not the
+  `Host`: host and port are compared, the scheme is not, and a missing port is
+  the scheme's default. A client that sends neither header (`tpi`, `curl`) is
+  served as before, and the web interface, which opens the socket on its own
+  host, is not affected. Found in our own review. The refusal is made before
+  any credential, certificate or identity header is read.
+
 ## [2.50.1] — 2026-11-24
 
 A security release: a percent-encoded path could get past the refusal of a
