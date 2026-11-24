@@ -83,6 +83,14 @@ impl NodeId {
     pub fn to_bitfield(self) -> u8 {
         1 << self as u8
     }
+
+    /// Every node but this one. The real pin controller uses it; the
+    /// simulated one has no USB multiplexer to select, so a `stubbed` build
+    /// never calls it.
+    #[cfg_attr(feature = "stubbed", allow(dead_code))]
+    pub fn to_inverse_bitfield(self) -> u8 {
+        0b1111 & !(1 << self as u8)
+    }
 }
 
 impl Display for NodeId {
