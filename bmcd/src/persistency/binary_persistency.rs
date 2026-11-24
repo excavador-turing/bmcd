@@ -188,7 +188,6 @@ impl<'a> PersistencyStore {
         &self,
         mut source: impl std::io::Write + Seek + 'a,
     ) -> Result<(), PersistencyError<'a>> {
-        use std::io::Write as _;
         let bytes = self.encode().await?;
         source.rewind()?;
         if let Err(e) = source.write_all(&bytes) {
