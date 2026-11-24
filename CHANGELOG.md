@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Every state change over GET is refused, whatever the credential.** 2.48.0
+  still served the GET forms of a state change (every `opt=set` type, the
+  upload cancel and the backup) when they carried a Bearer token, so that older
+  `tpi` and BMC-UI kept working. That transition is over: those requests now
+  answer 405 with `Allow: POST`, with a Bearer token, with Basic or with none.
+  The backup, the cancel and the transfer are routed on POST only, and the
+  OpenAPI document no longer lists their GET forms. A workstation `tpi` must be
+  2.0 or newer, a separately served BMC-UI must be 4.8.0 or newer, and scripts
+  must use `curl -X POST`. (#73, carried by its replacement pull request;
+  BMC-Firmware#109, found by Daniel Steinhauf
+  ([@danste22](https://github.com/danste22)), who also wrote the fix.)
+
 ### Security
 
 - **RUSTSEC-2026-0594 (`cookie` 0.16, via actix-web) is accepted, with the
