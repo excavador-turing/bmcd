@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.50.0] — 2026-11-24
+
+Two changes, both from
+Daniel Steinhauf ([@danste22](https://github.com/danste22)): his move to
+`rockusb` 0.4 (step 3 of BMC-Firmware#93, three RK1 flashes tested on a board)
+and the `opt-level` suggestion he made in the same issue. Thank you, Daniel.
+
 ### Changed
 
 - **`sha2`, `crc` and `crc32fast` are built at `opt-level = 3`.** The release
