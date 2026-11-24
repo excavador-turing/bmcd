@@ -857,12 +857,18 @@ mod restore_tests {
     async fn a_node_that_was_on_is_switched_back_on() {
         let (bmc, _dir) = flashed_board().await;
 
-        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, true).await.unwrap();
+        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, true)
+            .await
+            .unwrap();
 
         assert!(on);
         assert_eq!(bmc.rails(), 0b1111);
         assert!(bmc.get_node_power(NodeId::Node2).await.unwrap());
-        assert_eq!(bmc.pin_controller.simulated_usb_boot(), 0, "boot pin released");
+        assert_eq!(
+            bmc.pin_controller.simulated_usb_boot(),
+            0,
+            "boot pin released"
+        );
         assert_eq!(
             bmc.get_usb_mode().await.unwrap().0,
             UsbConfig::UsbA(NodeId::Node1),
@@ -874,7 +880,9 @@ mod restore_tests {
     async fn a_node_that_was_off_or_failed_stays_off_with_usb_restored() {
         let (bmc, _dir) = flashed_board().await;
 
-        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, false).await.unwrap();
+        let on = UpgradeWorker::restore(&bmc, NodeId::Node2, false)
+            .await
+            .unwrap();
 
         assert!(!on);
         assert_eq!(bmc.rails(), 0b1101, "node 2 off, the others untouched");

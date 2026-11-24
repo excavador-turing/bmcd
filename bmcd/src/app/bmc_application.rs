@@ -1137,7 +1137,10 @@ mod power_tests {
         bmc.activate_slot(0b0100, 0b1111).await.unwrap();
 
         let err = bmc.reset_node(NodeId::Node2).await.unwrap_err();
-        assert_eq!(err.downcast_ref::<NodeIsOff>(), Some(&NodeIsOff(NodeId::Node2)));
+        assert_eq!(
+            err.downcast_ref::<NodeIsOff>(),
+            Some(&NodeIsOff(NodeId::Node2))
+        );
         assert!(!reported(&bmc, NodeId::Node2).await);
         assert_eq!(bmc.rails(), 0b0100, "the rails are where they were");
         // and the node that is on was not touched by the refusal.
@@ -1210,7 +1213,11 @@ mod power_tests {
         });
         tokio::time::sleep(MID_SETTLE).await;
         bmc.activate_slot(0b0010, 0b0010).await.unwrap();
-        assert_eq!(bmc.rails(), 0b0010, "switched on at once, not after the wait");
+        assert_eq!(
+            bmc.rails(),
+            0b0010,
+            "switched on at once, not after the wait"
+        );
 
         reset.await.unwrap().unwrap();
         assert!(reported(&bmc, NodeId::Node2).await);
