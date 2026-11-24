@@ -135,7 +135,9 @@ impl From<ChangeError> for SwitchError {
 }
 
 pub struct SwitchService {
-    inner: Mutex<Inner>,
+    /// Shared with the blocking thread that runs a change: it records what it
+    /// did here itself, because the future that started it may be gone.
+    inner: Arc<Mutex<Inner>>,
     path: PathBuf,
     /// `/etc/network/interfaces` twin of the switch document.
     interfaces_path: PathBuf,
@@ -145,9 +147,10 @@ pub struct SwitchService {
     bond_executors: Vec<PathBuf>,
     /// Runs `ip` and `bridge`. The real thing, unless a test says otherwise.
     exec: Arc<dyn Exec>,
-    /// One switch change at a time. Not held across `.await`: the commands
-    /// themselves run on a blocking thread, and this only stops a second
-    /// change starting while the first is still on that thread.
+    /// One switch change at a time. The turn is held by the blocking thread
+    /// that runs the commands, not by the future waiting for it: if the request
+    /// is dropped (the client went away) the thread carries on, and the next
+    /// change still waits for it to finish.
     busy: Arc<AtomicBool>,
     busy_notify: Arc<Notify>,
 }
@@ -179,13 +182,13 @@ impl SwitchService {
         }
 
         SwitchService {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 state,
                 // Until something is applied, the board is on whatever it
                 // boots as, which is Flat.
                 running: Preset::flat().expand(),
                 replaces_hand_written: false,
-            }),
+            })),
             path,
             interfaces_path: PathBuf::from(INTERFACES_FILE),
             net_class: NET_CLASS.into(),
@@ -218,36 +221,28 @@ impl SwitchService {
         }
     }
 
-    /// `ip` / `bridge` off the async worker, and not while `inner` is held.
-    async fn blocking_plan(
-        &self,
-        commands: &[Command],
-    ) -> Result<(usize, Result<(), SwitchError>), SwitchError> {
-        let exec = Arc::clone(&self.exec);
-        let commands = commands.to_vec();
-        tokio::task::spawn_blocking(move || run_plan(exec.as_ref(), &commands))
-            .await
-            .map_err(|e| {
-                SwitchError::Io(std::io::Error::other(format!(
-                    "switch command task stopped: {e}"
-                )))
-            })
-    }
-
-    async fn blocking_all(&self, commands: &[Command]) -> Result<(), SwitchError> {
-        self.blocking_plan(commands).await?.1
-    }
-
-    async fn blocking_best_effort(&self, commands: &[Command]) -> Result<(), SwitchError> {
-        let exec = Arc::clone(&self.exec);
-        let commands = commands.to_vec();
-        tokio::task::spawn_blocking(move || run_best_effort(exec.as_ref(), &commands))
-            .await
-            .map_err(|e| {
-                SwitchError::Io(std::io::Error::other(format!(
-                    "switch command task stopped: {e}"
-                )))
-            })?
+    /// Run `work` on a blocking thread that owns `turn`.
+    ///
+    /// `ip` and `bridge` are processes, so they run off the async workers, and
+    /// `inner` is not held while they do. The turn travels with the work and
+    /// not with the future that awaits it: a request future is dropped when its
+    /// client disconnects, while the thread keeps running its commands. The
+    /// turn is released when the commands are done, and `work` records what it
+    /// did in `inner` itself, because nothing else will.
+    async fn run_owning_turn<T: Send + 'static>(
+        turn: SwitchTurn,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, SwitchError> {
+        tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            work()
+        })
+        .await
+        .map_err(|e| {
+            SwitchError::Io(std::io::Error::other(format!(
+                "switch command task stopped: {e}"
+            )))
+        })
     }
 }
 
@@ -337,25 +332,6 @@ impl SwitchService {
         None
     }
 
-    /// The switch as the kernel reports it, for after a plan that did not run
-    /// clean: what `fallback` says is running is then a guess, and the next
-    /// plan would be computed from it. Falls back to `fallback` when the
-    /// kernel cannot be read.
-    ///
-    /// `bridge -j vlan show` is a process, so this runs on a blocking thread,
-    /// and the callers do not hold `inner` while it does.
-    async fn running_from_reality(&self, fallback: &SwitchDocument) -> SwitchDocument {
-        let exec = Arc::clone(&self.exec);
-        let net_class = self.net_class.clone();
-        let owned = fallback.clone();
-        tokio::task::spawn_blocking(move || running_from_kernel(exec.as_ref(), &net_class, &owned))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("reading the switch back from the kernel stopped: {e}");
-                fallback.clone()
-            })
-    }
-
     /// Look for `br0` somewhere other than the kernel's `/sys/class/net`.
     #[cfg(test)]
     pub fn with_net_class(mut self, net_class: impl Into<PathBuf>) -> Self {
@@ -411,7 +387,7 @@ impl SwitchService {
             );
             return Ok(());
         }
-        let _turn = self.switch_turn().await;
+        let turn = self.switch_turn().await;
         let mut inner = self.inner.lock().await;
         let Some(document) = inner.state.confirmed().cloned() else {
             return Ok(());
@@ -489,16 +465,14 @@ impl SwitchService {
             };
             let commands = plan(&baseline, &document);
             drop(inner);
-            self.blocking_all(&commands).await?;
-            self.inner.lock().await.running = document;
+            self.run_all_owning_turn(turn, commands, document).await?;
             return Ok(());
         }
 
         let baseline = baseline.unwrap_or_else(|| Preset::flat().expand());
         let commands = plan(&baseline, &document);
         drop(inner);
-        self.blocking_all(&commands).await?;
-        self.inner.lock().await.running = document;
+        self.run_all_owning_turn(turn, commands, document).await?;
         tracing::info!("switch configuration applied from {}", self.path.display());
         Ok(())
     }
@@ -528,7 +502,7 @@ impl SwitchService {
         window: Duration,
         replace_hand_written: bool,
     ) -> Result<Pending, SwitchError> {
-        let _turn = self.switch_turn().await;
+        let turn = self.switch_turn().await;
         self.bridge_check()?;
         let lag = document.second_uplink == SecondUplink::Lag;
         if lag && !self.bond_native() {
@@ -582,24 +556,32 @@ impl SwitchService {
             // A failure here leaves the switch part-way. Undo what it did,
             // best-effort (steps that never ran usually fail too), and then
             // drop the pending change. What is undone is only what this apply
-            // did: see [`undo_plan`]. The commands run on a blocking thread,
-            // and `inner` is not held while they run: one of the two workers
+            // did: see [`undo_plan`]. All of it runs on one blocking thread
+            // that owns the turn and records the outcome in `inner` itself, so
+            // a client that goes away half-way leaves neither a second change
+            // interleaved with these commands nor a `running` that was never
+            // written. `inner` is not held meanwhile: one of the two workers
             // would otherwise sit inside `ip` or `bridge`.
             drop(inner);
-            let (done, outcome) = self.blocking_plan(&commands).await?;
-            let mut inner = self.inner.lock().await;
-            if let Err(e) = outcome {
-                let bond_created = commands.iter().take(done).any(creates_bond);
-                let undo = undo_plan(&previous, &document, bond_created);
-                drop(inner);
-                let _ = self.blocking_best_effort(&undo).await;
-                let running = self.running_from_reality(&previous).await;
-                let mut inner = self.inner.lock().await;
-                inner.running = running;
-                let _ = inner.state.revert(SystemTime::now());
-                return Err(e);
-            }
-            inner.running = document;
+            let exec = Arc::clone(&self.exec);
+            let net_class = self.net_class.clone();
+            let shared = Arc::clone(&self.inner);
+            Self::run_owning_turn(turn, move || -> Result<(), SwitchError> {
+                let (done, outcome) = run_plan(exec.as_ref(), &commands);
+                if let Err(e) = outcome {
+                    let bond_created = commands.iter().take(done).any(creates_bond);
+                    let undo = undo_plan(&previous, &document, bond_created);
+                    let _ = run_best_effort(exec.as_ref(), &undo);
+                    let running = running_from_kernel(exec.as_ref(), &net_class, &previous);
+                    let mut inner = shared.blocking_lock();
+                    inner.running = running;
+                    let _ = inner.state.revert(SystemTime::now());
+                    return Err(e);
+                }
+                shared.blocking_lock().running = document;
+                Ok(())
+            })
+            .await??;
         }
         Ok(pending)
     }
@@ -772,16 +754,14 @@ impl SwitchService {
     }
 
     pub async fn revert(&self) -> Result<(), SwitchError> {
-        let _turn = self.switch_turn().await;
+        let turn = self.switch_turn().await;
         let (effect, running) = {
             let mut inner = self.inner.lock().await;
             let effect = inner.state.revert(SystemTime::now())?;
             let running = inner.running.clone();
             (effect, running)
         };
-        let (next, outcome) = self.carry_out(effect, &running).await;
-        self.inner.lock().await.running = next;
-        outcome
+        self.carry_out(turn, effect, running).await
     }
 
     /// Called on a timer. Starts a window whose uplink has come up, and puts
@@ -792,7 +772,7 @@ impl SwitchService {
 
     /// [`tick`](Self::tick) at a given time.
     pub(crate) async fn tick_at(&self, now: SystemTime) {
-        let _turn = self.switch_turn().await;
+        let turn = self.switch_turn().await;
         let (effect, running) = {
             let mut inner = self.inner.lock().await;
             self.start_window_if_reachable(&mut inner, now);
@@ -803,13 +783,11 @@ impl SwitchService {
             tracing::warn!("switch change was not confirmed in its window; putting the previous configuration back");
             (effect, inner.running.clone())
         };
-        let (next, outcome) = self.carry_out(effect, &running).await;
-        if let Err(e) = &outcome {
+        if let Err(e) = self.carry_out(turn, effect, running).await {
             // There is nothing above this to tell. Saying so loudly is the
             // whole of the response.
             tracing::error!("could not put the previous switch configuration back: {e}");
         }
-        self.inner.lock().await.running = next;
     }
 
     /// Put a document back on the switch, for a revert.
@@ -821,24 +799,51 @@ impl SwitchService {
     /// the kernel rather than taken from the document, because after a failure
     /// the document is not what is running.
     ///
-    /// Returns the document that is running afterwards. The caller stores it
-    /// after the commands have finished, so the switch lock is not held while
-    /// `ip` or `bridge` runs.
+    /// The thread that runs the commands stores what is running afterwards,
+    /// once they have finished, so the switch lock is not held while `ip` or
+    /// `bridge` runs, and the turn is held until it has.
     async fn carry_out(
         &self,
+        turn: SwitchTurn,
         effect: Effect,
-        running: &SwitchDocument,
-    ) -> (SwitchDocument, Result<(), SwitchError>) {
-        if let Effect::Apply(document) = effect {
-            let commands = plan(running, &document);
-            let outcome = self.blocking_best_effort(&commands).await;
+        running: SwitchDocument,
+    ) -> Result<(), SwitchError> {
+        let Effect::Apply(document) = effect else {
+            return Ok(());
+        };
+        let commands = plan(&running, &document);
+        let exec = Arc::clone(&self.exec);
+        let net_class = self.net_class.clone();
+        let shared = Arc::clone(&self.inner);
+        Self::run_owning_turn(turn, move || -> Result<(), SwitchError> {
+            let outcome = run_best_effort(exec.as_ref(), &commands);
             let next = match &outcome {
                 Ok(()) => document,
-                Err(_) => self.running_from_reality(&document).await,
+                Err(_) => running_from_kernel(exec.as_ref(), &net_class, &document),
             };
-            return (next, outcome);
-        }
-        (running.clone(), Ok(()))
+            shared.blocking_lock().running = next;
+            outcome
+        })
+        .await?
+    }
+
+    /// Run a plan to the end, stopping at the first failure, and record
+    /// `document` as running if it all went through. For the boot, which has
+    /// nothing to undo.
+    async fn run_all_owning_turn(
+        &self,
+        turn: SwitchTurn,
+        commands: Vec<Command>,
+        document: SwitchDocument,
+    ) -> Result<(), SwitchError> {
+        let exec = Arc::clone(&self.exec);
+        let shared = Arc::clone(&self.inner);
+        Self::run_owning_turn(turn, move || -> Result<(), SwitchError> {
+            run_plan(exec.as_ref(), &commands).1?;
+            shared.blocking_lock().running = document;
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -878,7 +883,10 @@ fn kernel_vlans_from(exec: &dyn Exec) -> Option<KernelVlans> {
     }
 }
 
-/// [`SwitchService::running_from_reality`]'s blocking half.
+/// The switch as the kernel reports it, for after a plan that did not run
+/// clean: what `fallback` says is running is then a guess, and the next plan
+/// would be computed from it. Falls back to `fallback` when the kernel cannot
+/// be read. `bridge -j vlan show` is a process: call this on a blocking thread.
 fn running_from_kernel(
     exec: &dyn Exec,
     net_class: &Path,
@@ -2065,5 +2073,135 @@ mod tests {
                 tagged: [10].into_iter().collect()
             }
         );
+    }
+
+    // ---- one change at a time, and none of them on an async worker ---------
+
+    /// Holds the first command it is asked to run until the test lets it go,
+    /// and otherwise behaves as [`FakeExec`].
+    struct GateExec {
+        inner: Arc<FakeExec>,
+        taken: std::sync::atomic::AtomicBool,
+        /// Whether a command is being held, and whether it may go on.
+        state: std::sync::Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl GateExec {
+        fn new() -> Arc<Self> {
+            Arc::new(GateExec {
+                inner: FakeExec::new(),
+                taken: std::sync::atomic::AtomicBool::new(false),
+                state: std::sync::Mutex::new((false, false)),
+                changed: std::sync::Condvar::new(),
+            })
+        }
+        fn entered(&self) -> bool {
+            self.state.lock().unwrap().0
+        }
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl Exec for GateExec {
+        fn run(&self, program: &str, args: &[&str]) -> Result<String, ApplyError> {
+            let is_read = program == "bridge" && args.join(" ") == "-j vlan show";
+            if !is_read && !self.taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut state = self.state.lock().unwrap();
+                state.0 = true;
+                while !state.1 {
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+            self.inner.run(program, args)
+        }
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The request that started a change can be dropped while `ip` is still
+    /// running (the client went away). The change must still run to its end
+    /// and record what it left running, the next change must wait until it
+    /// has, and nothing but the commands' own thread may be held up meanwhile.
+    ///
+    /// On the single-threaded runtime of this test, a command run on the async
+    /// worker would hang the test at the gate instead of failing it.
+    #[tokio::test]
+    async fn a_change_whose_request_is_dropped_still_finishes_before_the_next_one_starts() {
+        let dir = tempdir::TempDir::new("switch-dropped-request").expect("temp dir");
+        let gate = GateExec::new();
+        let service = Arc::new(
+            SwitchService::load(dir.path().join("switch.json"))
+                .with_interfaces_path(dir.path().join("interfaces"))
+                .with_net_class(net(dir.path(), false, false))
+                .with_bond_executors(executor(dir.path()))
+                .with_exec(gate.clone()),
+        );
+
+        let first = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.apply(trunk(), DEFAULT_WINDOW, false).await }
+        });
+        until("the first command to start", || gate.entered()).await;
+
+        // The client goes away with the command still running.
+        first.abort();
+        assert!(first.await.is_err(), "the request was dropped");
+
+        // No worker is stuck in `ip`: the service still answers.
+        let view = tokio::time::timeout(Duration::from_secs(2), service.view())
+            .await
+            .expect("a running command does not hold up the service");
+        assert!(view.pending.is_some(), "the change is waiting to be proved");
+
+        // The next change waits for the one that is still running.
+        let second = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.revert().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "the next change waits for the one still running"
+        );
+        assert!(
+            gate.inner.ran().is_empty(),
+            "nothing else ran while the first command was held: {:#?}",
+            gate.inner.ran()
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second change finishes")
+            .expect("the task ran")
+            .expect("the revert");
+
+        let first_plan: Vec<String> = plan(&Preset::flat().expand(), &trunk())
+            .iter()
+            .map(|command| command.join(" "))
+            .collect();
+        let ran = gate.inner.ran();
+        assert!(ran.len() > first_plan.len(), "{ran:#?}");
+        assert_eq!(
+            ran[..first_plan.len()],
+            first_plan[..],
+            "the dropped change ran to its end before anything else"
+        );
+        // The revert was planned from what the first change left running: had
+        // `running` never been written, it would have had nothing to undo.
+        let view = service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.running, Preset::flat().expand());
     }
 }
