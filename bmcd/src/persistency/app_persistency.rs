@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::binary_persistency::PersistencyStore;
+use crate::utils::write_durably;
 use anyhow::Context;
 use futures::future::Either;
 use tokio::fs::{File, OpenOptions};
@@ -85,23 +86,27 @@ impl MonitorContext {
             return Ok(MonitorEvent::PersistencyWritten);
         };
 
-        let mut new = file.clone();
-        new.set_extension("new");
-
-        let pending = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&new)
-            .await?;
-        self.inner.write(pending.into_std().await).await?;
-
-        tokio::fs::rename(&new, &file).await.with_context(|| {
-            format!(
-                "error writing persistency binary. backup available at: {}",
-                new.to_string_lossy()
-            )
-        })?;
+        // Encoded in memory and handed to `write_durably`: the data is synced
+        // before the rename and the directory after it. On UBIFS a rename
+        // can reach the flash while the data behind it has not, and bmcd then
+        // starts on a short or empty `bmcd.bin`, with the default power
+        // state, USB mode and node information.
+        let bytes = self.inner.encode().await?;
+        let target = file.clone();
+        let written = tokio::task::spawn_blocking(move || write_durably(&target, &bytes))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result);
+        if let Err(e) = written {
+            // The store was marked clean when it was encoded.
+            self.inner.mark_dirty();
+            return Err(e).with_context(|| {
+                format!(
+                    "error writing persistency binary {}",
+                    file.to_string_lossy()
+                )
+            });
+        }
 
         Ok(MonitorEvent::PersistencyWritten)
     }
@@ -329,6 +334,72 @@ mod tests {
                 assert_eq!(persistency2.try_get::<u128>("test").await.unwrap(), 123u128);
             });
         });
+    }
+
+    /// The store reaches `bmcd.bin` through `write_durably` (BMC-Firmware#130):
+    /// the whole file replaces the old one, nothing is left beside it, and a
+    /// temporary left by an interrupted write is cleared. The flush before the
+    /// rename and the one on the directory are what a power cut needs and what
+    /// a test on a page cache cannot show; they are in `write_durably`, whose
+    /// own tests cover its steps.
+    #[tokio::test]
+    async fn a_commit_replaces_the_file_and_leaves_nothing_beside_it() {
+        let tmp_dir = TempDir::with_prefix("persistency_durable").unwrap();
+        let bin_file = tmp_dir.path().join("bmcd.bin");
+        std::fs::write(tmp_dir.path().join("bmcd.bin.tmp"), b"half a wri").unwrap();
+        let keys_with_default = [("test", bincode::serialize(&123u128).unwrap())];
+        // An hour: only the explicit commit below writes during this test.
+        let persistency = ApplicationPersistency::new(
+            keys_with_default.clone(),
+            &bin_file,
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+
+        persistency.try_set("test", &777u128).await.unwrap();
+        assert!(persistency.is_dirty());
+        persistency.context.commit_to_file().await.unwrap();
+        assert!(!persistency.is_dirty());
+
+        let mut names: Vec<_> = std::fs::read_dir(tmp_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["bmcd.bin"]);
+
+        let reloaded = ApplicationPersistency::new(keys_with_default, &bin_file, None)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.try_get::<u128>("test").await.unwrap(), 777u128);
+    }
+
+    /// A commit that fails leaves the old file as it was and the store dirty,
+    /// so the next sync tries again. A directory on the temporary's name makes
+    /// `write_durably` fail, even for root.
+    #[tokio::test]
+    async fn a_failed_commit_keeps_the_old_file_and_stays_dirty() {
+        let tmp_dir = TempDir::with_prefix("persistency_failed").unwrap();
+        let bin_file = tmp_dir.path().join("bmcd.bin");
+        let keys_with_default = [("test", bincode::serialize(&123u128).unwrap())];
+        let persistency = ApplicationPersistency::new(
+            keys_with_default,
+            &bin_file,
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+        persistency.try_set("test", &1u128).await.unwrap();
+        persistency.context.commit_to_file().await.unwrap();
+        let before = std::fs::read(&bin_file).unwrap();
+        assert!(!before.is_empty());
+
+        persistency.try_set("test", &2u128).await.unwrap();
+        std::fs::create_dir(tmp_dir.path().join("bmcd.bin.tmp")).unwrap();
+        assert!(persistency.context.commit_to_file().await.is_err());
+        assert!(persistency.is_dirty());
+        assert_eq!(std::fs::read(&bin_file).unwrap(), before);
     }
 
     #[tokio::test]

@@ -38,6 +38,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ([@adberger](https://github.com/adberger)) in BMC-Firmware#132, found by
   deterministic simulation testing. Thank you. (BMC-Firmware#132)
 
+### Fixed
+
+- **`bmcd.bin` is replaced durably.** The store that holds the power state, the
+  USB mode and the node information was written to a `.new` file beside it and
+  renamed over `bmcd.bin` with no flush of the data before the rename. On UBIFS
+  a power cut could leave the rename on flash and the data not, and bmcd then
+  started on new, default storage. It now goes through `write_durably`, like the switch,
+  address, TLS and access files: the data is flushed before the rename and the
+  directory after it, a temporary left by an interrupted write is cleared, and
+  a write that fails leaves the old file in place and the store marked
+  changed, so the next sync tries again. Reported by adberger
+  ([@adberger](https://github.com/adberger)) in BMC-Firmware#130, found by
+  reading the code while building a deterministic simulation test for the
+  board. Thank you. (BMC-Firmware#130)
+
 ## [2.50.0] — 2026-11-24
 
 Two changes, both from

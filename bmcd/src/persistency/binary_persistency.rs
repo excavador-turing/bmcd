@@ -153,10 +153,13 @@ impl<'a> PersistencyStore {
         watcher
     }
 
-    pub(super) async fn write(
-        &self,
-        mut source: impl Write + Seek + 'a,
-    ) -> Result<(), PersistencyError<'a>> {
+    /// The bytes of the store file: the header, then the data.
+    ///
+    /// The dirty flag is cleared here, while the read lock is held. A
+    /// `try_set` takes the write lock before it marks the store dirty, so a
+    /// change made after this snapshot marks it dirty again and a change made
+    /// before it is in the bytes.
+    pub(super) async fn encode(&self) -> Result<Vec<u8>, PersistencyError<'a>> {
         let cache = self.cache.read().await;
         let data = bincode::serialize(&cache.deref().0)
             .map_err(|e| PersistencyError::SerializationError("data serialization".into(), e))?;
@@ -165,13 +168,29 @@ impl<'a> PersistencyStore {
         header.data_size = u32::try_from(data.len())
             .map_err(|_| PersistencyError::Limit("persistency size > 4.2GB not supported"))?;
 
-        let header_bytes = bincode::serialize(&header)
+        let mut bytes = bincode::serialize(&header)
             .map_err(|e| PersistencyError::SerializationError("header serialization".into(), e))?;
-
-        source.rewind()?;
-        source.write_all(&header_bytes)?;
-        source.write_all(&data)?;
+        bytes.extend_from_slice(&data);
         self.dirty.store(false, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
+    /// Say that what [`encode`](Self::encode) returned did not reach the
+    /// file, so the next sync writes it again.
+    pub(super) fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) async fn write(
+        &self,
+        mut source: impl Write + Seek + 'a,
+    ) -> Result<(), PersistencyError<'a>> {
+        let bytes = self.encode().await?;
+        source.rewind()?;
+        if let Err(e) = source.write_all(&bytes) {
+            self.mark_dirty();
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -304,6 +323,40 @@ mod tests {
             cursor.get_ref()[..cursor.position() as usize],
             write_cursor.get_ref()[..write_cursor.position() as usize]
         );
+    }
+
+    /// `encode` is what `write` puts in the file, and it is what the daemon
+    /// hands to `write_durably`.
+    #[tokio::test]
+    async fn encode_is_the_file_and_clears_the_dirty_flag() {
+        let mut cursor = Cursor::new(Vec::new());
+        let store = PersistencyStore::new(
+            [("test", bincode::serialize(&123u128).unwrap())],
+            &mut cursor,
+        )
+        .unwrap();
+        store.try_set("test", 5u128).await.unwrap();
+        assert!(store.is_dirty());
+
+        let bytes = store.encode().await.unwrap();
+        assert!(!store.is_dirty());
+        // A write that did not reach the file says so, and the next sync
+        // writes it again.
+        store.mark_dirty();
+        assert!(store.is_dirty());
+
+        let mut reloaded = HashMap::new();
+        PersistencyStore::try_deserialize_source(Cursor::new(bytes.clone()), &mut reloaded)
+            .unwrap();
+        assert_eq!(
+            reloaded.get(&default_hash("test")),
+            Some(&bincode::serialize(&5u128).unwrap())
+        );
+
+        let mut written = Cursor::new(Vec::new());
+        store.write(&mut written).await.unwrap();
+        assert_eq!(written.into_inner(), bytes);
+        assert!(!store.is_dirty());
     }
 
     #[tokio::test]
