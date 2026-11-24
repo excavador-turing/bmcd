@@ -10,6 +10,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **A percent-encoded path no longer slips past the GET and cross-site
+  refusals.** The policy that answers 405 to a state change over `GET` or
+  `HEAD` and 403 to a cross-site one compared the raw request path with
+  `/api/bmc`, while the router matches the percent-decoded path, so
+  `/api/b%6dc`, `/api/bm%63` and `/%61pi/bmc` reached the same handlers as
+  `/api/bmc` without either refusal. Authentication still applied; what was
+  lost is the protection against a credential the browser attaches by itself
+  (a client certificate, or a trusted proxy's identity header). Now:
+  - the policy, the factory-password gate and the login path all read the
+    path the router matched (`ServiceRequest::match_info`), so they cannot
+    disagree with the router;
+  - as defence in depth, a request under `/api/bmc` whose path has a `%` in
+    it is refused with 400 before anything else is asked of it. No client
+    encodes the path of this API (the web interface and `tpi` send fixed words
+    and a numeric upload handle); query strings may still be encoded;
+  - the legacy `?opt=set` handler itself answers 405 to `GET` and `HEAD`, so a
+    spelling the middleware missed still cannot change state.
+
+  Tests put the middleware behind a router, as `main` does, and send every
+  spelling of the report, double encodings, doubled slashes, dot segments and
+  other case over `GET`, `HEAD` and `POST`, with and without
+  `Sec-Fetch-Site: cross-site`, and check that a legitimate `POST`, a read and
+  an encoded query are still served. Reported by adberger
+  ([@adberger](https://github.com/adberger)) in BMC-Firmware#132, found by
+  deterministic simulation testing. Thank you. (BMC-Firmware#132)
+
 ## [2.50.0] — 2026-11-24
 
 Two changes, both from

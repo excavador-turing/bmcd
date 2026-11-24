@@ -1239,7 +1239,9 @@ pub fn document() -> Value {
                             `tpi` reads the local token the daemon writes to `/run/bmcd/local-token` at \
                             every start, accepted from loopback only. The firmware health probe is the \
                             static page at `https://127.0.0.1/`, not this API. State changes are POST \
-                            (`?opt=set` included); their GET forms answer 405. A state change whose \
+                            (`?opt=set` included); their GET forms answer 405. The path is sent as \
+                            written: a path with percent-encoding in it (`/api/b%6dc`) is 400. \
+                            A state change whose \
                             `Sec-Fetch-Site` is `cross-site` or `same-site` is 403, and Basic \
                             authentication is refused on any request carrying `Sec-Fetch-*`, `Origin` \
                             or `Referer`.",

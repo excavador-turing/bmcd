@@ -159,11 +159,11 @@ where
             // board has been set up.
             if !self
                 .factory
-                .permits(request.request().method(), request.request().uri().path())
+                .permits(request.request().method(), routed_path(&request))
             {
                 tracing::warn!(
                     "refused {} for {}: this board is still on its factory password",
-                    request.request().uri().path(),
+                    routed_path(&request),
                     name
                 );
                 return Box::pin(std::future::ready(Ok(factory_password_response(
@@ -223,7 +223,7 @@ where
             // unauthenticated request that carries a body, and holding the
             // only authentication lock across that read stalls every other
             // request for as long as the sender likes.
-            if request.request().uri().path() == auth_path {
+            if routed_path(&request) == auth_path {
                 return authentication_request(&mut request, &peer, &context).await;
             }
 
@@ -259,11 +259,10 @@ where
                     // now, so that a wrong password is still a wrong password
                     // rather than this message -- which would otherwise tell
                     // a stranger the account name is right.
-                    if !factory.permits(request.request().method(), request.request().uri().path())
-                    {
+                    if !factory.permits(request.request().method(), routed_path(&request)) {
                         tracing::warn!(
                             "refused {}: this board is still on its factory password",
-                            request.request().uri().path()
+                            routed_path(&request)
                         );
                         return Ok(factory_password_response(request.request()));
                     }
@@ -481,8 +480,24 @@ fn is_browser_call(request: &HttpRequest) -> bool {
     request_policy::is_browser_request(request.headers())
 }
 
+/// The path the router matched: the request path with its percent-encoding
+/// decoded the way actix's router decodes it (`/api/b%6dc` is `/api/bmc`;
+/// `%25`, `%2F` and `%2B` stay encoded).
+///
+/// Every decision that depends on which resource a request is for reads this
+/// and not `uri().path()`, which is the raw request target: the router and
+/// the policy must see the same path (BMC-Firmware#132).
+fn routed_path(request: &ServiceRequest) -> &str {
+    request.match_info().as_str()
+}
+
 /// The refusals that do not depend on who is asking (contract C2, C3).
 ///
+/// * A path with percent-encoding in it: 400. No client encodes the path of
+///   this API, and the router would match it as another spelling than the
+///   one on the wire; see [`request_policy::is_percent_encoded`]. The
+///   remaining checks read the routed path as well, so they hold on their
+///   own.
 /// * A state change that `Sec-Fetch-Site` says came from another site or
 ///   another origin of this one: 403. `same-origin`, `none` or no header pass.
 /// * A state change on `GET` (`?opt=set`, an upload cancel, a backup): 405,
@@ -497,7 +512,8 @@ fn policy_refusal<B>(
     let http = request.request();
     let headers = http.headers();
     let method = http.method();
-    let path = http.uri().path();
+    let raw_path = http.uri().path();
+    let path = routed_path(request);
     let query = http.uri().query().unwrap_or("");
     let authorization = headers
         .get(header::AUTHORIZATION)
@@ -506,6 +522,12 @@ fn policy_refusal<B>(
         Some(ServiceResponse::new(http.clone(), response).map_into_right_body())
     };
 
+    if request_policy::is_percent_encoded(raw_path) {
+        tracing::warn!("refused {method} {raw_path}: the path is percent-encoded");
+        return refuse(
+            HttpResponse::BadRequest().body("the path of an API request is not percent-encoded"),
+        );
+    }
     let state_change = request_policy::is_state_change(method, path, query);
     if state_change && request_policy::is_cross_site(headers) {
         tracing::warn!("refused a cross-site {method} {path}");
@@ -1565,6 +1587,263 @@ mod tests {
         )
         .await;
         assert_eq!(read.status(), StatusCode::OK);
+    }
+
+    /// The middleware behind a router, as `main` mounts it. The tests above
+    /// call the middleware directly, with the path exactly as written; behind
+    /// a router the same request is matched on its decoded path, which is
+    /// where BMC-Firmware#132 got through.
+    struct Mounted {
+        context: Arc<Mutex<AuthenticationContext<UnixValidator>>>,
+    }
+
+    fn mounted_layer() -> Mounted {
+        let mut context = build_test_context(
+            [(TOKEN.to_string(), Instant::now())],
+            [(
+                "root".to_string(),
+                pwhash::sha512_crypt::hash(PASSWORD).expect("a shadow hash"),
+            )],
+        );
+        context.set_local_token(LOCAL_TOKEN.to_string());
+        Mounted {
+            context: Arc::new(Mutex::new(context)),
+        }
+    }
+
+    impl<S, B> actix_web::dev::Transform<S, ServiceRequest> for Mounted
+    where
+        S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+        S::Future: 'static,
+        B: MessageBody + 'static,
+    {
+        type Response = ServiceResponse<EitherBody<B>>;
+        type Error = Error;
+        type InitError = ();
+        type Transform = AuthenticationService<S>;
+        type Future = std::future::Ready<Result<Self::Transform, Self::InitError>>;
+
+        fn new_transform(&self, service: S) -> Self::Future {
+            std::future::ready(Ok(AuthenticationService::new(
+                Rc::new(service),
+                self.context.clone(),
+                "/api/bmc/authenticate",
+                "test realm",
+                IDENTITY_HEADER.into(),
+                Arc::new(FactoryPassword::new("/nonexistent/shadow")),
+            )))
+        }
+    }
+
+    async fn reached() -> HttpResponse {
+        HttpResponse::Ok().body("reached the route")
+    }
+
+    /// The scope and the routes the policy has an opinion about, behind the
+    /// middleware, in an `App` of their own.
+    macro_rules! mounted_app {
+        () => {
+            actix_web::test::init_service(
+                actix_web::App::new().service(
+                    actix_web::web::scope("/api/bmc")
+                        .wrap(mounted_layer())
+                        .route("", actix_web::web::get().to(reached))
+                        .route("", actix_web::web::post().to(reached))
+                        .route("/about", actix_web::web::get().to(reached))
+                        .route("/backup", actix_web::web::post().to(reached))
+                        .route(
+                            "/upload/{handle}/cancel",
+                            actix_web::web::post().to(reached),
+                        ),
+                ),
+            )
+            .await
+        };
+    }
+
+    async fn status_from<S, B>(app: &S, request: TestRequest) -> StatusCode
+    where
+        S: Service<actix_http::Request, Response = ServiceResponse<B>, Error = Error>,
+    {
+        actix_web::test::call_service(app, request.to_request())
+            .await
+            .status()
+    }
+
+    /// A request carrying a good token, so that only the policy and the
+    /// router decide what happens to it.
+    fn with_token(method: Method, uri: &str) -> TestRequest {
+        set_request(method, uri).insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")))
+    }
+
+    /// BMC-Firmware#132, every spelling the reporter listed and the obvious
+    /// ones around them: a `%` anywhere in the path of a routed request is a
+    /// 400, with or without a credential, over every method, cross-site or
+    /// not. It is refused before anything else is asked of it, so none of
+    /// them can be a state change that was classified as a read.
+    #[actix_web::test]
+    async fn a_percent_encoded_api_path_is_refused_before_anything_reads_it() {
+        let app = mounted_app!();
+        let query = "?opt=set&type=power&node1=1";
+        for spelling in [
+            "/api/b%6dc",
+            "/api/b%6Dc",
+            "/api/bm%63",
+            "/api/%62mc",
+            "/%61pi/bmc",
+            "/%61%70%69/%62%6d%63",
+            "/api/bmc/%62ackup",
+            "/api/bmc/%75pload/7/cancel",
+            "/api/bmc/upload/7/%63ancel",
+            "/api/bmc/%61bout",
+        ] {
+            for method in [Method::GET, Method::HEAD, Method::POST] {
+                for cross_site in [false, true] {
+                    for credential in [false, true] {
+                        let uri = format!("{spelling}{query}");
+                        let mut request = set_request(method.clone(), &uri);
+                        if cross_site {
+                            request = request.insert_header(("Sec-Fetch-Site", "cross-site"));
+                        }
+                        if credential {
+                            request = request
+                                .insert_header((header::AUTHORIZATION, format!("Bearer {TOKEN}")));
+                        }
+                        assert_eq!(
+                            status_from(&app, request).await,
+                            StatusCode::BAD_REQUEST,
+                            "{method} {uri} cross-site={cross_site} credential={credential}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spellings the router does not match as `/api/bmc` never reach a
+    /// handler, whatever the method and the credential: double encoding,
+    /// doubled slashes, dot segments, other case. (A path that still has a
+    /// `%` after the router's decoding is not a spelling of anything.)
+    #[actix_web::test]
+    async fn a_spelling_the_router_does_not_match_reaches_no_handler() {
+        let app = mounted_app!();
+        let query = "?opt=set&type=power&node1=1";
+        for spelling in [
+            "//api/bmc",
+            "/./api/bmc",
+            "/api/../api/bmc",
+            "/api//bmc",
+            "/api/bmc/../bmc",
+            "/api/bmc//backup",
+            "/api/bmc/./backup",
+            "/API/bmc",
+            "/api/BMC",
+            "/api/b%256dc",
+            "/api/bmc%2Fbackup",
+            "/api/bmc%2fbackup",
+        ] {
+            for method in [Method::GET, Method::HEAD, Method::POST] {
+                let uri = format!("{spelling}{query}");
+                let status = status_from(&app, with_token(method.clone(), &uri)).await;
+                assert!(
+                    status.is_client_error(),
+                    "{method} {uri} answered {status}, and it must not be served"
+                );
+            }
+        }
+    }
+
+    /// The refusals stand on every spelling the router does match: GET and
+    /// HEAD answer 405, a cross-site request 403, with the token that would
+    /// otherwise be good enough.
+    #[actix_web::test]
+    async fn a_state_change_over_get_or_head_is_refused_on_every_matched_spelling() {
+        let app = mounted_app!();
+        for uri in [
+            "/api/bmc?opt=set&type=power&node1=1",
+            "/api/bmc/?opt=set&type=power&node1=1",
+            "/api/bmc?type=power&opt=%73et&node1=1",
+            "/api/bmc?opt=%73%65%74&type=reboot",
+            "/api/bmc/backup",
+            "/api/bmc/upload/7/cancel",
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let response = actix_web::test::call_service(
+                    &app,
+                    with_token(method.clone(), uri).to_request(),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {uri}"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("POST"),
+                    "{method} {uri}"
+                );
+            }
+        }
+        for uri in [
+            "/api/bmc?opt=set&type=power&node1=1",
+            "/api/bmc?type=power&opt=%73et&node1=1",
+            "/api/bmc/backup",
+            "/api/bmc/upload/7/cancel",
+        ] {
+            for method in [Method::GET, Method::HEAD, Method::POST] {
+                let request =
+                    with_token(method.clone(), uri).insert_header(("Sec-Fetch-Site", "cross-site"));
+                assert_eq!(
+                    status_from(&app, request).await,
+                    StatusCode::FORBIDDEN,
+                    "cross-site {method} {uri}"
+                );
+            }
+        }
+    }
+
+    /// And what must keep working: a POST, a read, an encoded query (the
+    /// query is not the path), and the same-origin browser.
+    #[actix_web::test]
+    async fn legitimate_requests_behind_the_router_are_served() {
+        let app = mounted_app!();
+        for (method, uri) in [
+            (Method::POST, "/api/bmc?opt=set&type=power&node1=1"),
+            (Method::POST, "/api/bmc?type=power&opt=%73et&node1=1"),
+            (Method::POST, "/api/bmc?opt=set&type=flash&file=a%20b.img"),
+            (Method::GET, "/api/bmc?opt=get&type=power"),
+            (Method::GET, "/api/bmc?opt=get&type=flash&file=a%20b.img"),
+            (Method::GET, "/api/bmc/about"),
+            (Method::POST, "/api/bmc/backup"),
+            (Method::POST, "/api/bmc/upload/7/cancel"),
+        ] {
+            assert_eq!(
+                status_from(&app, with_token(method.clone(), uri)).await,
+                StatusCode::OK,
+                "{method} {uri}"
+            );
+        }
+        let same_origin = with_token(Method::POST, "/api/bmc?opt=set&type=power&node1=1")
+            .insert_header(("Sec-Fetch-Site", "same-origin"));
+        assert_eq!(status_from(&app, same_origin).await, StatusCode::OK);
+        let read_from_elsewhere = with_token(Method::GET, "/api/bmc?opt=get&type=power")
+            .insert_header(("Sec-Fetch-Site", "cross-site"));
+        assert_eq!(status_from(&app, read_from_elsewhere).await, StatusCode::OK);
+    }
+
+    /// The credential is still asked for: an encoded path or not, no token
+    /// is a 401 on a read and the refusals above do not hide it.
+    #[actix_web::test]
+    async fn a_request_without_a_credential_is_still_unauthorized() {
+        let app = mounted_app!();
+        let request = set_request(Method::GET, "/api/bmc?opt=get&type=power");
+        assert_eq!(status_from(&app, request).await, StatusCode::UNAUTHORIZED);
+        let request = set_request(Method::POST, "/api/bmc?opt=set&type=power&node1=1");
+        assert_eq!(status_from(&app, request).await, StatusCode::UNAUTHORIZED);
     }
 
     /// Contract C3: Basic is refused on any browser request, even with the

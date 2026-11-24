@@ -290,6 +290,17 @@ async fn api_entry(
         return LegacyResponse::bad_request("Missing `type` parameter");
     };
 
+    // The middleware already answers 405 to this. It is asked again here,
+    // where only a routed request arrives and the query is decoded, so that a
+    // spelling the middleware did not recognise (BMC-Firmware#132) still
+    // cannot change state over GET.
+    if is_set && crate::authentication::request_policy::is_safe_method(request.method()) {
+        return LegacyResponse::Error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "this request changes state: send it as POST".into(),
+        );
+    }
+
     dispatch(bmc.as_ref(), serial, &ty, is_set, query, &request).await
 }
 

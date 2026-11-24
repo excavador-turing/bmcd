@@ -28,12 +28,35 @@ const API: &str = "/api/bmc";
 /// Every method other than `GET`, `HEAD` and `OPTIONS` is one. So are the
 /// three `GET` forms older clients send ([`is_get_state_change`]), which the
 /// middleware refuses.
+///
+/// `path` is the path the router matched, not the raw request target: see
+/// [`is_percent_encoded`] and `routed_path` in the middleware.
 pub fn is_state_change(method: &Method, path: &str, query: &str) -> bool {
-    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+    if is_safe_method(method) {
         is_get_state_change(path, query)
     } else {
         true
     }
+}
+
+/// `GET`, `HEAD` and `OPTIONS`: the methods that must not change state.
+pub fn is_safe_method(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// The raw path of a request carries percent-encoding.
+///
+/// The router matches the percent-decoded path (`/api/b%6dc` is `/api/bmc`),
+/// so a policy that reads the raw path and one that reads the routed path can
+/// disagree about the same request (BMC-Firmware#132). Nothing that talks to
+/// this daemon encodes a path: the API paths are fixed words and a numeric
+/// handle, and the web interface and `tpi` send the same bytes the OpenAPI
+/// document lists. The middleware therefore answers 400 to any request under
+/// it whose path has a `%`, and decides everything else on the routed path as
+/// well, so a spelling that slips past one is still caught by the other.
+/// Query strings are not paths and may be encoded.
+pub fn is_percent_encoded(raw_path: &str) -> bool {
+    raw_path.contains('%')
 }
 
 /// The state changes older clients send on `GET`, refused with 405:
@@ -134,6 +157,118 @@ mod tests {
         assert!(is_get_state_change("/api/bmc/backup", ""));
         assert!(!is_get_state_change("/api/bmc/upload/7", ""));
         assert!(!is_get_state_change("/api/bmc/upload//cancel", ""));
+    }
+
+    /// The path the router matches, as actix hands it to a middleware.
+    fn routed(uri: &str) -> String {
+        actix_web::test::TestRequest::get()
+            .uri(uri)
+            .to_srv_request()
+            .match_info()
+            .as_str()
+            .to_string()
+    }
+
+    /// BMC-Firmware#132: the router matched `/api/bmc` for all of these, and
+    /// the policy read the raw path and saw something else.
+    #[test]
+    fn every_spelling_of_the_api_path_is_decoded_the_way_the_router_decodes_it() {
+        let query = "opt=set&type=power&node1=1";
+        for spelling in [
+            "/api/b%6dc",
+            "/api/b%6Dc",
+            "/api/bm%63",
+            "/api/%62mc",
+            "/%61pi/bmc",
+            "/%61%70%69/%62%6d%63",
+        ] {
+            let path = routed(&format!("{spelling}?{query}"));
+            assert_eq!(path, "/api/bmc", "{spelling}");
+            assert!(is_percent_encoded(spelling), "{spelling}");
+            for method in [Method::GET, Method::HEAD] {
+                assert!(
+                    is_state_change(&method, &path, query),
+                    "{method} {spelling}"
+                );
+            }
+            // What the policy used to be given. It is not `/api/bmc`, so it
+            // classified a state change as a read.
+            assert!(
+                !is_state_change(&Method::GET, spelling, query),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `%25`, `%2F` and `%2B` are not decoded by the router, so a double
+    /// encoding stays encoded and is no spelling of `/api/bmc`.
+    #[test]
+    fn a_double_encoding_is_not_decoded_a_second_time() {
+        for spelling in [
+            "/api/b%256dc",
+            "/api/bmc%2Fbackup",
+            "/api/bmc%2fbackup",
+            "/api/bmc/upload/7%2Fcancel",
+        ] {
+            let path = routed(spelling);
+            assert_eq!(path, spelling);
+            assert!(is_percent_encoded(&path), "{spelling}");
+            assert!(
+                !is_get_state_change(&path, "opt=set&type=power"),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// Nothing normalises these: the router matches them as written, so none
+    /// of them is `/api/bmc` and none reaches its handlers.
+    #[test]
+    fn dot_and_slash_spellings_are_not_the_api_path() {
+        for spelling in [
+            "//api/bmc",
+            "/./api/bmc",
+            "/api/../api/bmc",
+            "/api//bmc",
+            "/api/bmc/../bmc",
+            "/API/bmc",
+        ] {
+            assert_eq!(routed(spelling), spelling);
+            assert!(
+                !is_get_state_change(spelling, "opt=set&type=power"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_the_same_resource() {
+        assert!(is_get_state_change("/api/bmc/", "opt=set&type=power"));
+        assert!(!is_get_state_change("/api/bmc/", "opt=get&type=power"));
+    }
+
+    #[test]
+    fn only_a_path_without_a_percent_is_plain() {
+        for plain in [
+            "/",
+            "/api/bmc",
+            "/api/bmc/upload/7/cancel",
+            "/api/bmc/backup",
+        ] {
+            assert!(!is_percent_encoded(plain), "{plain}");
+        }
+        for encoded in ["/api/b%6dc", "/%61pi", "/api/bmc/%62ackup", "/100%"] {
+            assert!(is_percent_encoded(encoded), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn get_head_and_options_are_the_safe_methods() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(is_safe_method(&method), "{method}");
+        }
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!is_safe_method(&method), "{method}");
+        }
     }
 
     #[test]
