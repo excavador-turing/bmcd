@@ -65,7 +65,7 @@ pwhash = "1.0.0"
 rand = "0.9.0"
 reqwest = { version = "0.12.12", features = ["stream"] }
 rockfile = { version = "0.1.2" }
-rockusb = { version = "0.2.0", features = ["libusb"] }
+rockusb = { version = "0.4.0", features = ["libusb"] }
 rusb = "0.9.4"
 rustpiboot = "0.3.0"
 serde = { version = "1.0.217", features = ["derive"] }
