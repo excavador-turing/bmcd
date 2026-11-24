@@ -22,6 +22,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   revisited when an actix-web release moves to a fixed cookie. Found by the
   weekly advisories job that Daniel Steinhauf ([@danste22](https://github.com/danste22))
   asked for in BMC-Firmware#93.
+- **The interface is served with a script-restricting Content-Security-Policy.**
+  The UI responses carried only `frame-ancestors 'none'`; they now send
+  `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+  img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src
+  'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, so an
+  injected `<script>` or inline handler does not run and a page cannot post a
+  form elsewhere. It was written against the BMC-UI 4.8.0 bundle: one module
+  script and its chunks from the same origin, no inline script, no `eval`, no
+  worker, fonts as files, and the API, the upload and the serial console
+  WebSocket on the same host. `'unsafe-inline'` stays for styles only (the
+  terminal and the theme switch add `<style>` elements). `connect-src 'self'`
+  matches a same-host WebSocket in current browsers (Safari before 15.4 did
+  not). The policy applies to the documents the board serves; when the
+  interface is served by a fleet pod, that pod's policy governs the page and
+  the board only answers API calls, which a CSP does not restrict. A custom
+  `www` bundle that needs more (an external host, an inline script) has to be
+  built to this policy. Refs BMC-Firmware#99; found in the review by Daniel
+  Steinhauf ([@danste22](https://github.com/danste22)).
 
 ## [2.48.0] — 2026-11-24
 

@@ -23,12 +23,46 @@ const REVALIDATE: &str = "no-cache";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const ASSETS: &str = "/assets/";
 
+/// What the built interface (BMC-UI 4.8.0) needs, and nothing else. It was
+/// read off the release bundle: one module script and its chunks from the same
+/// origin, no inline script, no `eval`, no worker, fonts and images served as
+/// files, and the API, the upload and the serial console (a WebSocket) on the
+/// same host.
+///
+/// * `script-src 'self'` is the point of the header: an injected `<script>`
+///   or an `onclick=` handler does not run.
+/// * `style-src` keeps `'unsafe-inline'` because the terminal and the theme
+///   switch add `<style>` elements and the components set `style` attributes.
+///   Styles cannot run script, so this costs little.
+/// * `connect-src 'self'` covers `fetch`, the upload and the serial console
+///   WebSocket: browsers match `'self'` against `ws:` and `wss:` of the same
+///   host (CSP level 3; Safari before 15.4 did not).
+/// * `form-action 'self'`, `base-uri 'none'` and `object-src 'none'` close the
+///   ways an injected element could send a form elsewhere, rebase every
+///   relative URL or load a plugin.
+///
+/// It applies to the documents bmcd serves, so to the board's own interface.
+/// When the interface is served by a fleet pod, that pod's policy governs the
+/// page and the board's header is not involved: the board only answers the
+/// pod's API calls, and a CSP on an API response (JSON, the backup archive)
+/// restricts nothing. `frame-ancestors 'none'` stays the same as before.
+const CONTENT_SECURITY: &str = "default-src 'self'; \
+script-src 'self'; \
+style-src 'self' 'unsafe-inline'; \
+img-src 'self' data:; \
+font-src 'self'; \
+connect-src 'self'; \
+object-src 'none'; \
+base-uri 'none'; \
+form-action 'self'; \
+frame-ancestors 'none'";
+
 fn browser_guards(headers: &mut HeaderMap) {
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors 'none'"),
+        HeaderValue::from_static(CONTENT_SECURITY),
     );
 }
 
@@ -142,7 +176,7 @@ mod tests {
                 headers
                     .get(CONTENT_SECURITY_POLICY)
                     .and_then(|v| v.to_str().ok()),
-                Some("frame-ancestors 'none'")
+                Some(CONTENT_SECURITY)
             );
         }
         let cc = headers
@@ -150,6 +184,71 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_owned());
         let body = String::from_utf8(test::read_body(res).await.to_vec()).unwrap();
         (status, cc, body)
+    }
+
+    /// The policy that is sent, as a set of directives, so that the tests say
+    /// what it forbids and not only that it is a particular string.
+    fn directives() -> std::collections::HashMap<String, Vec<String>> {
+        CONTENT_SECURITY
+            .split(';')
+            .map(|d| {
+                let mut parts = d.split_whitespace().map(str::to_owned);
+                (parts.next().unwrap(), parts.collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn policy_keeps_script_to_own_origin() {
+        let d = directives();
+        assert_eq!(d["script-src"], ["'self'"]);
+        assert_eq!(d["default-src"], ["'self'"]);
+        assert!(!CONTENT_SECURITY.contains("'unsafe-eval'"));
+        assert!(!d["script-src"].iter().any(|v| v.contains("unsafe")));
+    }
+
+    #[test]
+    fn policy_closes_plugins_base_and_framing() {
+        let d = directives();
+        assert_eq!(d["object-src"], ["'none'"]);
+        assert_eq!(d["base-uri"], ["'none'"]);
+        assert_eq!(d["frame-ancestors"], ["'none'"]);
+        assert_eq!(d["form-action"], ["'self'"]);
+    }
+
+    #[test]
+    fn policy_lets_the_interface_reach_its_own_board_only() {
+        let d = directives();
+        assert_eq!(d["connect-src"], ["'self'"]);
+        assert_eq!(d["font-src"], ["'self'"]);
+        assert_eq!(d["img-src"], ["'self'", "data:"]);
+    }
+
+    #[actix_web::test]
+    async fn every_ui_response_carries_the_policy() {
+        // `get` asserts the headers on each of these, found or not.
+        for path in ["/", "/index.html", "/power-control", "/favicon.ico"] {
+            get(path).await;
+        }
+        let (status, _, _) = get("/assets/missing.js").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn api_responses_carry_no_policy() {
+        let dir = www();
+        let app = test::init_service(
+            App::new()
+                .service(web::scope("/api/bmc").route("/ping", web::get().to(|| async { "pong" })))
+                .configure(config(dir.path())),
+        )
+        .await;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/bmc/ping").to_request(),
+        )
+        .await;
+        assert!(res.headers().get(CONTENT_SECURITY_POLICY).is_none());
     }
 
     #[actix_web::test]
