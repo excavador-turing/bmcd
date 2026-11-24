@@ -198,8 +198,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn policy_keeps_script_to_own_origin() {
+    #[actix_web::test]
+    async fn policy_keeps_script_to_own_origin() {
         let d = directives();
         assert_eq!(d["script-src"], ["'self'"]);
         assert_eq!(d["default-src"], ["'self'"]);
@@ -207,8 +207,8 @@ mod tests {
         assert!(!d["script-src"].iter().any(|v| v.contains("unsafe")));
     }
 
-    #[test]
-    fn policy_closes_plugins_base_and_framing() {
+    #[actix_web::test]
+    async fn policy_closes_plugins_base_and_framing() {
         let d = directives();
         assert_eq!(d["object-src"], ["'none'"]);
         assert_eq!(d["base-uri"], ["'none'"]);
@@ -216,8 +216,8 @@ mod tests {
         assert_eq!(d["form-action"], ["'self'"]);
     }
 
-    #[test]
-    fn policy_lets_the_interface_reach_its_own_board_only() {
+    #[actix_web::test]
+    async fn policy_lets_the_interface_reach_its_own_board_only() {
         let d = directives();
         assert_eq!(d["connect-src"], ["'self'"]);
         assert_eq!(d["font-src"], ["'self'"]);
