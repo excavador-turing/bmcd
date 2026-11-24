@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom},
     ops::Deref,
 };
 use tokio::{
@@ -181,10 +181,14 @@ impl<'a> PersistencyStore {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// `encode` into anything seekable. The daemon writes through
+    /// `write_durably`, so this is for the tests, which read what it wrote.
+    #[cfg(test)]
     pub(super) async fn write(
         &self,
-        mut source: impl Write + Seek + 'a,
+        mut source: impl std::io::Write + Seek + 'a,
     ) -> Result<(), PersistencyError<'a>> {
+        use std::io::Write as _;
         let bytes = self.encode().await?;
         source.rewind()?;
         if let Err(e) = source.write_all(&bytes) {
