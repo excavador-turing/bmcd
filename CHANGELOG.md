@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.51.0] — 2026-11-25
+
 Update safety. Five reports against the firmware's update path, four of them
 from Adrian Berger ([@adberger](https://github.com/adberger)), whose
 deterministic simulation of a board under power cuts, reboots and concurrent
