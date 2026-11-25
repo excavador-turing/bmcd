@@ -101,7 +101,9 @@ impl LagLog {
         if let Some((events, chunks)) = self.note(skipped, Instant::now()) {
             tracing::warn!(
                 "[node {}] a console client fell behind: {} chunks skipped in {} events",
-                self.node, chunks, events
+                self.node,
+                chunks,
+                events
             );
         }
     }
@@ -111,11 +113,17 @@ impl LagLog {
     fn note(&mut self, skipped: u64, now: Instant) -> Option<(u64, u64)> {
         self.events += 1;
         self.chunks += skipped;
-        if self.last.is_some_and(|t| now.duration_since(t) < LAG_LOG_INTERVAL) {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < LAG_LOG_INTERVAL)
+        {
             return None;
         }
         self.last = Some(now);
-        Some((std::mem::take(&mut self.events), std::mem::take(&mut self.chunks)))
+        Some((
+            std::mem::take(&mut self.events),
+            std::mem::take(&mut self.chunks),
+        ))
     }
 }
 
