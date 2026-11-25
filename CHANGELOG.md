@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.51.2] — 2026-11-25
+
 ### Fixed
 
 - **The Power page's "last power on" time restarts when the BMC reboots and
