@@ -651,7 +651,8 @@ impl BmcApplication {
         stamp_cold_boot(&mut node_infos, state, get_timestamp_unix());
         self.app_db
             .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
-            .await
+            .await?;
+        Ok(())
     }
 
     #[instrument(skip(self))]
