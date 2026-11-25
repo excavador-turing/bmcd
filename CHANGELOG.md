@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Power page's "last power on" time restarts when the BMC reboots and
+  powers the nodes back on.** On a v2.4 board a reboot of the BMC (after a
+  firmware update, for one) cuts the power of the nodes, and the daemon switches
+  them back on at start. The daemon compared the nodes it was restoring with
+  the state it had stored, saw no change, and left the time of the last switch
+  from the UI or the API, so the page showed a stale one. A cold boot now stamps
+  every node it powers on with the time of the start and clears the stamp of the
+  ones it leaves off; a restart of the daemon under running nodes keeps the
+  stamps as they were. Reported by DingoDogz (Discord). Thank you. A reboot of a
+  node from inside the node does not cut its power, so the BMC cannot see it and
+  the time does not change.
+
 ## [2.51.1] — 2026-11-25
 
 ### Fixed

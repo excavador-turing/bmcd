@@ -236,6 +236,47 @@ fn power_transition(activated_nodes: u8, idx: usize, new_state: u8) -> Option<bo
     (new_state != current_state).then_some(new_state == 1)
 }
 
+/// Updates the power-on stamps of the nodes in `mask` for a change from
+/// `activated_nodes` to `node_states`: a node that is powered on gets `now`, a
+/// node that is powered off loses its stamp, and a node left where it is keeps
+/// whatever it has.
+fn stamp_transitions(
+    node_infos: &mut NodeInfos,
+    activated_nodes: u8,
+    node_states: u8,
+    mask: u8,
+    now: Option<u64>,
+) {
+    for (idx, new_state) in bit_iterator(node_states, mask) {
+        match power_transition(activated_nodes, idx, new_state) {
+            Some(true) => node_infos[idx].power_on_time = now,
+            Some(false) => node_infos[idx].power_on_time = None,
+            None => (),
+        }
+    }
+}
+
+/// The power-on stamps of the nodes after a cold boot, when the daemon is
+/// about to power on every node in `state`. A cold boot cuts the power of every
+/// node, so a node that comes back has just been powered on, whatever the stamp
+/// from before the cut says, and a node that stays off has no stamp.
+///
+/// [`stamp_transitions`] cannot do this: it compares with the persisted state,
+/// which is the state being restored, sees no change, and leaves the stamp of
+/// the last switch from the UI or the API.
+///
+/// `now` is the wall clock. The BMC may have no RTC, and at a cold boot the
+/// clock may not be synchronised yet, so the stamp can be off by the step the
+/// clock takes when NTP lands: a step back saturates the uptime at 0 in
+/// [`BmcApplication::get_node_infos`], a step forward adds to it. A stamp from
+/// before the reboot carries the same step, and a wrong one is not made worse
+/// by this.
+fn stamp_cold_boot(node_infos: &mut NodeInfos, state: u8, now: Option<u64>) {
+    for (idx, on) in bit_iterator(state, 0b1111) {
+        node_infos[idx].power_on_time = if on == 1 { now } else { None };
+    }
+}
+
 /// The keys of the daemon's store, with the values a board that has never run
 /// it starts from.
 fn persistency_builder() -> PersistencyBuilder {
@@ -414,6 +455,10 @@ impl BmcApplication {
                     "cold boot: restoring persisted power state: nodes={:?}",
                     powered_nodes(state)
                 );
+                // The nodes lost their power with the BMC: the ones that come
+                // back are powered on now. `activate_slot` compares with the
+                // persisted state and would see no change in them.
+                self.stamp_cold_boot_power_on_times(state).await?;
                 state
             }
         };
@@ -596,6 +641,19 @@ impl BmcApplication {
         Ok(true)
     }
 
+    /// Stores the power-on stamps of a cold boot, see [`stamp_cold_boot`].
+    async fn stamp_cold_boot_power_on_times(&self, state: u8) -> anyhow::Result<()> {
+        let mut node_infos = self
+            .app_db
+            .try_get::<NodeInfos>(NODE_INFO_KEY)
+            .await
+            .unwrap_or_default();
+        stamp_cold_boot(&mut node_infos, state, get_timestamp_unix());
+        self.app_db
+            .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
+            .await
+    }
+
     #[instrument(skip(self))]
     async fn update_power_on_times(
         &self,
@@ -609,13 +667,13 @@ impl BmcApplication {
             .await
             .unwrap_or_default();
 
-        for (idx, new_state) in bit_iterator(node_states, mask) {
-            match power_transition(activated_nodes, idx, new_state) {
-                Some(true) => node_infos[idx].power_on_time = get_timestamp_unix(),
-                Some(false) => node_infos[idx].power_on_time = None,
-                None => (),
-            }
-        }
+        stamp_transitions(
+            &mut node_infos,
+            activated_nodes,
+            node_states,
+            mask,
+            get_timestamp_unix(),
+        );
 
         self.app_db
             .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
@@ -1098,6 +1156,60 @@ mod tests {
             assert_eq!(power_transition(others, idx, 1), Some(true));
             assert_eq!(power_transition(0b1111, idx, 0), Some(false));
         }
+    }
+
+    fn stamped(times: [Option<u64>; 4]) -> NodeInfos {
+        let mut infos = NodeInfos::default();
+        for (info, time) in infos.iter_mut().zip(times) {
+            info.power_on_time = time;
+        }
+        infos
+    }
+
+    fn stamps(infos: &NodeInfos) -> [Option<u64>; 4] {
+        std::array::from_fn(|idx| infos[idx].power_on_time)
+    }
+
+    #[test]
+    fn a_cold_restore_resets_the_power_on_time_of_the_nodes_it_switches_on() {
+        // The stamps are those of the last switch from the UI, long before the
+        // BMC rebooted and cut the power. Nodes 1 and 3 come back on, 2 and 4
+        // stay off: the first two are stamped with now, the others have none.
+        let mut infos = stamped([Some(100), Some(200), Some(300), Some(400)]);
+        stamp_cold_boot(&mut infos, 0b0101, Some(5000));
+        assert_eq!(stamps(&infos), [Some(5000), None, Some(5000), None]);
+
+        // Why this is not left to `activate_slot`: against the persisted state
+        // the same nodes show no change, and the old stamps would stay.
+        let mut infos = stamped([Some(100), None, Some(300), None]);
+        stamp_transitions(&mut infos, 0b0101, 0b0101, 0b1111, Some(5000));
+        assert_eq!(stamps(&infos), [Some(100), None, Some(300), None]);
+    }
+
+    #[test]
+    fn a_cold_restore_with_nothing_on_clears_every_stamp() {
+        let mut infos = stamped([Some(1), Some(2), Some(3), Some(4)]);
+        stamp_cold_boot(&mut infos, 0b0000, Some(5000));
+        assert_eq!(stamps(&infos), [None; 4]);
+    }
+
+    #[test]
+    fn a_live_adopt_keeps_the_power_on_time_of_the_nodes_that_are_on() {
+        // The daemon restarted under running nodes: persisted and live agree,
+        // and the stamps stay.
+        let mut infos = stamped([Some(100), Some(200), None, None]);
+        stamp_transitions(&mut infos, 0b0011, 0b0011, 0b1111, Some(5000));
+        assert_eq!(stamps(&infos), [Some(100), Some(200), None, None]);
+    }
+
+    #[test]
+    fn a_live_adopt_makes_the_stamps_follow_the_live_state() {
+        // Persisted: nodes 1 and 2 on. Live: nodes 2 and 3. Node 1 is off, so
+        // its stamp goes; node 2 stays on, so its stamp stays; node 3 is on
+        // without a stamp, so it gets one.
+        let mut infos = stamped([Some(100), Some(200), None, None]);
+        stamp_transitions(&mut infos, 0b0011, 0b0110, 0b1111, Some(5000));
+        assert_eq!(stamps(&infos), [None, Some(200), Some(5000), None]);
     }
 
     #[test]
