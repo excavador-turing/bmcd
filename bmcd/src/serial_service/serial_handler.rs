@@ -18,6 +18,7 @@ use futures::{Sink, SinkExt, Stream};
 use serde::Serialize;
 use std::io::{self, ErrorKind, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{
@@ -26,7 +27,7 @@ use tokio::sync::{
     watch, Mutex,
 };
 use tokio_serial::{DataBits, Parity, SerialPort, SerialPortBuilderExt, StopBits};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::codec::{BytesCodec, Decoder};
 use tokio_util::sync::PollSender;
 use tracing::trace;
@@ -38,6 +39,85 @@ use crate::utils::{string_from_utf16, string_from_utf32};
 type RingBuffer = FixedCircularBuffer<u8, OUTPUT_BUF_SIZE>;
 
 const OUTPUT_BUF_SIZE: usize = 16 * 1024;
+
+/// How many chunks of console output the read fan-out holds for a client that
+/// is slower than the node. A chunk is one read of the port, and the port is
+/// read through `tokio_util`'s `FramedRead`, whose buffer is 8 KiB, so a chunk
+/// is at most 8 KiB (a UART read is usually far smaller). The channel keeps a
+/// single copy of each chunk however many clients are attached, so the worst
+/// case is 256 x 8 KiB = 2 MiB per node, 8 MiB for the four nodes -- and only
+/// while a client is not keeping up. At 1.5 Mbaud the line carries about
+/// 150 KB/s, so 2 MiB is about 14 s of a saturated line. The earlier 8 chunks
+/// were 64 KiB at most: under half a second of it.
+pub(crate) const READ_BROADCAST_CAPACITY: usize = 256;
+
+/// A client that falls behind more than [`READ_BROADCAST_CAPACITY`] chunks
+/// misses some output. It is told so, in the stream, and stays attached.
+fn lag_marker(skipped: u64) -> Bytes {
+    let unit = if skipped == 1 { "chunk" } else { "chunks" };
+    Bytes::from(format!(
+        "\r\n[bmcd: {skipped} {unit} of console output skipped, the browser fell behind]\r\n"
+    ))
+}
+
+/// The most often a client that keeps falling behind is logged.
+const LAG_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Rate limit for the log line about a lagging client: one line per
+/// [`LAG_LOG_INTERVAL`], carrying what happened since the last one.
+struct LagLog {
+    node: usize,
+    last: Option<Instant>,
+    events: u64,
+    chunks: u64,
+}
+
+/// What a client reads from the fan-out: a chunk, or, where it fell behind, the
+/// marker in place of the chunks it missed. Never an error.
+fn lag_to_marker(
+    lag: &mut LagLog,
+    res: Result<Bytes, BroadcastStreamRecvError>,
+) -> io::Result<Bytes> {
+    match res {
+        Ok(bytes) => Ok(bytes),
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            lag.record(skipped);
+            Ok(lag_marker(skipped))
+        }
+    }
+}
+
+impl LagLog {
+    fn new(node: usize) -> Self {
+        Self {
+            node,
+            last: None,
+            events: 0,
+            chunks: 0,
+        }
+    }
+
+    fn record(&mut self, skipped: u64) {
+        if let Some((events, chunks)) = self.note(skipped, Instant::now()) {
+            tracing::warn!(
+                "[node {}] a console client fell behind: {} chunks skipped in {} events",
+                self.node, chunks, events
+            );
+        }
+    }
+
+    /// Counts a lag event. Returns what is to be logged -- events and chunks
+    /// since the last line -- or `None` while the last line is recent.
+    fn note(&mut self, skipped: u64, now: Instant) -> Option<(u64, u64)> {
+        self.events += 1;
+        self.chunks += skipped;
+        if self.last.is_some_and(|t| now.duration_since(t) < LAG_LOG_INTERVAL) {
+            return None;
+        }
+        self.last = Some(now);
+        Some((std::mem::take(&mut self.events), std::mem::take(&mut self.chunks)))
+    }
+}
 
 /// A [`Handler`] is an object that controls a single UART connection from the
 /// BMC to a predefined node. It has 2 functions to directly read and write the
@@ -153,8 +233,12 @@ impl Handler {
 
         let poll_sender = PollSender::new(write_sender.clone())
             .sink_map_err(|_| io::Error::from(ErrorKind::BrokenPipe));
+        // A client that cannot keep up misses output; that is not a reason to
+        // end its session. The gap is told to it as a line of text in the
+        // stream, and the next chunk follows.
+        let mut lag = LagLog::new(self.node);
         let stream = BroadcastStream::new(read_sender.subscribe())
-            .map(|res| res.map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e)));
+            .map(move |res| lag_to_marker(&mut lag, res));
         Ok((stream, poll_sender))
     }
 
@@ -225,7 +309,11 @@ impl Handler {
     /// Starts the worker on an open port. Split from [`Self::run`] so that the
     /// worker can be run against something that is not a UART.
     pub(crate) fn start<P: Port>(&mut self, port: P) {
-        let (read_sender, _) = broadcast::channel::<Bytes>(8);
+        self.start_with_capacity(port, READ_BROADCAST_CAPACITY);
+    }
+
+    fn start_with_capacity<P: Port>(&mut self, port: P, read_capacity: usize) {
+        let (read_sender, _) = broadcast::channel::<Bytes>(read_capacity);
         let (write_sender, write_receiver) = mpsc::channel::<Bytes>(8);
         self.worker_context = Some((read_sender.clone(), write_sender.clone()));
 
@@ -299,12 +387,10 @@ async fn run_worker<P: Port>(
                     console.publish(&bytes);
                 }
 
-                if read_sender.receiver_count() > 0 {
-                    if let Err(e) = read_sender.send(bytes.into()) {
-                        tracing::error!("broadcast error: {:#}", e);
-                        break;
-                    }
-                }
+                // An error only says that no client is attached, which is no
+                // reason to stop reading the node: the last client may leave
+                // between the read and this send.
+                let _ = read_sender.send(bytes.into());
             },
             res = baud.changed() => {
                 if res.is_err() {
@@ -416,6 +502,10 @@ mod tests {
     }
 
     fn rig(with_console: bool, baud: u32) -> Rig {
+        rig_with_capacity(with_console, baud, READ_BROADCAST_CAPACITY)
+    }
+
+    fn rig_with_capacity(with_console: bool, baud: u32, read_capacity: usize) -> Rig {
         let dir = TempDir::with_prefix("serial_handler").unwrap();
         let link = dir.path().join("ttyNode1");
         let (port_end, node) = tokio::io::duplex(64 * 1024);
@@ -431,10 +521,13 @@ mod tests {
         if with_console {
             handler.set_console(Some(Arc::new(ConsolePty::create(&link).unwrap())));
         }
-        handler.start(FakePort {
-            io: port_end,
-            bauds: bauds.clone(),
-        });
+        handler.start_with_capacity(
+            FakePort {
+                io: port_end,
+                bauds: bauds.clone(),
+            },
+            read_capacity,
+        );
         Rig {
             handler,
             node,
@@ -587,5 +680,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&b, b"x");
+    }
+
+    /// The node says `n` things, one chunk each: every one is read off the
+    /// line and into the ring buffer before the next is sent.
+    async fn say_in_chunks(rig: &mut Rig, n: usize) {
+        for i in 0..n {
+            rig.node.write_all(&[b'a' + (i % 26) as u8]).await.unwrap();
+            for _ in 0..2000 {
+                if rig.handler.read_whole_buffer().await.unwrap().len() == i + 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(rig.handler.read_whole_buffer().await.unwrap().len(), i + 1);
+        }
+    }
+
+    async fn next_chunk(stream: &mut (impl Stream<Item = io::Result<Bytes>> + Unpin)) -> Bytes {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("no chunk")
+            .expect("the stream ended")
+            .expect("the stream failed")
+    }
+
+    #[test]
+    fn the_read_fan_out_holds_a_burst_of_a_fast_line() {
+        // 2 MiB at most per node, see the constant. Going back to a handful
+        // of chunks makes a line at 1.5 Mbaud overrun a browser at once.
+        const { assert!(READ_BROADCAST_CAPACITY >= 256) };
+    }
+
+    #[tokio::test]
+    async fn a_client_that_reads_late_gets_a_burst_of_chunks_whole() {
+        let mut rig = rig(false, 1_500_000);
+        let (mut stream, _sink) = rig.handler.open_channel().unwrap();
+
+        // Far more than the 8 chunks the channel once held, none read yet.
+        say_in_chunks(&mut rig, 200).await;
+
+        for i in 0..200 {
+            let chunk = next_chunk(&mut stream).await;
+            assert_eq!(&chunk[..], &[b'a' + (i % 26) as u8], "chunk {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_fell_behind_is_told_and_kept() {
+        let mut rig = rig_with_capacity(false, 115_200, 2);
+        let (mut slow, _s1) = rig.handler.open_channel().unwrap();
+        let (mut quick, _s2) = rig.handler.open_channel().unwrap();
+
+        // Five chunks into a channel of two while `slow` reads nothing: the
+        // first three are gone. `quick` keeps pace, which also tells us each
+        // chunk has been sent before the next is written.
+        for i in 0..5u8 {
+            rig.node.write_all(&[b'a' + i]).await.unwrap();
+            assert_eq!(&next_chunk(&mut quick).await[..], &[b'a' + i]);
+        }
+
+        let marker = next_chunk(&mut slow).await;
+        assert_eq!(
+            &marker[..],
+            b"\r\n[bmcd: 3 chunks of console output skipped, the browser fell behind]\r\n"
+        );
+        // The session goes on with what was kept, and with what comes next.
+        assert_eq!(&next_chunk(&mut slow).await[..], b"d");
+        assert_eq!(&next_chunk(&mut slow).await[..], b"e");
+        rig.node.write_all(b"after").await.unwrap();
+        assert_eq!(&next_chunk(&mut slow).await[..], b"after");
+    }
+
+    #[test]
+    fn the_marker_names_what_was_skipped() {
+        assert_eq!(
+            &lag_marker(1)[..],
+            b"\r\n[bmcd: 1 chunk of console output skipped, the browser fell behind]\r\n"
+        );
+        assert!(lag_marker(250).starts_with(b"\r\n[bmcd: 250 chunks of"));
+    }
+
+    #[test]
+    fn a_client_that_keeps_lagging_is_logged_once_in_a_while() {
+        let mut log = LagLog::new(1);
+        let t0 = Instant::now();
+        assert_eq!(log.note(3, t0), Some((1, 3)));
+        assert_eq!(log.note(4, t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.note(5, t0 + Duration::from_secs(9)), None);
+        // What was held back is reported with the next line.
+        assert_eq!(log.note(1, t0 + Duration::from_secs(10)), Some((3, 10)));
+        assert_eq!(log.note(2, t0 + Duration::from_secs(11)), None);
     }
 }

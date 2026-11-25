@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The web serial console no longer closes when the browser falls behind the
+  UART.** At 1500000 baud the console ended with `close code 1011: channel
+  lagged by 2`. The read fan-out held 8 chunks, and a client that fell that far
+  behind got an error from the broadcast channel, which the session turned
+  into a close. Reported by DingoDogz (Discord), on an RK1 running Talos. Thank
+  you. A client that lags now stays attached, and the stream carries a line
+  where the output was lost, `[bmcd: N chunks of console output skipped, the
+  browser fell behind]`; it is logged at most once every ten seconds per
+  client. The fan-out holds 256 chunks, 2 MiB at most per node (a chunk is one
+  read of the port, at most 8 KiB). The worker also no longer stops reading a
+  node when the last client leaves at the moment a chunk arrives.
+
 ## [2.51.0] — 2026-11-25
 
 Update safety. Five reports against the firmware's update path, four of them
