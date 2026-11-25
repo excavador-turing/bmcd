@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.51.1] — 2026-11-25
+
 ### Fixed
 
 - **The web serial console no longer closes when the browser falls behind the
