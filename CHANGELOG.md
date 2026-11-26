@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.51.3] — 2026-11-26
+
 ### Fixed
 
 - **A node's power-on time is no longer inflated, or cut short, by a step of
