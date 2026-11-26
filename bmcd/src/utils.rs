@@ -161,6 +161,24 @@ pub fn get_timestamp_unix() -> Option<u64> {
         .map(|x| x.as_secs())
 }
 
+/// Seconds since the kernel started, from `CLOCK_BOOTTIME`: a clock that only
+/// counts forward, is not moved by a step of the wall clock, and keeps counting
+/// while the system is suspended. Zero at every boot, so it is only comparable
+/// with another reading of the same boot, see [`get_boot_id`].
+pub fn get_boottime_secs() -> Option<u64> {
+    use nix::time::{clock_gettime, ClockId};
+    let now = clock_gettime(ClockId::CLOCK_BOOTTIME).ok()?;
+    u64::try_from(now.tv_sec()).ok()
+}
+
+/// The id the kernel makes at random once per boot. Two readings of
+/// [`get_boottime_secs`] belong together only when this is the same.
+pub fn get_boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 pub async fn logging_sink_stdio(output: &Output) -> std::io::Result<()> {
     let mut lines = output.stdout.lines();
     while let Some(line) = lines.next_line().await? {
