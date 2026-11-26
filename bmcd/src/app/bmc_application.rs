@@ -55,6 +55,9 @@ pub const ACTIVATED_NODES_KEY: &str = "activated_nodes";
 pub const USB_CONFIG: &str = "usb_config";
 /// Stores information about nodes: name alias, time since powered on, and others. See [NodeInfo].
 pub const NODE_INFO_KEY: &str = "node_info";
+/// Stores the boot-clock half of the power-on stamps, one per node. See
+/// [`PowerOnMark`].
+pub const POWER_ON_MARKS_KEY: &str = "power_on_marks";
 pub const NODE1_USB_MODE: &str = "node1_usb";
 pub const COOLING_DEVICES: &str = "cooling_devices";
 const COOLING_CAPACITY: usize = 10;
@@ -236,24 +239,150 @@ fn power_transition(activated_nodes: u8, idx: usize, new_state: u8) -> Option<bo
     (new_state != current_state).then_some(new_state == 1)
 }
 
+/// One reading of the clocks the power-on time is made from.
+///
+/// The wall clock is what a person means by "when", but it is not a clock to
+/// measure a duration with: on a v2.4 board the SoC clock is not battery
+/// backed, so the kernel starts from a stale time and chronyd steps it by
+/// minutes once it has reached a server, and any NTP client or `date` can step
+/// it at any time, in either direction. A stamp taken before the step and an
+/// "uptime" taken after it then differ by the step. The boot clock
+/// (`CLOCK_BOOTTIME`) only counts forward, and keeps counting while the system
+/// is suspended, so a difference of two readings of it is the time that really
+/// went by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockReading {
+    /// Seconds since the Unix epoch by the wall clock, `None` before it.
+    pub wall: Option<u64>,
+    /// The boot clock, `None` when it cannot be read.
+    pub boot: Option<BootClock>,
+}
+
+/// A reading of the boot clock: seconds since the kernel started, and which
+/// start that was.
+///
+/// The seconds mean nothing without the boot id. `CLOCK_BOOTTIME` starts from
+/// zero at every boot, so a reading from the previous boot compared with one
+/// from this boot would give a number with no relation to the time that has
+/// gone by. `/proc/sys/kernel/random/boot_id` is a random id the kernel makes
+/// once per boot, and tells the two apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootClock {
+    pub boot_id: String,
+    pub secs: u64,
+}
+
+impl ClockReading {
+    /// The clocks, now.
+    pub fn now() -> Self {
+        let boot = match (utils::get_boot_id(), utils::get_boottime_secs()) {
+            (Some(boot_id), Some(secs)) => Some(BootClock { boot_id, secs }),
+            _ => None,
+        };
+        Self {
+            wall: get_timestamp_unix(),
+            boot,
+        }
+    }
+
+    /// The mark to store beside a power-on stamp taken at this reading.
+    fn mark(&self) -> Option<PowerOnMark> {
+        self.boot.clone().map(|boot| PowerOnMark {
+            boot,
+            wall: self.wall,
+        })
+    }
+}
+
+/// The boot-clock half of a node's power-on stamp. The stamp itself stays in
+/// [`NodeInfo::power_on_time`] as a wall-clock reading, as it always was; this
+/// is stored beside it, in a key of its own, because the store is bincode and
+/// a field added to [`NodeInfo`] would make every stored `node_info` unreadable.
+///
+/// Why both. The boot clock cannot say anything about a time before this
+/// boot, so a stamp that has to outlive a reboot of the BMC can only be a
+/// wall-clock one. Within a boot the boot clock is exact, so it is used for as
+/// long as the boot id says it can be:
+///
+/// | the node was stamped...                 | reported as                      |
+/// | :-------------------------------------- | :------------------------------- |
+/// | in this boot (restart of the daemon)    | boot clock now - boot clock then |
+/// | in an earlier boot, node kept powered   | wall clock now - wall clock then |
+/// | by a version that stored no mark        | wall clock now - wall clock then |
+///
+/// The wall-clock fallback is the pre-existing behaviour and is as good as the
+/// two wall clocks are: it needs the board's clock to be right at both ends. A
+/// board that keeps its nodes powered through a reboot of the BMC (a v2.5
+/// latch) is the one case that ends up here, and it has nothing better to go
+/// on: whatever the node ran through while the BMC was down was never
+/// measured by any clock the BMC has.
+///
+/// A board where the nodes lose their power with the BMC (v2.4) never needs the
+/// fallback: a cold boot stamps every node it powers on with a mark of the new
+/// boot, so the stamp and the clock that reads it come from the same boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerOnMark {
+    pub boot: BootClock,
+    /// The wall-clock stamp this mark was made with, so that it is only taken
+    /// for the stamp it belongs to. A stamp changed by something that stores
+    /// none (an older daemon, run for a while on the same store) no longer
+    /// matches and the mark is ignored.
+    pub wall: Option<u64>,
+}
+
+pub type PowerOnMarks = [Option<PowerOnMark>; 4];
+
+/// How long a node has been powered on, as seen from `now`.
+///
+/// `stamp` is the node's stored [`NodeInfo::power_on_time`], `None` for a node
+/// that is off. See [`PowerOnMark`] for which clock answers and why.
+fn power_on_seconds(
+    stamp: Option<u64>,
+    mark: Option<&PowerOnMark>,
+    now: &ClockReading,
+) -> Option<u64> {
+    let stamp = stamp?;
+    if let (Some(mark), Some(boot)) = (mark, &now.boot) {
+        if mark.wall == Some(stamp) && mark.boot.boot_id == boot.boot_id {
+            return Some(boot.secs.saturating_sub(mark.boot.secs));
+        }
+    }
+    // saturating: with the wall clock a step backwards (a stale clock that NTP
+    // corrects) would otherwise underflow this into an enormous uptime. A
+    // step forwards is not detectable here and adds to it; the boot clock
+    // above is what avoids both.
+    Some(now.wall?.saturating_sub(stamp))
+}
+
 /// Updates the power-on stamps of the nodes in `mask` for a change from
 /// `activated_nodes` to `node_states`: a node that is powered on gets `now`, a
 /// node that is powered off loses its stamp, and a node left where it is keeps
 /// whatever it has.
 fn stamp_transitions(
     node_infos: &mut NodeInfos,
+    marks: &mut PowerOnMarks,
     activated_nodes: u8,
     node_states: u8,
     mask: u8,
-    now: Option<u64>,
+    now: &ClockReading,
 ) {
     for (idx, new_state) in bit_iterator(node_states, mask) {
         match power_transition(activated_nodes, idx, new_state) {
-            Some(true) => node_infos[idx].power_on_time = now,
-            Some(false) => node_infos[idx].power_on_time = None,
+            Some(true) => stamp(node_infos, marks, idx, now),
+            Some(false) => clear_stamp(node_infos, marks, idx),
             None => (),
         }
     }
+}
+
+fn stamp(node_infos: &mut NodeInfos, marks: &mut PowerOnMarks, idx: usize, now: &ClockReading) {
+    node_infos[idx].power_on_time = now.wall;
+    marks[idx] = now.mark();
+}
+
+fn clear_stamp(node_infos: &mut NodeInfos, marks: &mut PowerOnMarks, idx: usize) {
+    node_infos[idx].power_on_time = None;
+    marks[idx] = None;
 }
 
 /// The power-on stamps of the nodes after a cold boot, when the daemon is
@@ -265,15 +394,22 @@ fn stamp_transitions(
 /// which is the state being restored, sees no change, and leaves the stamp of
 /// the last switch from the UI or the API.
 ///
-/// `now` is the wall clock. The BMC may have no RTC, and at a cold boot the
-/// clock may not be synchronised yet, so the stamp can be off by the step the
-/// clock takes when NTP lands: a step back saturates the uptime at 0 in
-/// [`BmcApplication::get_node_infos`], a step forward adds to it. A stamp from
-/// before the reboot carries the same step, and a wrong one is not made worse
-/// by this.
-fn stamp_cold_boot(node_infos: &mut NodeInfos, state: u8, now: Option<u64>) {
+/// `now` is read before the clock is synchronised, at a cold boot on a board
+/// with no battery for its clock. The wall half of the stamp is then wrong by
+/// the step NTP takes; the boot half is not, and is the one that is reported
+/// for as long as this boot lasts (see [`PowerOnMark`]).
+fn stamp_cold_boot(
+    node_infos: &mut NodeInfos,
+    marks: &mut PowerOnMarks,
+    state: u8,
+    now: &ClockReading,
+) {
     for (idx, on) in bit_iterator(state, 0b1111) {
-        node_infos[idx].power_on_time = if on == 1 { now } else { None };
+        if on == 1 {
+            stamp(node_infos, marks, idx, now);
+        } else {
+            clear_stamp(node_infos, marks, idx);
+        }
     }
 }
 
@@ -284,6 +420,7 @@ fn persistency_builder() -> PersistencyBuilder {
         .register_key(ACTIVATED_NODES_KEY, &0u8)
         .register_key(USB_CONFIG, &UsbConfig::UsbA(NodeId::Node1))
         .register_key(NODE_INFO_KEY, &NodeInfos::default())
+        .register_key(POWER_ON_MARKS_KEY, &PowerOnMarks::default())
         .register_key(NODE1_USB_MODE, &false)
         .register_key(
             COOLING_DEVICES,
@@ -643,16 +780,9 @@ impl BmcApplication {
 
     /// Stores the power-on stamps of a cold boot, see [`stamp_cold_boot`].
     async fn stamp_cold_boot_power_on_times(&self, state: u8) -> anyhow::Result<()> {
-        let mut node_infos = self
-            .app_db
-            .try_get::<NodeInfos>(NODE_INFO_KEY)
-            .await
-            .unwrap_or_default();
-        stamp_cold_boot(&mut node_infos, state, get_timestamp_unix());
-        self.app_db
-            .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
-            .await?;
-        Ok(())
+        let (mut node_infos, mut marks) = self.load_power_on_stamps().await;
+        stamp_cold_boot(&mut node_infos, &mut marks, state, &ClockReading::now());
+        self.store_power_on_stamps(node_infos, marks).await
     }
 
     #[instrument(skip(self))]
@@ -662,22 +792,42 @@ impl BmcApplication {
         node_states: u8,
         mask: u8,
     ) -> anyhow::Result<()> {
-        let mut node_infos = self
+        let (mut node_infos, mut marks) = self.load_power_on_stamps().await;
+        stamp_transitions(
+            &mut node_infos,
+            &mut marks,
+            activated_nodes,
+            node_states,
+            mask,
+            &ClockReading::now(),
+        );
+        self.store_power_on_stamps(node_infos, marks).await
+    }
+
+    async fn load_power_on_stamps(&self) -> (NodeInfos, PowerOnMarks) {
+        let node_infos = self
             .app_db
             .try_get::<NodeInfos>(NODE_INFO_KEY)
             .await
             .unwrap_or_default();
+        let marks = self
+            .app_db
+            .try_get::<PowerOnMarks>(POWER_ON_MARKS_KEY)
+            .await
+            .unwrap_or_default();
+        (node_infos, marks)
+    }
 
-        stamp_transitions(
-            &mut node_infos,
-            activated_nodes,
-            node_states,
-            mask,
-            get_timestamp_unix(),
-        );
-
+    async fn store_power_on_stamps(
+        &self,
+        node_infos: NodeInfos,
+        marks: PowerOnMarks,
+    ) -> anyhow::Result<()> {
         self.app_db
             .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
+            .await?;
+        self.app_db
+            .try_set::<PowerOnMarks>(POWER_ON_MARKS_KEY, marks)
             .await?;
         Ok(())
     }
@@ -898,20 +1048,21 @@ impl BmcApplication {
 
     #[instrument(skip(self))]
     pub async fn get_node_infos(&self) -> anyhow::Result<NodeInfos> {
-        let Some(current_time) = utils::get_timestamp_unix() else {
+        let now = ClockReading::now();
+        if now.wall.is_none() && now.boot.is_none() {
             anyhow::bail!("Current time before Unix epoch");
-        };
+        }
 
         let mut node_infos = self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await?;
-        node_infos.iter_mut().for_each(|info| {
-            if let Some(time) = &mut info.power_on_time {
-                // saturating: the stored value is a wall-clock stamp, and the
-                // BMC has no RTC, so a clock that steps backwards once NTP
-                // lands would otherwise underflow this into an enormous
-                // uptime.
-                *time = current_time.saturating_sub(*time);
-            }
-        });
+        // A mark that cannot be read is no mark: the wall clock answers.
+        let marks = self
+            .app_db
+            .try_get::<PowerOnMarks>(POWER_ON_MARKS_KEY)
+            .await
+            .unwrap_or_default();
+        for (info, mark) in node_infos.iter_mut().zip(marks.iter()) {
+            info.power_on_time = power_on_seconds(info.power_on_time, mark.as_ref(), &now);
+        }
 
         Ok(node_infos)
     }
@@ -1171,27 +1322,66 @@ mod tests {
         std::array::from_fn(|idx| infos[idx].power_on_time)
     }
 
+    /// The clocks at a moment: the wall clock, and the boot clock of `boot`.
+    fn at(wall: u64, boot_id: &str, boot_secs: u64) -> ClockReading {
+        ClockReading {
+            wall: Some(wall),
+            boot: Some(BootClock {
+                boot_id: boot_id.to_string(),
+                secs: boot_secs,
+            }),
+        }
+    }
+
+    /// What the board reports for `node` (0-based) at `now`, from the stored
+    /// stamps, as `get_node_infos` computes it.
+    fn reported(
+        infos: &NodeInfos,
+        marks: &PowerOnMarks,
+        node: usize,
+        now: &ClockReading,
+    ) -> Option<u64> {
+        power_on_seconds(infos[node].power_on_time, marks[node].as_ref(), now)
+    }
+
+    /// Stamps node 1 at `then` on an empty board.
+    fn node1_stamped_at(then: &ClockReading) -> (NodeInfos, PowerOnMarks) {
+        let (mut infos, mut marks) = (NodeInfos::default(), PowerOnMarks::default());
+        stamp_transitions(&mut infos, &mut marks, 0b0000, 0b0001, 0b1111, then);
+        (infos, marks)
+    }
+
     #[test]
     fn a_cold_restore_resets_the_power_on_time_of_the_nodes_it_switches_on() {
         // The stamps are those of the last switch from the UI, long before the
         // BMC rebooted and cut the power. Nodes 1 and 3 come back on, 2 and 4
         // stay off: the first two are stamped with now, the others have none.
         let mut infos = stamped([Some(100), Some(200), Some(300), Some(400)]);
-        stamp_cold_boot(&mut infos, 0b0101, Some(5000));
+        let mut marks = PowerOnMarks::default();
+        let now = at(5000, "boot-b", 7);
+        stamp_cold_boot(&mut infos, &mut marks, 0b0101, &now);
         assert_eq!(stamps(&infos), [Some(5000), None, Some(5000), None]);
+        assert_eq!(marks[0], now.mark());
+        assert_eq!(marks[1], None);
+        assert_eq!(marks[2], now.mark());
+        assert_eq!(marks[3], None);
 
         // Why this is not left to `activate_slot`: against the persisted state
         // the same nodes show no change, and the old stamps would stay.
         let mut infos = stamped([Some(100), None, Some(300), None]);
-        stamp_transitions(&mut infos, 0b0101, 0b0101, 0b1111, Some(5000));
+        let mut marks = PowerOnMarks::default();
+        stamp_transitions(&mut infos, &mut marks, 0b0101, 0b0101, 0b1111, &now);
         assert_eq!(stamps(&infos), [Some(100), None, Some(300), None]);
     }
 
     #[test]
     fn a_cold_restore_with_nothing_on_clears_every_stamp() {
         let mut infos = stamped([Some(1), Some(2), Some(3), Some(4)]);
-        stamp_cold_boot(&mut infos, 0b0000, Some(5000));
+        let now = at(5000, "boot-b", 7);
+        let mut marks = [(); 4].map(|_| now.mark());
+        stamp_cold_boot(&mut infos, &mut marks, 0b0000, &now);
         assert_eq!(stamps(&infos), [None; 4]);
+        assert_eq!(marks, PowerOnMarks::default());
     }
 
     #[test]
@@ -1199,7 +1389,15 @@ mod tests {
         // The daemon restarted under running nodes: persisted and live agree,
         // and the stamps stay.
         let mut infos = stamped([Some(100), Some(200), None, None]);
-        stamp_transitions(&mut infos, 0b0011, 0b0011, 0b1111, Some(5000));
+        let mut marks = PowerOnMarks::default();
+        stamp_transitions(
+            &mut infos,
+            &mut marks,
+            0b0011,
+            0b0011,
+            0b1111,
+            &at(5000, "boot-b", 7),
+        );
         assert_eq!(stamps(&infos), [Some(100), Some(200), None, None]);
     }
 
@@ -1209,8 +1407,196 @@ mod tests {
         // its stamp goes; node 2 stays on, so its stamp stays; node 3 is on
         // without a stamp, so it gets one.
         let mut infos = stamped([Some(100), Some(200), None, None]);
-        stamp_transitions(&mut infos, 0b0011, 0b0110, 0b1111, Some(5000));
+        let mut marks = PowerOnMarks::default();
+        stamp_transitions(
+            &mut infos,
+            &mut marks,
+            0b0011,
+            0b0110,
+            0b1111,
+            &at(5000, "boot-b", 7),
+        );
         assert_eq!(stamps(&infos), [None, Some(200), Some(5000), None]);
+    }
+
+    #[test]
+    fn a_node_that_is_off_has_no_power_on_time() {
+        let (infos, marks) = (NodeInfos::default(), PowerOnMarks::default());
+        assert_eq!(reported(&infos, &marks, 0, &at(5000, "boot-a", 50)), None);
+    }
+
+    #[test]
+    fn a_step_of_the_clock_forward_after_the_stamp_does_not_change_the_time() {
+        // The measured case: a v2.4 board, no battery for the clock. The
+        // daemon stamps the node 10 s into the boot, by a clock that is
+        // minutes behind, then chronyd steps it forward by 130 s.
+        let (infos, marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        // 35 s later by the boot clock, before the step: the wall clock agrees.
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_035, "boot-a", 45)),
+            Some(35)
+        );
+        // Another 5 s, and the wall clock now reads 130 s more.
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_040 + 130, "boot-a", 50)),
+            Some(40),
+            "a wall-clock step must not count as time the node was on"
+        );
+        // The wall clock alone, which is what this replaces, got it wrong.
+        assert_eq!(
+            power_on_seconds(infos[0].power_on_time, None, &at(1_170, "boot-a", 50)),
+            Some(170)
+        );
+    }
+
+    #[test]
+    fn a_step_of_the_clock_backward_after_the_stamp_does_not_change_the_time() {
+        // A clock that was ahead and is corrected: the wall-clock difference
+        // would be negative, which saturates to 0 and says the node has only
+        // just come on.
+        let (infos, marks) = node1_stamped_at(&at(10_000, "boot-a", 10));
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(10_000 - 3_600 + 40, "boot-a", 50)),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn a_step_of_the_clock_before_a_later_stamp_does_not_change_the_earlier_one() {
+        // Node 1 is stamped at boot second 10, the clock steps, node 2 is
+        // stamped at boot second 100 by the corrected clock. Each reports its
+        // own age.
+        let (mut infos, mut marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        stamp_transitions(
+            &mut infos,
+            &mut marks,
+            0b0001,
+            0b0011,
+            0b1111,
+            &at(2_000, "boot-a", 100),
+        );
+        let now = at(2_030, "boot-a", 130);
+        assert_eq!(reported(&infos, &marks, 0, &now), Some(120));
+        assert_eq!(reported(&infos, &marks, 1, &now), Some(30));
+    }
+
+    #[test]
+    fn a_restart_of_the_daemon_within_one_boot_keeps_the_time_exactly() {
+        // What the store holds after a stop and what the new process reads:
+        // the stamps go through the same encoding the store uses.
+        let (infos, marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        let stored_infos = bincode::serialize(&infos).unwrap();
+        let stored_marks = bincode::serialize(&marks).unwrap();
+        let mut infos: NodeInfos = bincode::deserialize(&stored_infos).unwrap();
+        let mut marks: PowerOnMarks = bincode::deserialize(&stored_marks).unwrap();
+        assert_eq!(marks[0].as_ref().map(|m| m.boot.secs), Some(10));
+
+        // The new process adopts the live state: nothing changes...
+        let now = at(1_000 + 130 + 60, "boot-a", 70);
+        stamp_transitions(&mut infos, &mut marks, 0b0001, 0b0001, 0b1111, &now);
+        // ...and the time is the boot clock's, whatever the wall clock did.
+        assert_eq!(reported(&infos, &marks, 0, &now), Some(60));
+    }
+
+    #[test]
+    fn a_stamp_from_another_boot_falls_back_to_the_wall_clock() {
+        // A board that keeps its nodes on through a reboot of the BMC (a v2.5
+        // latch). The boot clock restarted, so it cannot say how long ago a
+        // stamp of the earlier boot was; the wall-clock stamp can.
+        let (infos, marks) = node1_stamped_at(&at(1_000, "boot-a", 900));
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_600, "boot-b", 30)),
+            Some(600),
+            "wall now - wall then, not 30 - 900"
+        );
+        // And that fallback saturates on a clock that is behind the stamp.
+        assert_eq!(reported(&infos, &marks, 0, &at(900, "boot-b", 30)), Some(0));
+    }
+
+    #[test]
+    fn a_stamp_without_a_mark_is_read_by_the_wall_clock() {
+        // Stored by a version that kept no marks, or when the boot clock could
+        // not be read at the stamp.
+        let infos = stamped([Some(1_000), None, None, None]);
+        let marks = PowerOnMarks::default();
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_250, "boot-a", 5)),
+            Some(250)
+        );
+        // No boot clock now either: the same.
+        let no_boot = ClockReading {
+            wall: Some(1_250),
+            boot: None,
+        };
+        assert_eq!(reported(&infos, &marks, 0, &no_boot), Some(250));
+    }
+
+    #[test]
+    fn a_mark_that_belongs_to_another_stamp_is_ignored() {
+        // An older daemon switched the node on again, same boot, and stored a
+        // new wall stamp but no mark. The mark of the earlier switch-on must
+        // not be taken for it.
+        let (mut infos, marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        infos[0].power_on_time = Some(1_500);
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_600, "boot-a", 610)),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_node_switched_off_drops_its_mark() {
+        let (mut infos, mut marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        stamp_transitions(
+            &mut infos,
+            &mut marks,
+            0b0001,
+            0b0000,
+            0b1111,
+            &at(1_100, "boot-a", 110),
+        );
+        assert_eq!(stamps(&infos), [None; 4]);
+        assert_eq!(marks, PowerOnMarks::default());
+    }
+
+    #[test]
+    fn a_cold_boot_stamp_is_not_inflated_by_the_step_that_follows() {
+        // The board of the report: the kernel starts from a stale time, the
+        // daemon stamps the nodes 8 s in, chronyd steps the clock forward by
+        // 130.36 s about two minutes after boot. The node has been on for
+        // 40 s of real time at the first look and 125 s at the second.
+        let (mut infos, mut marks) = (NodeInfos::default(), PowerOnMarks::default());
+        stamp_cold_boot(&mut infos, &mut marks, 0b0001, &at(1_000, "boot-b", 8));
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_040, "boot-b", 48)),
+            Some(40)
+        );
+        assert_eq!(
+            reported(&infos, &marks, 0, &at(1_117 + 130, "boot-b", 133)),
+            Some(125)
+        );
+    }
+
+    #[test]
+    fn the_marks_are_stored_in_a_form_that_reads_back() {
+        let (_, marks) = node1_stamped_at(&at(1_000, "boot-a", 10));
+        let bytes = bincode::serialize(&marks).unwrap();
+        assert_eq!(bincode::deserialize::<PowerOnMarks>(&bytes).unwrap(), marks);
+        // The default of a store that has never held one.
+        let bytes = bincode::serialize(&PowerOnMarks::default()).unwrap();
+        assert_eq!(
+            bincode::deserialize::<PowerOnMarks>(&bytes).unwrap(),
+            [None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn the_boot_clock_and_the_boot_id_can_be_read_on_linux() {
+        let first = utils::get_boottime_secs().expect("CLOCK_BOOTTIME");
+        let second = utils::get_boottime_secs().expect("CLOCK_BOOTTIME");
+        assert!(second >= first);
+        let id = utils::get_boot_id().expect("/proc/sys/kernel/random/boot_id");
+        assert_eq!(id, utils::get_boot_id().unwrap(), "stable within a boot");
     }
 
     #[test]
