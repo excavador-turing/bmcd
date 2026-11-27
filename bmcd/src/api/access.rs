@@ -202,7 +202,7 @@ fn trial_load(pem: &[u8]) -> Result<(), String> {
     let path = std::env::temp_dir().join(format!("bmcd-ca-trial-{}.pem", std::process::id()));
     std::fs::write(&path, pem).map_err(|e| e.to_string())?;
 
-    let result = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+    let result = SslAcceptor::mozilla_modern_v5(SslMethod::tls())
         .map_err(|e| e.to_string())
         .and_then(|mut builder| builder.set_ca_file(&path).map_err(|e| e.to_string()));
 

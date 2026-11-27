@@ -587,27 +587,15 @@ fn load_tls_config(
     tls_config: &config::Tls,
 ) -> anyhow::Result<(SslAcceptor, tls_store::ServedCertificate)> {
     let (private_key, cert) = load_keys_from_pem(&tls_config.private_key, &tls_config.certificate)?;
-    // `_v5`, and the suffix is the whole point: `mozilla_intermediate` is
-    // Mozilla's version 4 profile, which pins the maximum protocol version to
-    // TLS 1.2. The board's OpenSSL is 3.5.7 and offers TLS 1.3 perfectly well;
-    // this call was the only thing refusing it.
+    // TLS 1.3 only. `mozilla_modern_v5` is Mozilla's modern profile: TLS 1.3,
+    // and no TLS 1.2 fallback.
     //
-    // A TLS-1.2-only server is not merely dated, it changes what a client has
-    // to send. Under 1.2 the client's `supported_groups` extension constrains
-    // the curve of the SERVER's certificate as well as the key exchange
-    // (RFC 4492 section 5.1), so a client whose curve list stops at P-256 --
-    // which is Envoy's default -- cannot use a P-384 certificate and gets
-    // handshake_failure. Under TLS 1.3 the certificate's curve is governed by
-    // `signature_algorithms` instead, and the problem does not arise.
-    //
-    // That cost a day: a proxy in front of this daemon, holding a valid
-    // certificate, failing every handshake while the page in front of IT
-    // looked healthy.
-    //
-    // v5 is 1.2 and 1.3, not 1.3 alone. TLS 1.3 is what any current client
-    // negotiates; 1.2 stays as the fallback, because a BMC is the thing you
-    // reach for with whatever client you have.
-    let mut tls = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+    // Offering 1.3 is what lets a client with Envoy's default curves
+    // (`X25519:P-256`) use a P-384 certificate. Under TLS 1.2 the client's
+    // `supported_groups` also constrains the curve of the server certificate
+    // (RFC 4492 section 5.1), so that client cannot complete a handshake.
+    // Under TLS 1.3 the certificate curve is governed by `signature_algorithms`.
+    let mut tls = SslAcceptor::mozilla_modern_v5(SslMethod::tls())?;
 
     // The pair is NOT set on the builder. It lives in the store, and every
     // new connection is handed whatever is in there at the time -- which is
@@ -813,12 +801,10 @@ mod tests {
         assert_eq!(handshake_and_report_alpn(&tls, b"\x02h2"), None);
     }
 
-    /// TLS 1.3 is what this daemon should be negotiating, and 1.2 has to keep
-    /// working -- a BMC is reached with whatever client is to hand. A
-    /// regression here is silent from the daemon's side: everything still
-    /// connects, and only a client with a narrow curve list finds out.
+    /// An unconstrained client gets TLS 1.3. A client pinned to TLS 1.2 gets
+    /// no handshake: this daemon does not offer 1.2.
     #[test]
-    fn the_acceptor_offers_tls13_and_still_falls_back_to_tls12() {
+    fn the_acceptor_offers_tls13_and_refuses_tls12() {
         let (_dir, tls) = throwaway_tls_config("bmcd-version");
 
         assert_eq!(
@@ -828,8 +814,8 @@ mod tests {
         );
         assert_eq!(
             handshake_version(&tls, Some(SslVersion::TLS1_2), None),
-            Some("TLSv1.2".to_string()),
-            "a client that cannot do 1.3 must still be served"
+            None,
+            "a client pinned to TLS 1.2 must not complete a handshake"
         );
     }
 
@@ -892,8 +878,8 @@ mod tests {
             );
             assert_eq!(
                 handshake_version(&tls, Some(SslVersion::TLS1_2), None),
-                Some("TLSv1.2".to_string()),
-                "a {kind:?} certificate should also work for a TLS 1.2 client"
+                None,
+                "a {kind:?} certificate must not be served to a TLS 1.2 client"
             );
         }
     }
